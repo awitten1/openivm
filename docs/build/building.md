@@ -203,9 +203,11 @@ to obtain an inspection file.
 ### Archived compiled SQL
 
 OpenIVM always archives the programs it runs for `CREATE MATERIALIZED VIEW` and
-refresh in two tables next to the view's `openivm_views` metadata (for DuckLake
-views, the native frontend database's `main` schema), independently of
-`openivm_files_path`:
+refresh in two tables next to the view's `openivm_views` metadata (by default the
+view's native catalog, or for DuckLake views the native frontend database's `main`
+schema; `openivm_metadata_catalog`/`openivm_metadata_schema` move them together with
+the rest of the metadata, see [metadata placement](../internals/metadata-placement.md)),
+independently of `openivm_files_path`:
 
 ```sql
 SELECT view_catalog, view_schema, view_sql_name, operation, version,
@@ -225,29 +227,41 @@ ORDER BY s.stmt_order;
   `view_catalog`, `view_schema` and `view_sql_name` give the qualified MV name.
   `operation` is `create` or `refresh`. `compilation_id` identifies the operation that
   first stored a version; `last_compilation_id` is the latest operation that ran
-  the same program. For refreshes this is the `refresh_id` in
-  `openivm_refresh_profile` when profiling is enabled.
+  the same program. For refreshes outside an explicit transaction this is the
+  `refresh_id` in `openivm_refresh_profile` when profiling is enabled; refreshes
+  inside an explicit transaction are not profiled.
 - **Versions.** A program is the complete statement list, in execution order. A
   new version is stored only when that list differs from the view's latest stored
   version for the same operation. The comparison is exact: delta cutoffs, snapshot
   IDs and catalog references are not normalized away. A refresh inside an explicit
   transaction, for example, stamps its own timestamp, and DuckLake refreshes embed
   snapshot IDs, so these usually store a new version. Refreshes skipped because
-  deltas are empty compile nothing and store nothing.
+  deltas are empty compile nothing and store nothing. If a DuckLake refresh rolls
+  back its first delete attempt and retries with ranked deletion, only the retried
+  program that committed is stored. For snapshot-published DuckLake views, the
+  executed publication statement is stored between the data statements and the
+  watermark update. Statements OpenIVM derives while it runs, such as DuckLake
+  delta-table definitions and pinned snapshot publications, are stored as the SQL
+  that actually ran. Cleanup of consumed delta rows after a refresh commits is
+  housekeeping and is not part of the stored program.
 - **Outcomes.** `last_outcome` describes the latest operation that ran the version:
   `committed` (its transaction committed), `attempted` (it failed and rolled back,
-  so nothing was committed) or `unknown` (a cross-catalog refresh failed after data
-  statements ran outside a transaction, or `COMMIT` itself failed, so some effects may
-  have committed).
+  so nothing was committed) or `unknown` (a cross-catalog refresh failed after its
+  first statements ran outside a transaction, or `COMMIT` itself failed, so some
+  effects may have committed). This includes a DuckLake refresh whose data statements
+  roll back, because its in-progress marker in the metadata location has already
+  committed.
   `committed_count` counts committed runs. Compile-only calls such as
   `openivm_compile_with_facts` are never archived, so a stored program has always
   been executed.
 - **Transactions.** Native CREATE and refresh write the archive in their own
-  transaction, so it is visible only if they commit. A failed or rolled-back
+  transaction, so it is visible only if they commit. A failed or rolled-back native
   operation in an explicit transaction leaves no row. An autocommit refresh that
   fails is recorded as `attempted` (or `unknown`) in a separate metadata
   transaction. DuckLake data cannot share a transaction with native metadata, so
-  cross-catalog refreshes are recorded in one metadata transaction after they commit.
+  cross-catalog operations write the archive on separate connections: refreshes
+  in one metadata transaction after they commit (or fail), even inside an explicit
+  transaction, and DuckLake CREATE with its native metadata.
 - **Archive failures.** OpenIVM does not report success if the archive cannot be
   written. For native operations the archive write is part of the transaction, so
   a failed write rolls back the CREATE or refresh with an error. If a

@@ -18,7 +18,8 @@ enum class CompiledProgramOutcome : uint8_t {
 	// possible, so the row only becomes visible if the operation commits.
 	COMMITTED,
 	// Execution started, but OpenIVM cannot tell whether its effects committed (for
-	// example, a cross-catalog refresh that failed after data statements ran).
+	// example, a cross-catalog refresh that failed after its own-connection metadata
+	// or data statements ran).
 	UNKNOWN
 };
 
@@ -52,6 +53,10 @@ string WriteCompiledProgram(Connection &con, const CompiledProgram &program, Com
 // an empty string on success or the error message; it never throws.
 string RecordCompiledProgram(ClientContext &context, const string &view_catalog, const CompiledProgram &program,
                              CompiledProgramOutcome outcome);
+
+// The metadata catalog/schema `con` selected (RefreshMetadata::UseCatalog), where the
+// archive lives next to openivm_views. Returns an empty string or the error message.
+string ResolveCompiledSQLArchiveLocation(Connection &con, string &catalog, string &schema);
 
 // Identifier shared by the refresh profile and the archive for one operation.
 string NewCompilationId(const string &view_name, const string &operation = "");

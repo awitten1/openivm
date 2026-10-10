@@ -30,3 +30,11 @@ test_release_internal: test_remote_metadata
 
 test_remote_metadata:
 	python3 test/integration/test_remote_metadata.py ./build/release/duckdb
+
+.PHONY: test_benchmark_metadata
+
+test_release_internal: test_benchmark_metadata
+
+test_benchmark_metadata:
+	cmake --build build/release --target benchmark_metadata_test
+	dir=$$(mktemp -d) && ./build/release/extension/openivm/benchmark_metadata_test $$dir | grep -qx PASS; status=$$?; rm -rf $$dir; exit $$status
