@@ -225,7 +225,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BIGINT, Value::BIGINT(600));
 	db_config.AddExtensionOption(openivm::TEST_FAIL_POINT_SETTING,
 	                             "testing only: simulate a crash at a refresh protocol step (after_intent, "
-	                             "after_view_delta, before_data_commit, after_data_commit), a lease takeover "
+	                             "after_view_delta, before_data_commit, after_data_commit), a failing data statement "
+	                             "(data_statement_error), a lease takeover "
 	                             "(lease_lost_before_data, lease_lost_mid_data, lease_lost_before_watermark) or a "
 	                             "concurrent source commit "
 	                             "(concurrent_commit_before_data, concurrent_commit_after_data)",

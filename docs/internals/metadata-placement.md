@@ -305,6 +305,7 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 | Explicit-transaction rejection (including RENAME COLUMN); atomic same-database schema | `test/sql/metadata_location.test` |
 | RENAME COLUMN restore after a failed ALTER; autocommit rename | `test/sql/metadata_location.test` |
 | Crash after intent, inside data transaction, after data commit; full recompute | `test/sql/metadata_location.test` (`openivm_test_fail_point`) |
+| Clean data-step failure retracts the marker; next refresh is incremental and exact (native view, chained DuckLake view) | `test/sql/metadata_location.test`, `test/sql/metadata_location_ducklake.test` (`data_statement_error`) |
 | Concurrent connections, daemon scheduling | `test/sql/metadata_location.test` |
 | Read-only and missing catalogs, untracked DROP TABLE while detached, reopen discovery, conflicting setting, existing databases, replace, drop, orphan cleanup | `test/sql/metadata_location.test` |
 | DuckLake views: frontend marker, reopen without settings, crash after the DuckLake data commit | `test/sql/metadata_location_ducklake.test` |
@@ -323,7 +324,9 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 `openivm_test_fail_point` is a testing hook. `after_intent`, `before_data_commit` and
 `after_data_commit` simulate a process crash at a protocol step and run no compensation.
 `after_view_delta` crashes right after the statement that writes the view's own delta
-rows for downstream views, before the backing table changes.
+rows for downstream views, before the backing table changes. `data_statement_error` makes
+the data step fail with an ordinary error after its first statement, so the normal failure
+handling (rollback, then retracting the marker) runs.
 `concurrent_commit_before_data` and `concurrent_commit_after_data` commit the SQL in
 `openivm_test_concurrent_sql` from another connection during the first refresh attempt,
 after compilation or after the data statements, as a concurrent client would.

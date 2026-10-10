@@ -421,6 +421,72 @@ SELECT (SELECT count(*) FROM (SELECT * FROM big_products
 ----
 0
 
+# A data statement fails without a crash: the data transaction rolls back, so the refresh
+# retracts its interruption marker, keeps the source deltas, and the next refresh is a
+# normal incremental one that applies them exactly once.
+statement ok
+INSERT INTO orders VALUES (40, 'a', 4), (41, 'k', 41);
+
+statement ok
+UPDATE orders SET amount = amount + 3 WHERE product = 'f';
+
+statement ok
+CREATE OR REPLACE TEMP TABLE sales_before AS SELECT * FROM product_sales;
+
+statement ok
+SET openivm_test_fail_point = 'data_statement_error';
+
+statement error
+PRAGMA refresh('product_sales');
+----
+'data_statement_error' failed a data statement
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales EXCEPT ALL SELECT * FROM sales_before))
+     + (SELECT count(*) FROM (SELECT * FROM sales_before EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM openivm_delta_orders;
+----
+true
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM big_products
+                              EXCEPT ALL SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25
+                              EXCEPT ALL SELECT * FROM big_products));
+----
+0
+
+statement ok
+DROP TABLE sales_before;
+
 # Crash inside the data transaction, before COMMIT: the data change is lost with the process.
 statement ok
 INSERT INTO orders VALUES (13, 'a', 13), (14, 'g', 14), (14, 'g', 14);

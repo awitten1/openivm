@@ -349,6 +349,10 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// transaction; cross-catalog refreshes archive after their last commit.
 	bool execution_started = false;
 	bool effects_may_be_committed = false;
+	// Whether MV data may have committed: a data statement ran outside a transaction or a
+	// data COMMIT was attempted. Until then a failure rolls the data back completely, so the
+	// split protocol can retract its interruption marker.
+	bool data_may_be_committed = false;
 	bool archive_handled = false;
 	// Track whether we're inside an open exec_con transaction so any exception path can
 	// rollback cleanly. Without explicit rollback, a throw mid-transaction relies on the
@@ -525,11 +529,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			execution_started = true;
 			// Cross-catalog data statements outside a transaction commit individually.
 			effects_may_be_committed = effects_may_be_committed || !tx_open;
+			data_may_be_committed = data_may_be_committed || !tx_open;
 			// Under a lease every statement is checked first, so a client past its deadline
 			// stops before the next write; the data transaction then rolls back.
 			bool crash_after_view_delta = MetadataLocator::TestPoint(context, "after_view_delta");
+			bool fail_data_statement = MetadataLocator::TestPoint(context, "data_statement_error");
 			bool split_program = profiler.Enabled() || (retry_plan && retry_plan->IsActive()) || lease.Active() ||
-			                     crash_after_view_delta;
+			                     crash_after_view_delta || fail_data_statement;
 			if (!split_program) {
 				executed_statement_count++;
 				return exec_con.Query(program);
@@ -556,6 +562,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 				}
 				if (crash_after_view_delta && WritesViewDelta(statements[stmt_idx], vn)) {
 					MetadataLocator::FailPoint(context, "after_view_delta");
+				}
+				if (fail_data_statement) {
+					// Test-only: an ordinary statement error after the first data statement ran.
+					// Unlike a simulated crash, the normal failure handling runs.
+					throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
+					                                             "' failed: openivm_test_fail_point "
+					                                             "'data_statement_error' failed a data statement");
 				}
 				if (!retry_plan || !retry_plan->IsActive()) {
 					continue;
@@ -659,6 +672,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 			// A failure inside COMMIT leaves the outcome unknown; never compensate for it.
 			effects_may_be_committed = true;
+			data_may_be_committed = true;
 			exec_con.Commit();
 			tx_open = false;
 			archive_handled = !cross_system;
@@ -687,6 +701,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			    prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(vn)),
 			    publication->GetValue(0, 0).ToString());
 			set_archived_program();
+			data_may_be_committed = true;
 			auto published = exec_con.Query(publish_sql);
 			if (published->HasError()) {
 				throw CatalogException("Could not advance snapshot publication for '%s': %s", vn,
@@ -855,9 +870,11 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 			tx_open = false;
 		}
-		if (split_protocol && intent_recorded && !effects_may_be_committed && !was_interrupted) {
+		if (split_protocol && intent_recorded && !data_may_be_committed && !was_interrupted) {
 			// The data transaction rolled back, so nothing changed: retract our marker
 			// rather than force a full recompute. Best effort; a set marker is still safe.
+			// Under a lease the fence refuses this after a takeover, keeping the new
+			// owner's marker.
 			try {
 				auto cleared = run_metadata(
 				    "UPDATE " + metadata_location.Table(openivm::VIEWS_TABLE) +
