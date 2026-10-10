@@ -228,8 +228,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "after_view_delta, before_data_commit, after_data_commit), a failing data statement "
 	                             "(data_statement_error), a lease takeover "
 	                             "(lease_lost_before_data, lease_lost_mid_data, lease_lost_before_watermark) or a "
-	                             "concurrent source commit "
-	                             "(concurrent_commit_before_data, concurrent_commit_after_data)",
+	                             "concurrent commit "
+	                             "(concurrent_commit_before_data, concurrent_commit_after_data, or "
+	                             "concurrent_commit_then_data_error after the interruption marker, followed by a "
+	                             "failing data statement)",
 	                             LogicalType::VARCHAR, Value(""));
 	db_config.AddExtensionOption(openivm::TEST_CONCURRENT_SQL_SETTING,
 	                             "testing only: SQL that a concurrent_commit_* fail point commits from another "

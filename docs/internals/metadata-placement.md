@@ -142,7 +142,7 @@ Crash and retry semantics:
 |---|---|---|
 | Before step 1 commits | unchanged | normal incremental refresh |
 | After 1, before 2 commits | marker set, data unchanged | full recompute |
-| Step 2 fails cleanly (rolled back) | marker retracted | normal incremental refresh |
+| Step 2 fails cleanly (rolled back) | marker retracted, unless another client set it (lease lost or `refresh_epoch` changed) | normal incremental refresh, or full recompute if the marker stayed |
 | Crash inside 2 | marker set, data rolled back | full recompute |
 | After 2, before 3 commits | marker set, data new, watermarks old | full recompute |
 | After 3 | consistent | normal |
@@ -244,7 +244,8 @@ Refreshes of one view are serialized across clients by `openivm_refresh_leases`:
   transaction's row lock (after which the extended lease no longer qualifies as expired,
   or the takeover gets a serialization failure, so the takeover fails), or this `UPDATE`
   finds the row gone or concurrently changed and fails (zero rows, or a serialization
-  failure). Step 3 also fails if `refresh_epoch` changed. The client's own heartbeat waits
+  failure). Step 3 also fails if `refresh_epoch` changed, and the retraction then matches no
+  row, leaving the marker set. The client's own heartbeat waits
   while a fenced transaction is open, so the two never write the lease row at the same
   time and spuriously fail each other.
 - A client whose step 3 fails after committing data bumps `refresh_epoch` and sets the
@@ -314,6 +315,7 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 | Legacy discovery unchanged; scheduler discovery of a configured location | `test/integration/scheduler_catalog_test.cpp` |
 | PostgreSQL metadata: placement, reopen, crash + abandoned lease, RENAME rejection and portable restore, CREATE inside the metadata catalog rejected, DROP, concurrent DuckLake clients without a local frontend file | `test/integration/test_remote_metadata.py` (CI: `.github/workflows/RemoteMetadata.yml`) |
 | Lease lost before the data phase, after the first DuckLake statement, and taken over before the watermark commit (fence) | `test/integration/test_remote_metadata.py` |
+| A clean data rollback keeps the marker another client set with a bumped `refresh_epoch`; the next refresh recomputes exactly | `test/integration/test_remote_metadata.py` (`concurrent_commit_then_data_error`) |
 | Lease times written from the PostgreSQL server clock; expiry judged on that clock (live 120 s ahead refuses, 1 s past takes over) | `test/integration/test_remote_metadata.py` |
 | Rejected CREATE in an explicit transaction creates no metadata schema; ADD COLUMN of a tracked source while the metadata catalog is detached | `test/sql/metadata_location.test` |
 | Settings contradicting the frontend marker of a DuckLake view | `test/sql/metadata_location_ducklake.test` |
@@ -330,6 +332,8 @@ handling (rollback, then retracting the marker) runs.
 `concurrent_commit_before_data` and `concurrent_commit_after_data` commit the SQL in
 `openivm_test_concurrent_sql` from another connection during the first refresh attempt,
 after compilation or after the data statements, as a concurrent client would.
+`concurrent_commit_then_data_error` commits it after the interruption marker and then
+fails the data step like `data_statement_error`.
 `lease_lost_before_data` and `lease_lost_mid_data` hand the lease to another (already
 expired) owner and make the client observe the loss, as its deadline would;
 `lease_lost_before_watermark` hands it over without local notice, so only the fence can

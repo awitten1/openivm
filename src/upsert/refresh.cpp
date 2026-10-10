@@ -496,6 +496,9 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		}
 		if (split_protocol) {
 			MetadataLocator::FailPoint(context, "after_intent");
+			// Test-only: another client commits between the intent marker and the data step,
+			// whose first statement then fails.
+			InjectConcurrentCommit(context, "concurrent_commit_then_data_error", attempt);
 		}
 		if (lease.Active()) {
 			if (MetadataLocator::TestPoint(context, "lease_lost_before_data")) {
@@ -533,7 +536,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			// Under a lease every statement is checked first, so a client past its deadline
 			// stops before the next write; the data transaction then rolls back.
 			bool crash_after_view_delta = MetadataLocator::TestPoint(context, "after_view_delta");
-			bool fail_data_statement = MetadataLocator::TestPoint(context, "data_statement_error");
+			string fail_data_point;
+			for (auto point : {"data_statement_error", "concurrent_commit_then_data_error"}) {
+				if (MetadataLocator::TestPoint(context, point)) {
+					fail_data_point = point;
+				}
+			}
+			bool fail_data_statement = !fail_data_point.empty();
 			bool split_program = profiler.Enabled() || (retry_plan && retry_plan->IsActive()) || lease.Active() ||
 			                     crash_after_view_delta || fail_data_statement;
 			if (!split_program) {
@@ -567,8 +576,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 					// Test-only: an ordinary statement error after the first data statement ran.
 					// Unlike a simulated crash, the normal failure handling runs.
 					throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
-					                                             "' failed: openivm_test_fail_point "
-					                                             "'data_statement_error' failed a data statement");
+					                                             "' failed: openivm_test_fail_point '" +
+					                                             fail_data_point + "' failed a data statement");
 				}
 				if (!retry_plan || !retry_plan->IsActive()) {
 					continue;
@@ -875,10 +884,16 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			// rather than force a full recompute. Best effort; a set marker is still safe.
 			// Under a lease the fence refuses this after a takeover, keeping the new
 			// owner's marker.
+			string retraction = "UPDATE " + metadata_location.Table(openivm::VIEWS_TABLE) +
+			                    " SET refresh_in_progress = false WHERE view_name = " + Value(vn).ToSQLString();
+			if (lease.Active()) {
+				// A client that overran its lease marks the view and bumps the epoch after its
+				// late data commit, possibly while this client holds the lease. That marker must
+				// survive: with a changed epoch this matches no row.
+				retraction += " AND COALESCE(refresh_epoch, 0) = " + to_string(refresh_epoch);
+			}
 			try {
-				auto cleared = run_metadata(
-				    "UPDATE " + metadata_location.Table(openivm::VIEWS_TABLE) +
-				    " SET refresh_in_progress = false WHERE view_name = " + Value(vn).ToSQLString() + ";\n");
+				auto cleared = run_metadata(retraction + ";\n");
 				if (!cleared.empty()) {
 					OPENIVM_DEBUG_PRINT("[REFRESH] Could not retract marker: %s\n", cleared.c_str());
 				}
