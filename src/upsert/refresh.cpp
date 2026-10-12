@@ -463,25 +463,16 @@ struct AuxCatalogTarget {
 
 static AuxCatalogTarget ResolveAuxCatalogTarget(RefreshMetadata &metadata, Connection &con,
                                                 const string &view_catalog_name, const string &view_schema_name) {
-	string default_db;
-	string default_schema = "main";
-	auto db_res = con.Query("SELECT current_database()");
-	if (!db_res->HasError() && db_res->RowCount() > 0 && !db_res->GetValue(0, 0).IsNull()) {
-		default_db = db_res->GetValue(0, 0).ToString();
-	}
-	auto schema_res = con.Query("SELECT current_schema()");
-	if (!schema_res->HasError() && schema_res->RowCount() > 0 && !schema_res->GetValue(0, 0).IsNull()) {
-		default_schema = schema_res->GetValue(0, 0).ToString();
-	}
-
+	// Auxiliary state follows the MV, never the configured metadata schema.
+	string default_db = RefreshMetadata::CurrentLocation(con).catalog_name;
 	AuxCatalogTarget target;
 	target.catalog_name = view_catalog_name.empty() ? default_db : view_catalog_name;
-	target.schema_name = view_schema_name.empty() ? default_schema : view_schema_name;
+	target.schema_name = view_schema_name.empty() ? string(DEFAULT_SCHEMA) : view_schema_name;
 	bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_catalog_name);
 	if (!target_is_ducklake && !default_db.empty() && default_db != "memory" && !view_catalog_name.empty() &&
 	    view_catalog_name != default_db) {
 		target.catalog_name = default_db;
-		target.schema_name = default_schema;
+		target.schema_name = DEFAULT_SCHEMA;
 	}
 	return target;
 }
@@ -697,6 +688,8 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 		                    view_schema_name.c_str(), cross_system ? 1 : 0);
 	}
 
+	// A newly configured openivm_metadata_schema takes effect for this refresh.
+	RefreshMetadata::PrepareMetadataSchema(context, view_catalog_name, false);
 	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
 	// Only external data catalogs need a separate native metadata transaction.
 	auto metadata_catalog = con.Query("SELECT current_database()");

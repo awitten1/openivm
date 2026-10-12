@@ -1605,6 +1605,8 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 	    skip_empty_enabled && !has_left_join &&
 	    (non_empty_leaf_count == 1 || all_non_empty_deltas_are_tiny); // mull-ignore: cxx_eq_to_ne
 	if (key_domain_probe_enabled) {
+		// Probe committed watermarks in the metadata schema the compiler selected.
+		RefreshMetadata::UseSameLocation(*input.context.metadata_con.context, key_probe_con);
 		unordered_map<uint64_t, JoinColumnRef> column_refs;
 		// The <= mutant indexes one past leaves.
 		// mull-ignore-next: cxx_lt_to_le

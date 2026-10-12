@@ -195,12 +195,15 @@ PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, uni
 }
 
 string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
-                                const string &default_db) {
-	if (current_catalog.empty() || current_catalog == default_db || table_name.find('.') != string::npos ||
-	    table_name.find('(') != string::npos) {
+                                const string &default_db, const string &default_schema) {
+	// Auxiliary state is built while the metadata schema is selected; qualify sources
+	// whenever that differs from the caller's catalog and schema.
+	if (current_catalog.empty() || (current_catalog == default_db && current_schema == default_schema) ||
+	    table_name.find('.') != string::npos || table_name.find('(') != string::npos) {
 		return table_name;
 	}
-	return current_catalog + "." + current_schema + "." + table_name;
+	return KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
+	       KeywordHelper::WriteOptionallyQuoted(current_schema) + "." + table_name;
 }
 
 static string StripTrailingSemicolon(string sql) {

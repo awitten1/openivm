@@ -302,7 +302,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	db_config.AddExtensionOption("openivm_explain_initial_load_only",
 	                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption(openivm::METADATA_SCHEMA_SETTING,
+	                             "schema for OpenIVM control metadata in each native catalog; empty keeps existing "
+	                             "metadata where it is and uses main for new metadata",
+	                             LogicalType::VARCHAR, Value(""));
 	Connection con(instance);
+	// Upgrade existing metadata in the schema that already holds it.
+	try {
+		RefreshMetadata::UseCatalog(*con.context, con);
+	} catch (std::exception &ex) {
+		OPENIVM_DEBUG_PRINT("[METADATA] Keeping the default schema for load-time upgrades: %s\n", ex.what());
+	}
 
 	// Migration: add new columns to existing openivm_views tables
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
@@ -336,22 +346,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// hit not-yet-existing tables on a fresh DB fail silently — the parser's
 	// CREATE TABLE includes these columns directly, so fresh DBs are fine.
 	// ALTERs are backward-compat for legacy DBs.
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::MATCH_LOG_TABLE) +
-	          " (query_hash UBIGINT,"
-	          " log_timestamp TIMESTAMP,"
-	          " matched_view VARCHAR,"
-	          " chosen_strategy VARCHAR,"
-	          " bypass_cost_est DOUBLE,"
-	          " chosen_cost_est DOUBLE,"
-	          " actual_duration_ms BIGINT,"
-	          " PRIMARY KEY (query_hash, log_timestamp))");
+	con.Query(CreateMetadataTableSQL(openivm::MATCH_LOG_TABLE));
 	con.Query(CreateMVDependenciesSQL());
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::CONSTRAINTS_CACHE_TABLE) +
-	          " (table_name VARCHAR, constraint_kind VARCHAR,"
-	          " columns_json VARCHAR, referenced_table VARCHAR,"
-	          " referenced_columns_json VARCHAR,"
-	          " is_trusted BOOLEAN DEFAULT true,"
-	          " PRIMARY KEY (table_name, constraint_kind, columns_json))");
+	con.Query(CreateMetadataTableSQL(openivm::CONSTRAINTS_CACHE_TABLE));
 
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS signature_hash UBIGINT DEFAULT NULL");
@@ -457,7 +454,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                                                   LogicalType::VARCHAR));
 	auto declare_rely_fk = PragmaFunction::PragmaCall(
 	    "openivm_declare_rely_fk",
-	    [](ClientContext &, const FunctionParameters &parameters) -> string {
+	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
 		    string child_table = StringValue::Get(parameters.values[0]);
 		    auto child_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[1]));
 		    string parent_table = StringValue::Get(parameters.values[2]);
@@ -465,7 +462,20 @@ static void LoadInternal(ExtensionLoader &loader) {
 		    if (child_columns.empty() || child_columns.size() != parent_columns.size()) {
 			    throw InvalidInputException("openivm_declare_rely_fk requires matching child/parent column lists");
 		    }
-		    return "INSERT OR REPLACE INTO " + string(openivm::CONSTRAINTS_CACHE_TABLE) +
+		    // Declarations may precede the first materialized view, so create the
+		    // metadata schema and table where that view's metadata will live.
+		    Connection con(*context.db);
+		    RefreshMetadata::UseCatalog(context, con);
+		    auto location = RefreshMetadata::CurrentLocation(con);
+		    auto constraints_table =
+		        SqlUtils::FullName(location.catalog_name, location.schema_name, openivm::CONSTRAINTS_CACHE_TABLE);
+		    string setup;
+		    if (!StringUtil::CIEquals(location.schema_name, DEFAULT_SCHEMA)) {
+			    setup = "CREATE SCHEMA IF NOT EXISTS " + SqlUtils::QuoteIdentifier(location.catalog_name) + "." +
+			            SqlUtils::QuoteIdentifier(location.schema_name) + ";\n";
+		    }
+		    setup += CreateMetadataTableSQL(openivm::CONSTRAINTS_CACHE_TABLE, constraints_table) + ";\n";
+		    return setup + "INSERT OR REPLACE INTO " + constraints_table +
 		           " (table_name, constraint_kind, columns_json, referenced_table, "
 		           "referenced_columns_json, is_trusted) VALUES ('" +
 		           SqlUtils::EscapeValue(child_table) + "', 'RELY_FK', '" +

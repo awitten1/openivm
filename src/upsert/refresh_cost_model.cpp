@@ -522,8 +522,9 @@ static RegressionWeights FitRegression(const vector<RefreshMetadata::RefreshHist
 
 RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOperator &plan, const string &view_name,
                                         const DeltaActivityResult *delta_activity) {
-	// Single connection for all cardinality queries
+	// Single connection for all cardinality queries, reading the caller's metadata schema
 	Connection con(*context.db);
+	RefreshMetadata::UseSameLocation(context, con);
 
 	// Read operational flags — cost model reflects what actually happens at refresh time.
 	bool nterm_enabled = SqlUtils::GetBoolSetting(context, "openivm_ducklake_nterm", true);
@@ -905,9 +906,8 @@ string RefreshCostHistoryQuery(ClientContext &context, const FunctionParameters 
 	       " AS view_name, refresh_timestamp, method, incremental_compute_est, incremental_upsert_est,"
 	       " recompute_compute_est, recompute_replace_est, actual_duration_ms"
 	       " FROM " +
-	       SqlUtils::FullName(ClientData::Get(*con.context).catalog_search_path->GetDefault().catalog, DEFAULT_SCHEMA,
-	                          openivm::HISTORY_TABLE) +
-	       " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' ORDER BY refresh_timestamp DESC LIMIT 20";
+	       RefreshMetadata::MetadataTable(con, openivm::HISTORY_TABLE) + " WHERE view_name = '" +
+	       SqlUtils::EscapeValue(view_name) + "' ORDER BY refresh_timestamp DESC LIMIT 20";
 }
 
 vector<StrategyCostEstimate> EstimatePerQuery(ClientContext &context, const string &view_name,

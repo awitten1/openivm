@@ -21,8 +21,31 @@ public:
 	explicit RefreshMetadata(Connection &con) : con(con) {
 	}
 
+	struct MetadataLocation {
+		string catalog_name;
+		string schema_name;
+	};
+
 	// Native view metadata belongs to the view catalog; external catalogs use the native default.
+	// Within that catalog, metadata stays in the schema that already holds it. New metadata uses
+	// openivm_metadata_schema, or main when it is unset.
 	static void UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
+	// Select the location already resolved for a helper context; resolve it for any other context.
+	static void UseSameLocation(ClientContext &context, Connection &con);
+	// The metadata location selected for a helper connection.
+	static MetadataLocation CurrentLocation(Connection &con);
+	static string MetadataTable(Connection &con, const string &table);
+	// The explicitly configured metadata schema; empty means keep existing metadata where it is.
+	static string ConfiguredMetadataSchema(ClientContext &context);
+	// Schemas of a native catalog that contain `table`, in name order.
+	static vector<string> FindMetadataSchemas(Connection &con, const string &catalog, const string &table);
+	static string ResolveMetadataSchema(Connection &con, const string &catalog, const string &preferred);
+	// In autocommit mode, move a catalog's metadata into the configured schema and, for a new
+	// materialized view, create that schema. Other metadata objects keep their placement.
+	static void PrepareMetadataSchema(ClientContext &context, const string &view_catalog, bool create_schema);
+	// Every native metadata location containing `table`, and the qualified table names.
+	static vector<MetadataLocation> MetadataLocations(Connection &con, const string &table);
+	static vector<string> MetadataTables(Connection &con, const string &table);
 
 	void SnapshotTransaction(ClientContext &context);
 	string ResolveViewName(const string &view_name, const string &catalog = "", const string &schema = "");
@@ -139,10 +162,11 @@ public:
 	// Build SQL to delete old delta rows that all dependent views have already consumed.
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
+	// delta_metadata_tables: qualified openivm_delta_tables of every native metadata location.
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
 	                                   const string &delta_metadata_table = "",
 	                                   vector<string> *deferred_cleanup = nullptr,
-	                                   const vector<string> &metadata_catalogs = {});
+	                                   const vector<string> &delta_metadata_tables = {});
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);

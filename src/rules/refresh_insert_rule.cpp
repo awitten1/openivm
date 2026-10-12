@@ -119,12 +119,9 @@ static void RegisterMetadataRestore(ClientContext &context, Connection &con, con
 	if (rows->HasError()) {
 		throw CatalogException("OpenIVM could not snapshot helper metadata: %s", rows->GetError());
 	}
-	auto location = con.Query("SELECT current_database(), current_schema()");
-	if (location->HasError()) {
-		throw CatalogException("OpenIVM could not resolve metadata restore location: %s", location->GetError());
-	}
-	auto restore = BuildRestoreRowsSQL(*rows, SqlUtils::FullName(location->GetValue(0, 0).ToString(),
-	                                                             location->GetValue(1, 0).ToString(), table_name));
+	auto location = RefreshMetadata::CurrentLocation(con);
+	auto restore =
+	    BuildRestoreRowsSQL(*rows, SqlUtils::FullName(location.catalog_name, location.schema_name, table_name));
 	if (!restore.empty()) {
 		TransactionalHelperUndoState::Get(context).AddRestoreSQL(std::move(restore));
 	}

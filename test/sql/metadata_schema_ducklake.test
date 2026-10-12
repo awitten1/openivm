@@ -1,0 +1,107 @@
+# name: test/sql/metadata_schema_ducklake.test
+# description: DuckLake MVs keep control metadata in the native frontend's openivm_metadata_schema and their backing, delta and publication tables in the lake schema
+# group: [sql]
+
+require openivm
+
+require parquet
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+statement ok
+ATTACH '__TEST_DIR__/openivm_metadata_schema_ducklake.db' AS dl (TYPE ducklake);
+
+statement ok
+CREATE SCHEMA dl.obs;
+
+statement ok
+CREATE TABLE dl.obs.readings (sensor INTEGER, val INTEGER);
+
+statement ok
+INSERT INTO dl.obs.readings VALUES (1, 10), (1, 20), (2, 5), (3, NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.obs.sensor_totals AS
+SELECT sensor, SUM(val) AS total, COUNT(*) AS cnt FROM dl.obs.readings GROUP BY sensor;
+
+# Control metadata lives in the native frontend, in the configured schema only.
+query IIII
+SELECT
+    (SELECT count(*) FROM memory.openivm.openivm_views
+     WHERE view_sql_name = 'sensor_totals' AND view_catalog = 'dl' AND view_schema = 'obs'),
+    (SELECT count(*) FROM memory.openivm.openivm_delta_tables d JOIN memory.openivm.openivm_views v USING (view_name)
+     WHERE v.view_sql_name = 'sensor_totals' AND d.catalog_type = 'ducklake' AND d.source_catalog = 'dl'
+       AND d.source_schema = 'obs'),
+    (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'memory' AND schema_name = 'main'
+       AND table_name IN ('openivm_views', 'openivm_delta_tables')),
+    (SELECT count(*) FROM duckdb_schemas() WHERE database_name = 'dl' AND schema_name = 'openivm');
+----
+1	1	0	0
+
+# The MV, its backing table, MV delta and publication table stay in the lake schema.
+query II
+SELECT
+    (SELECT count(*) FROM duckdb_views() WHERE database_name = 'dl' AND schema_name = 'obs' AND view_name = 'sensor_totals'),
+    (SELECT count(*) FROM duckdb_tables() t JOIN memory.openivm.openivm_views v
+        ON t.table_name IN ('openivm_data_' || v.view_name, 'openivm_delta_' || v.view_name, 'openivm_visible_' || v.view_name)
+     WHERE v.view_sql_name = 'sensor_totals' AND t.database_name = 'dl' AND t.schema_name = 'obs');
+----
+1	3
+
+statement ok
+INSERT INTO dl.obs.readings VALUES (2, 7), (4, 1), (4, 1);
+
+statement ok
+DELETE FROM dl.obs.readings WHERE val = 10;
+
+statement ok
+UPDATE dl.obs.readings SET val = val + 100 WHERE sensor = 2;
+
+statement ok
+PRAGMA refresh('dl.obs.sensor_totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.obs.sensor_totals EXCEPT ALL SELECT sensor, SUM(val), COUNT(*) FROM dl.obs.readings GROUP BY sensor) UNION ALL (SELECT sensor, SUM(val), COUNT(*) FROM dl.obs.readings GROUP BY sensor EXCEPT ALL SELECT * FROM dl.obs.sensor_totals));
+----
+0
+
+# The refresh watermark advanced in the configured schema.
+query I
+SELECT count(*) FROM memory.openivm.openivm_delta_tables d JOIN memory.openivm.openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'sensor_totals' AND d.last_snapshot_id IS NOT NULL;
+----
+1
+
+# Reads after the setting is cleared still discover the metadata.
+statement ok
+SET openivm_metadata_schema = '';
+
+statement ok
+INSERT INTO dl.obs.readings VALUES (5, 50);
+
+statement ok
+PRAGMA refresh('dl.obs.sensor_totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.obs.sensor_totals EXCEPT ALL SELECT sensor, SUM(val), COUNT(*) FROM dl.obs.readings GROUP BY sensor) UNION ALL (SELECT sensor, SUM(val), COUNT(*) FROM dl.obs.readings GROUP BY sensor EXCEPT ALL SELECT * FROM dl.obs.sensor_totals));
+----
+0
+
+# DROP cleans up the native metadata and the lake objects across the catalog boundary.
+statement ok
+DROP VIEW dl.obs.sensor_totals;
+
+query II
+SELECT
+    (SELECT count(*) FROM memory.openivm.openivm_views WHERE view_sql_name = 'sensor_totals'),
+    (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dl' AND schema_name = 'obs'
+       AND starts_with(table_name, 'openivm_'));
+----
+0	0

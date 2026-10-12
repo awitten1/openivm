@@ -2,11 +2,17 @@
 #include "core/refresh_metadata.hpp"
 
 #include "core/openivm_debug.hpp"
+#include "core/parser_create_mv_helpers.hpp"
+#include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "core/published_view.hpp"
+#include "duckdb/common/error_data.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/client_data.hpp"
+#include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "rules/column_hider.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/storage/data_table.hpp"
@@ -21,41 +27,283 @@
 
 namespace duckdb {
 
-void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
+namespace {
+
+// The metadata location a helper connection selected. Nested helpers reuse its schema,
+// so one operation never splits its metadata reads and writes across schemas.
+class MetadataLocationState : public ClientContextState {
+public:
+	string catalog_name;
+	string schema_name;
+};
+
+constexpr const char *METADATA_LOCATION_STATE = "openivm_metadata_location";
+
+optional_ptr<MetadataLocationState> TryGetLocationState(ClientContext &context) {
+	return context.registered_state->Get<MetadataLocationState>(METADATA_LOCATION_STATE);
+}
+
+vector<string> CatalogSchemas(Connection &con, const string &catalog) {
+	vector<string> schemas;
+	con.context->RunFunctionInTransaction([&]() {
+		Catalog::GetCatalog(*con.context, catalog).ScanSchemas(*con.context, [&](SchemaCatalogEntry &schema) {
+			schemas.push_back(schema.name);
+		});
+	});
+	std::sort(schemas.begin(), schemas.end());
+	return schemas;
+}
+
+bool SchemaExists(Connection &con, const string &catalog, const string &schema) {
+	for (auto &existing : CatalogSchemas(con, catalog)) {
+		if (StringUtil::CIEquals(existing, schema)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+string ResolveMetadataCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
 	auto catalog = view_catalog;
 	if (catalog.empty()) {
 		catalog = ClientData::Get(context).catalog_search_path->GetDefault().catalog;
 	}
-	string target = SqlUtils::QuoteIdentifier(DEFAULT_SCHEMA);
 	if (!catalog.empty()) {
-		auto type = con.Query("SELECT type FROM duckdb_databases() WHERE NOT internal AND database_name = '" +
+		auto type = con.Query("SELECT database_name, type FROM duckdb_databases() WHERE NOT internal AND "
+		                      "database_name = '" +
 		                      SqlUtils::EscapeValue(catalog) + "'");
 		if (type->HasError()) {
 			throw CatalogException("OpenIVM could not resolve metadata catalog: %s", type->GetError());
 		}
-		if (type->RowCount() && type->GetValue(0, 0).ToString() == "duckdb") {
-			target = SqlUtils::QuoteIdentifier(catalog) + "." + target;
+		if (type->RowCount() && type->GetValue(1, 0).ToString() == "duckdb") {
+			return type->GetValue(0, 0).ToString();
 		}
 	}
+	// External catalogs keep their control metadata in the connection's native database.
+	auto current = con.Query("SELECT current_database()");
+	if (current->HasError() || current->RowCount() == 0 || current->GetValue(0, 0).IsNull()) {
+		throw CatalogException("OpenIVM could not resolve metadata catalog: %s",
+		                       current->HasError() ? current->GetError() : string("no current database"));
+	}
+	return current->GetValue(0, 0).ToString();
+}
+
+void SelectMetadataLocation(Connection &con, const string &catalog, const string &schema) {
+	auto &state = *con.context->registered_state->GetOrCreate<MetadataLocationState>(METADATA_LOCATION_STATE);
+	state.catalog_name = catalog;
+	state.schema_name = schema;
+	// A configured schema is created with its catalog's first materialized view. Until then it
+	// holds no metadata, and unqualified lookups stay in the catalog's default schema.
+	auto selected = SchemaExists(con, catalog, schema) ? schema : string(DEFAULT_SCHEMA);
+	auto target = SqlUtils::QuoteIdentifier(catalog) + "." + SqlUtils::QuoteIdentifier(selected);
 	auto result = con.Query("USE " + target);
 	if (result->HasError()) {
 		throw CatalogException("OpenIVM could not select metadata catalog: %s", result->GetError());
 	}
-	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s for view catalog '%s'\n", target.c_str(), catalog.c_str());
+	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s for metadata schema '%s'\n", target.c_str(), schema.c_str());
+}
+
+} // namespace
+
+string RefreshMetadata::ConfiguredMetadataSchema(ClientContext &context) {
+	auto state = TryGetLocationState(context);
+	if (state && !state->schema_name.empty()) {
+		return state->schema_name;
+	}
+	Value value;
+	if (context.TryGetCurrentSetting(openivm::METADATA_SCHEMA_SETTING, value) && !value.IsNull()) {
+		return value.ToString();
+	}
+	return "";
+}
+
+vector<string> RefreshMetadata::FindMetadataSchemas(Connection &con, const string &catalog, const string &table) {
+	vector<string> schemas;
+	for (auto &schema : CatalogSchemas(con, catalog)) {
+		if (con.TableInfo(catalog, schema, table)) {
+			schemas.push_back(schema);
+		}
+	}
+	return schemas;
+}
+
+string RefreshMetadata::ResolveMetadataSchema(Connection &con, const string &catalog, const string &preferred) {
+	auto schemas = FindMetadataSchemas(con, catalog, openivm::VIEWS_TABLE);
+	for (auto &schema : schemas) {
+		if (StringUtil::CIEquals(schema, preferred)) {
+			return schema;
+		}
+	}
+	if (schemas.size() > 1) {
+		throw CatalogException("OpenIVM metadata exists in schemas %s of catalog '%s'; set openivm_metadata_schema "
+		                       "to the schema that should hold it",
+		                       StringUtil::Join(schemas, ", "), catalog);
+	}
+	if (schemas.size() == 1) {
+		// Existing metadata stays authoritative until PrepareMetadataSchema moves it.
+		return schemas[0];
+	}
+	return preferred.empty() ? string(DEFAULT_SCHEMA) : preferred;
+}
+
+void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
+	auto catalog = ResolveMetadataCatalog(context, con, view_catalog);
+	SelectMetadataLocation(con, catalog, ResolveMetadataSchema(con, catalog, ConfiguredMetadataSchema(context)));
+}
+
+void RefreshMetadata::UseSameLocation(ClientContext &context, Connection &con) {
+	auto state = TryGetLocationState(context);
+	if (!state || state->catalog_name.empty()) {
+		UseCatalog(context, con);
+		return;
+	}
+	auto catalog = state->catalog_name;
+	auto schema = state->schema_name;
+	SelectMetadataLocation(con, catalog, schema);
+}
+
+RefreshMetadata::MetadataLocation RefreshMetadata::CurrentLocation(Connection &con) {
+	auto state = TryGetLocationState(*con.context);
+	if (state && !state->catalog_name.empty()) {
+		return {state->catalog_name, state->schema_name};
+	}
+	auto result = con.Query("SELECT current_database(), current_schema()");
+	if (result->HasError() || result->RowCount() == 0) {
+		throw CatalogException("OpenIVM could not resolve its metadata location: %s",
+		                       result->HasError() ? result->GetError() : string("no current schema"));
+	}
+	return {result->GetValue(0, 0).ToString(), result->GetValue(1, 0).ToString()};
+}
+
+string RefreshMetadata::MetadataTable(Connection &con, const string &table) {
+	auto location = CurrentLocation(con);
+	return SqlUtils::FullName(location.catalog_name, location.schema_name, table);
+}
+
+void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string &view_catalog, bool create_schema) {
+	auto configured = ConfiguredMetadataSchema(context);
+	// Explicit transactions keep using the existing location; their CREATE program
+	// creates a missing schema transactionally.
+	if (configured.empty() || !context.transaction.IsAutoCommit()) {
+		return;
+	}
+	Connection con(*context.db);
+	// Dropping a legacy table re-enters OpenIVM's DROP handling on this helper.
+	TransactionalMVLockState::Get(*con.context)
+	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	MutationLockGuard guard(context);
+	auto catalog = ResolveMetadataCatalog(context, con, view_catalog);
+	auto current = FindMetadataSchemas(con, catalog, openivm::VIEWS_TABLE);
+	for (auto &schema : current) {
+		if (StringUtil::CIEquals(schema, configured)) {
+			return;
+		}
+	}
+	if (current.size() > 1) {
+		throw CatalogException("OpenIVM metadata exists in schemas %s of catalog '%s'; set openivm_metadata_schema "
+		                       "to one of them",
+		                       StringUtil::Join(current, ", "), catalog);
+	}
+	string legacy = current.empty() ? "" : current[0];
+	if (legacy.empty() && create_schema && !StringUtil::CIEquals(configured, DEFAULT_SCHEMA)) {
+		// Tables created before the first view (for example at LOAD) belong with the new metadata.
+		for (auto &table : MetadataTableNames()) {
+			if (con.TableInfo(catalog, DEFAULT_SCHEMA, table)) {
+				legacy = DEFAULT_SCHEMA;
+				break;
+			}
+		}
+	}
+	if (legacy.empty() && (!create_schema || SchemaExists(con, catalog, configured))) {
+		return;
+	}
+	auto run = [&](const string &sql) {
+		auto result = con.Query(sql);
+		if (result->HasError()) {
+			throw CatalogException(result->GetError());
+		}
+	};
+	OPENIVM_DEBUG_PRINT("[METADATA] Moving metadata of %s from '%s' to '%s'\n", catalog.c_str(), legacy.c_str(),
+	                    configured.c_str());
+	con.BeginTransaction();
+	try {
+		run("CREATE SCHEMA IF NOT EXISTS " + SqlUtils::QuoteIdentifier(catalog) + "." +
+		    SqlUtils::QuoteIdentifier(configured));
+		for (auto &table : legacy.empty() ? vector<string>() : MetadataTableNames()) {
+			auto source = con.TableInfo(catalog, legacy, table);
+			if (!source) {
+				continue;
+			}
+			auto source_name = SqlUtils::FullName(catalog, legacy, table);
+			auto target_name = SqlUtils::FullName(catalog, configured, table);
+			run(CreateMetadataTableSQL(table, target_name));
+			auto target = con.TableInfo(catalog, configured, table);
+			if (!target) {
+				throw CatalogException("could not create %s", target_name);
+			}
+			// Copy the shared columns: legacy tables can predate later metadata columns.
+			vector<string> columns;
+			for (auto &column : source->columns) {
+				for (auto &target_column : target->columns) {
+					if (StringUtil::CIEquals(column.Name(), target_column.Name())) {
+						columns.push_back(SqlUtils::QuoteIdentifier(column.Name()));
+						break;
+					}
+				}
+			}
+			auto column_list = StringUtil::Join(columns, ", ");
+			run("INSERT OR IGNORE INTO " + target_name + " (" + column_list + ") SELECT " + column_list + " FROM " +
+			    source_name);
+			run("DROP TABLE " + source_name);
+		}
+		con.Commit();
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		try {
+			con.Rollback();
+		} catch (std::exception &) {
+		}
+		throw CatalogException("OpenIVM could not move its metadata in catalog '%s' from schema '%s' to '%s': %s",
+		                       catalog, legacy.empty() ? string(DEFAULT_SCHEMA) : legacy, configured,
+		                       error.RawMessage());
+	}
+}
+
+vector<RefreshMetadata::MetadataLocation> RefreshMetadata::MetadataLocations(Connection &con, const string &table) {
+	// Metadata lives in native catalogs. Enumerating external tables also opens
+	// their metadata transactions and can block on unrelated DuckLake writes.
+	auto rows = con.Query("SELECT database_name FROM duckdb_databases() WHERE type='duckdb' "
+	                      "AND NOT internal ORDER BY database_name");
+	if (rows->HasError()) {
+		throw CatalogException("OpenIVM could not locate its metadata: %s", rows->GetError());
+	}
+	vector<MetadataLocation> locations;
+	for (idx_t row = 0; row < rows->RowCount(); row++) {
+		auto catalog = rows->GetValue(0, row).ToString();
+		for (auto &schema : FindMetadataSchemas(con, catalog, table)) {
+			locations.push_back({catalog, schema});
+		}
+	}
+	return locations;
+}
+
+vector<string> RefreshMetadata::MetadataTables(Connection &con, const string &table) {
+	vector<string> tables;
+	for (auto &location : MetadataLocations(con, table)) {
+		tables.push_back(SqlUtils::FullName(location.catalog_name, location.schema_name, table));
+	}
+	return tables;
 }
 
 // The compiler's helper connection cannot observe the caller's uncommitted metadata.
 // Read through the caller's storage transaction and shadow only the compiler's reads.
 void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
-	auto current = con.Query("SELECT current_database()");
-	if (current->HasError()) {
-		throw CatalogException("Cannot resolve transaction metadata catalog: %s", current->GetError());
-	}
-	auto catalog = current->GetValue(0, 0).ToString();
+	auto location = CurrentLocation(con);
+	auto &catalog = location.catalog_name;
 	for (auto name :
-	     {openivm::VIEWS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::MV_DEPS_TABLE, "openivm_refresh_hooks"}) {
-		auto entry =
-		    Catalog::GetEntry<TableCatalogEntry>(context, catalog, DEFAULT_SCHEMA, name, OnEntryNotFound::RETURN_NULL);
+	     {openivm::VIEWS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::MV_DEPS_TABLE, openivm::REFRESH_HOOKS_TABLE}) {
+		auto entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, location.schema_name, name,
+		                                                  OnEntryNotFound::RETURN_NULL);
 		if (!entry) {
 			continue;
 		}
@@ -202,9 +450,11 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 			throw ParserException("Could not read IVM metadata for materialized view '%s'%s: %s", view_name, locus_text,
 			                      result->GetError());
 		}
+		auto location = CurrentLocation(con);
 		throw CatalogException("Materialized view '%s' does not exist in IVM metadata; check view_sql_name, "
-		                       "view_catalog and view_schema in the native database's main.openivm_views",
-		                       view_name);
+		                       "view_catalog and view_schema in %s",
+		                       view_name,
+		                       SqlUtils::FullName(location.catalog_name, location.schema_name, openivm::VIEWS_TABLE));
 	}
 	auto type_value = result->GetValue(0, 0);
 	if (type_value.IsNull()) {
@@ -277,18 +527,10 @@ string RefreshMetadata::GetLastUpdate(const string &view_name, const string &tab
 }
 
 vector<string> RefreshMetadata::MetadataCatalogs(Connection &con) {
-	// Source metadata lives in native catalogs. Enumerating external tables also
-	// opens their metadata transactions and can block on unrelated DuckLake writes.
-	auto rows = con.Query("SELECT database_name FROM duckdb_databases() WHERE type='duckdb' "
-	                      "AND NOT internal ORDER BY database_name");
-	if (rows->HasError()) {
-		throw CatalogException("OpenIVM could not locate source metadata: %s", rows->GetError());
-	}
 	vector<string> catalogs;
-	for (idx_t row = 0; row < rows->RowCount(); row++) {
-		auto catalog = rows->GetValue(0, row).ToString();
-		if (con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE)) {
-			catalogs.push_back(std::move(catalog));
+	for (auto &location : MetadataLocations(con, openivm::DELTA_TABLES_TABLE)) {
+		if (catalogs.empty() || catalogs.back() != location.catalog_name) {
+			catalogs.push_back(location.catalog_name);
 		}
 	}
 	return catalogs;
@@ -712,20 +954,12 @@ int64_t RefreshMetadata::GetRefreshInterval(const string &view_name) {
 }
 
 vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
-	// Scheduler metadata belongs to native catalogs. Scanning duckdb_tables()
-	// also opens external catalogs, taking DuckLake/SQLite read locks while a
-	// foreground refresh may be committing its writes.
-	auto catalogs = con.Query("SELECT database_name FROM duckdb_databases() WHERE type = 'duckdb' "
-	                          "AND NOT internal ORDER BY database_name");
-	if (catalogs->HasError()) {
-		throw CatalogException("OpenIVM could not enumerate metadata catalogs: %s", catalogs->GetError());
-	}
+	// Scheduler metadata belongs to native catalogs, in whichever schema holds it.
+	// Scanning duckdb_tables() also opens external catalogs, taking DuckLake/SQLite
+	// read locks while a foreground refresh may be committing its writes.
 	string query;
-	for (idx_t row = 0; row < catalogs->RowCount(); row++) {
-		auto catalog = catalogs->GetValue(0, row).ToString();
-		if (!con.TableInfo(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE)) {
-			continue;
-		}
+	for (auto &location : MetadataLocations(con, openivm::VIEWS_TABLE)) {
+		auto &catalog = location.catalog_name;
 		auto catalog_literal = "'" + SqlUtils::EscapeValue(catalog) + "'";
 		if (!query.empty()) {
 			query += " UNION ALL ";
@@ -734,9 +968,9 @@ vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
 		         "), "
 		         "COALESCE(v.view_schema, 'main'), v.refresh_interval, "
 		         "(SELECT MIN(d.last_update) FROM " +
-		         SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE) +
+		         SqlUtils::FullName(catalog, location.schema_name, openivm::DELTA_TABLES_TABLE) +
 		         " d WHERE d.view_name = v.view_name), " + catalog_literal + " FROM " +
-		         SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::VIEWS_TABLE) +
+		         SqlUtils::FullName(catalog, location.schema_name, openivm::VIEWS_TABLE) +
 		         " v WHERE v.refresh_interval IS NOT NULL";
 	}
 	if (query.empty()) {
@@ -769,7 +1003,7 @@ void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_prog
 
 string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
                                              const string &delta_metadata_table, vector<string> *deferred_cleanup,
-                                             const vector<string> &metadata_catalogs) {
+                                             const vector<string> &delta_metadata_tables) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
@@ -778,8 +1012,7 @@ string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string 
 	if (parts.size() == 3) {
 		auto predicate = SourcePredicate(parts[2], parts[0], parts[1]);
 		consumers = "SELECT last_update FROM " + metadata_table + " WHERE " + predicate;
-		for (auto &catalog : metadata_catalogs) {
-			auto other = SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::DELTA_TABLES_TABLE);
+		for (auto &other : delta_metadata_tables) {
 			if (!StringUtil::CIEquals(other, metadata_table)) {
 				consumers += " UNION ALL SELECT last_update FROM " + other + " WHERE " + predicate;
 			}

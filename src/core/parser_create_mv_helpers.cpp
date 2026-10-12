@@ -67,10 +67,111 @@ string BuildUpdateViewJsonSQL(const string &column_name, const string &json, con
 	       SqlUtils::EscapeSingleQuotes(json) + "' WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'";
 }
 
+static const vector<std::pair<string, string>> &MetadataTableDefinitions() {
+	// Matcher metadata columns (signature_hash..nullified_columns_json) stay
+	// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
+	// Refresh hooks: extensions can register custom SQL to run on MV refresh
+	// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm).
+	// Refresh history stores execution stats for learned cost model calibration;
+	// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.
+	static const vector<std::pair<string, string>> definitions = {
+	    {openivm::MV_DEPS_TABLE, "(parent_view VARCHAR, child_view VARCHAR, edge_kind VARCHAR DEFAULT 'direct',"
+	                             " PRIMARY KEY (parent_view, child_view))"},
+	    {openivm::VIEWS_TABLE,
+	     "(view_name varchar primary key, view_catalog varchar default null,"
+	     " view_schema varchar default null, view_sql_name varchar default null, sql_string varchar, type tinyint,"
+	     " has_minmax boolean default false, has_left_join boolean default false,"
+	     " has_join boolean default false,"
+	     " last_update timestamp, refresh_interval bigint default null,"
+	     " refresh_in_progress boolean default false,"
+	     " group_columns varchar default null,"
+	     " window_order_columns varchar default null,"
+	     " aggregate_types varchar default null,"
+	     " derived_aggregate_outputs_json varchar default null,"
+	     " having_predicate varchar default null,"
+	     " group_recompute_affected_mode varchar default null,"
+	     " group_recompute_source_occurrences_json varchar default null,"
+	     " has_full_outer boolean default false,"
+	     " full_outer_join_cols varchar default null,"
+	     " signature_hash ubigint default null,"
+	     " canonical_plan_blob blob default null,"
+	     " output_columns_json varchar default null,"
+	     " predicate_summary_json varchar default null,"
+	     " fd_summary_json varchar default null,"
+	     " source_tables_json varchar default null,"
+	     " aggregate_decomposition_json varchar default null,"
+	     " nullified_columns_json varchar default null,"
+	     " distinct_aux_meta_json varchar default null,"
+	     " count_distinct_aux_meta_json varchar default null,"
+	     " semi_anti_aux_meta_json varchar default null,"
+	     " lineage_json varchar default null,"
+	     " leftjoin_secondary_meta_json varchar default null,"
+	     " published_query varchar default null,"
+	     " pending_after_hook boolean default null)"},
+	    {openivm::REFRESH_HOOKS_TABLE, "(view_name varchar primary key, hook_sql varchar not null,"
+	                                   " mode varchar not null default 'after')"},
+	    {openivm::DELTA_TABLES_TABLE, "(view_name varchar, table_name varchar, last_update timestamp,"
+	                                  " catalog_type varchar default 'duckdb', last_snapshot_id bigint default "
+	                                  "null,"
+	                                  " last_refresh_ts timestamp default null,"
+	                                  " pending_row_estimate bigint default null,"
+	                                  " pending_estimate_ts timestamp default null,"
+	                                  " source_catalog varchar default null,"
+	                                  " source_schema varchar default null,"
+	                                  " source_table_id bigint default null,"
+	                                  " primary key(view_name, table_name))"},
+	    {openivm::HISTORY_TABLE, "(view_name varchar, refresh_timestamp timestamp default "
+	                             "current_timestamp,"
+	                             " method varchar, incremental_compute_est double, "
+	                             "incremental_upsert_est double,"
+	                             " recompute_compute_est double, recompute_replace_est double,"
+	                             " actual_duration_ms bigint,"
+	                             " strategy varchar default 'incremental',"
+	                             " primary key(view_name, refresh_timestamp))"},
+	    {openivm::PROFILE_TABLE, "(refresh_id varchar, view_name varchar,"
+	                             " profile_timestamp timestamp default current_timestamp,"
+	                             " step_order integer, step_name varchar, duration_ms bigint, "
+	                             "detail varchar,"
+	                             " primary key(refresh_id, step_order))"},
+	    {openivm::MATCH_LOG_TABLE, "(query_hash UBIGINT,"
+	                               " log_timestamp TIMESTAMP,"
+	                               " matched_view VARCHAR,"
+	                               " chosen_strategy VARCHAR,"
+	                               " bypass_cost_est DOUBLE,"
+	                               " chosen_cost_est DOUBLE,"
+	                               " actual_duration_ms BIGINT,"
+	                               " PRIMARY KEY (query_hash, log_timestamp))"},
+	    {openivm::CONSTRAINTS_CACHE_TABLE, "(table_name VARCHAR, constraint_kind VARCHAR,"
+	                                       " columns_json VARCHAR, referenced_table VARCHAR,"
+	                                       " referenced_columns_json VARCHAR,"
+	                                       " is_trusted BOOLEAN DEFAULT true,"
+	                                       " PRIMARY KEY (table_name, constraint_kind, columns_json))"},
+	};
+	return definitions;
+}
+
+const vector<string> &MetadataTableNames() {
+	static const vector<string> names = []() {
+		vector<string> result;
+		for (auto &definition : MetadataTableDefinitions()) {
+			result.push_back(definition.first);
+		}
+		return result;
+	}();
+	return names;
+}
+
+string CreateMetadataTableSQL(const string &table, const string &target) {
+	for (auto &definition : MetadataTableDefinitions()) {
+		if (definition.first == table) {
+			return "create table if not exists " + (target.empty() ? table : target) + " " + definition.second;
+		}
+	}
+	throw InternalException("Unknown OpenIVM metadata table '%s'", table);
+}
+
 string CreateMVDependenciesSQL() {
-	return "CREATE TABLE IF NOT EXISTS " + string(openivm::MV_DEPS_TABLE) +
-	       " (parent_view VARCHAR, child_view VARCHAR, edge_kind VARCHAR DEFAULT 'direct',"
-	       " PRIMARY KEY (parent_view, child_view))";
+	return CreateMetadataTableSQL(openivm::MV_DEPS_TABLE);
 }
 
 static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalog, const string &schema,
@@ -86,40 +187,7 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	OPENIVM_DEBUG_PRINT("[CREATE] Checking metadata schema in %s.%s\n", catalog.c_str(), schema.c_str());
 
 	ddl.push_back(CreateMVDependenciesSQL());
-	// Matcher metadata columns (signature_hash..nullified_columns_json) stay
-	// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
-	ddl.push_back(
-	    "create table if not exists " + string(openivm::VIEWS_TABLE) +
-	    " (view_name varchar primary key, view_catalog varchar default null,"
-	    " view_schema varchar default null, view_sql_name varchar default null, sql_string varchar, type tinyint,"
-	    " has_minmax boolean default false, has_left_join boolean default false,"
-	    " has_join boolean default false,"
-	    " last_update timestamp, refresh_interval bigint default null,"
-	    " refresh_in_progress boolean default false,"
-	    " group_columns varchar default null,"
-	    " window_order_columns varchar default null,"
-	    " aggregate_types varchar default null,"
-	    " derived_aggregate_outputs_json varchar default null,"
-	    " having_predicate varchar default null,"
-	    " group_recompute_affected_mode varchar default null,"
-	    " group_recompute_source_occurrences_json varchar default null,"
-	    " has_full_outer boolean default false,"
-	    " full_outer_join_cols varchar default null,"
-	    " signature_hash ubigint default null,"
-	    " canonical_plan_blob blob default null,"
-	    " output_columns_json varchar default null,"
-	    " predicate_summary_json varchar default null,"
-	    " fd_summary_json varchar default null,"
-	    " source_tables_json varchar default null,"
-	    " aggregate_decomposition_json varchar default null,"
-	    " nullified_columns_json varchar default null,"
-	    " distinct_aux_meta_json varchar default null,"
-	    " count_distinct_aux_meta_json varchar default null,"
-	    " semi_anti_aux_meta_json varchar default null,"
-	    " lineage_json varchar default null,"
-	    " leftjoin_secondary_meta_json varchar default null,"
-	    " published_query varchar default null,"
-	    " pending_after_hook boolean default null)");
+	ddl.push_back(CreateMetadataTableSQL(openivm::VIEWS_TABLE));
 	// Forward-compat ALTER for existing DBs that pre-date `distinct_aux_meta_json`
 	// (the CREATE IF NOT EXISTS above is a no-op when the table exists with the older schema).
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "distinct_aux_meta_json varchar default null");
@@ -140,23 +208,8 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "pending_after_hook boolean default null");
 
-	// Refresh hooks: extensions can register custom SQL to run on MV refresh
-	// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm)
-	ddl.push_back("create table if not exists openivm_refresh_hooks"
-	              " (view_name varchar primary key, hook_sql varchar not null,"
-	              " mode varchar not null default 'after')");
-
-	ddl.push_back("create table if not exists " + string(openivm::DELTA_TABLES_TABLE) +
-	              " (view_name varchar, table_name varchar, last_update timestamp,"
-	              " catalog_type varchar default 'duckdb', last_snapshot_id bigint default "
-	              "null,"
-	              " last_refresh_ts timestamp default null,"
-	              " pending_row_estimate bigint default null,"
-	              " pending_estimate_ts timestamp default null,"
-	              " source_catalog varchar default null,"
-	              " source_schema varchar default null,"
-	              " source_table_id bigint default null,"
-	              " primary key(view_name, table_name))");
+	ddl.push_back(CreateMetadataTableSQL(openivm::REFRESH_HOOKS_TABLE));
+	ddl.push_back(CreateMetadataTableSQL(openivm::DELTA_TABLES_TABLE));
 	// Backfill for existing databases without the columns (added post-release).
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "last_refresh_ts timestamp default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "pending_row_estimate bigint default null");
@@ -172,24 +225,12 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	              "'(^|[^A-Za-z0-9_])join([^A-Za-z0-9_]|$)', 'i'))");
 	ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) + " SET has_join = false WHERE has_join IS NULL");
 
-	// Refresh history: stores execution stats for learned cost model calibration.
-	// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.
-	ddl.push_back("create table if not exists " + string(openivm::HISTORY_TABLE) +
-	              " (view_name varchar, refresh_timestamp timestamp default "
-	              "current_timestamp,"
-	              " method varchar, incremental_compute_est double, "
-	              "incremental_upsert_est double,"
-	              " recompute_compute_est double, recompute_replace_est double,"
-	              " actual_duration_ms bigint,"
-	              " strategy varchar default 'incremental',"
-	              " primary key(view_name, refresh_timestamp))");
+	ddl.push_back(CreateMetadataTableSQL(openivm::HISTORY_TABLE));
 	AddColumnIfNotExists(ddl, openivm::HISTORY_TABLE, history, "strategy varchar default 'incremental'");
-	ddl.push_back("create table if not exists " + string(openivm::PROFILE_TABLE) +
-	              " (refresh_id varchar, view_name varchar,"
-	              " profile_timestamp timestamp default current_timestamp,"
-	              " step_order integer, step_name varchar, duration_ms bigint, "
-	              "detail varchar,"
-	              " primary key(refresh_id, step_order))");
+	ddl.push_back(CreateMetadataTableSQL(openivm::PROFILE_TABLE));
+	// View-matching tables share the configured metadata schema.
+	ddl.push_back(CreateMetadataTableSQL(openivm::MATCH_LOG_TABLE));
+	ddl.push_back(CreateMetadataTableSQL(openivm::CONSTRAINTS_CACHE_TABLE));
 }
 
 template <class BUILD_DDL>
@@ -233,11 +274,18 @@ static void InitializeSharedDDL(ClientContext &context, Connection &con, const s
 }
 
 void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema) {
+	// Probe the selected schema itself: unqualified names could fall back to legacy tables in main.
+	auto table = [&](const char *name) {
+		return SqlUtils::FullName(catalog, schema, name);
+	};
 	InitializeSharedDDL(context, con,
 	                    "SELECT v.view_sql_name, v.pending_after_hook, d.source_table_id, h.mode, "
-	                    "r.strategy, p.step_order, dep.edge_kind FROM openivm_views v, openivm_delta_tables d, "
-	                    "openivm_refresh_hooks h, openivm_refresh_history r, openivm_refresh_profile p, "
-	                    "openivm_mv_dependencies dep LIMIT 0",
+	                    "r.strategy, p.step_order, dep.edge_kind, m.query_hash, c.is_trusted FROM " +
+	                        table(openivm::VIEWS_TABLE) + " v, " + table(openivm::DELTA_TABLES_TABLE) + " d, " +
+	                        table(openivm::REFRESH_HOOKS_TABLE) + " h, " + table(openivm::HISTORY_TABLE) + " r, " +
+	                        table(openivm::PROFILE_TABLE) + " p, " + table(openivm::MV_DEPS_TABLE) + " dep, " +
+	                        table(openivm::MATCH_LOG_TABLE) + " m, " + table(openivm::CONSTRAINTS_CACHE_TABLE) +
+	                        " c LIMIT 0",
 	                    [&](vector<string> &ddl) { AppendMetadataSchemaDDL(context, catalog, schema, ddl); });
 }
 

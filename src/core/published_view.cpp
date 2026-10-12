@@ -51,9 +51,8 @@ void WarnSnapshotHistoryDeletion(ClientContext &context, LogicalOperator &plan) 
 	auto catalog = get.parameters[0].ToString();
 	Connection con(*context.db);
 	vector<string> affected;
-	for (auto &metadata_catalog : RefreshMetadata::MetadataCatalogs(con)) {
-		auto views = con.Query("SELECT view_name, view_schema, COALESCE(view_sql_name, view_name) FROM " +
-		                       SqlUtils::QualifiedPrefix(metadata_catalog, DEFAULT_SCHEMA) + openivm::VIEWS_TABLE +
+	for (auto &views_table : RefreshMetadata::MetadataTables(con, openivm::VIEWS_TABLE)) {
+		auto views = con.Query("SELECT view_name, view_schema, COALESCE(view_sql_name, view_name) FROM " + views_table +
 		                       " WHERE lower(view_catalog) = lower('" + SqlUtils::EscapeValue(catalog) + "')");
 		if (views->HasError()) {
 			throw CatalogException("Could not check snapshot publication before history deletion: %s",
@@ -111,7 +110,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
                            const vector<string> &columns, bool ducklake, const string &metadata_table,
                            const vector<string> &scope_columns, const string &timestamp_sql, SqlDialect dialect,
                            const string &appended_rows, const string &scope_rows,
-                           const vector<string> &metadata_catalogs) {
+                           const vector<string> &delta_metadata_tables) {
 	auto quote = [&](const string &name) {
 		return DialectQuoteIdent(name, dialect);
 	};
@@ -142,7 +141,8 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 			       ", openivm_multiplicity, openivm_timestamp) SELECT *, 1::INTEGER, " + timestamp + " FROM (" + rows +
 			       ") published_rows WHERE EXISTS (SELECT 1 FROM " + metadata_table + " WHERE table_name = '" +
 			       SqlUtils::EscapeValue(delta_name) + "');\n";
-			sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, metadata_catalogs);
+			sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr,
+			                                             delta_metadata_tables);
 		}
 		OPENIVM_DEBUG_PRINT("[PUBLISH] Appending visible projection delta for %s\n", view_name.c_str());
 		return sql;
@@ -215,7 +215,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	}
 	sql += "DROP TABLE " + changes + ";\nDROP TABLE " + next + ";\n";
 	if (!ducklake) {
-		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, metadata_catalogs);
+		sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr, delta_metadata_tables);
 	}
 	OPENIVM_DEBUG_PRINT("[PUBLISH] Compiled visible-row publication for %s\n", view_name.c_str());
 	return sql;

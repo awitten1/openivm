@@ -4,6 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "core/published_view.hpp"
 #include "core/refresh_locks.hpp"
+#include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/printer.hpp"
@@ -156,8 +157,9 @@ struct CreateMVProfileStep {
 
 class CreateMVProfiler {
 public:
-	explicit CreateMVProfiler(ClientContext &context)
-	    : enabled(false), retention_days(31), next_step(0), total_start(std::chrono::steady_clock::now()) {
+	explicit CreateMVProfiler(ClientContext &context_p)
+	    : context(context_p), enabled(false), retention_days(31), next_step(0),
+	      total_start(std::chrono::steady_clock::now()) {
 		Value profile_val;
 		enabled = context.TryGetCurrentSetting("openivm_profile_refresh", profile_val) && !profile_val.IsNull() &&
 		          profile_val.GetValue<bool>();
@@ -210,6 +212,12 @@ public:
 		}
 		flushed = true;
 		Connection profile_con(db);
+		try {
+			RefreshMetadata::UseCatalog(context, profile_con);
+		} catch (std::exception &ex) {
+			OPENIVM_DEBUG_PRINT("[PROFILE] Cannot locate CREATE MV profile metadata: %s\n", ex.what());
+			return;
+		}
 		// Retention and the new profile share one durable metadata commit.
 		profile_con.BeginTransaction();
 		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
@@ -239,6 +247,7 @@ public:
 	}
 
 private:
+	ClientContext &context;
 	bool enabled;
 	bool flushed = false;
 	int64_t retention_days;
@@ -626,14 +635,10 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	if (statements.empty()) {
 		return;
 	}
-	string metadata_catalog;
-	auto current_database = connection.Query("SELECT current_database()");
-	if (!current_database->HasError() && current_database->RowCount() > 0 &&
-	    !current_database->GetValue(0, 0).IsNull()) {
-		metadata_catalog = current_database->GetValue(0, 0).ToString();
-	}
+	// Seed from the durable tables in the connection's metadata schema.
+	auto metadata_location = RefreshMetadata::CurrentLocation(connection);
 	auto durable_table = [&](const string &table) {
-		return metadata_catalog.empty() ? "main." + table : SqlUtils::FullName(metadata_catalog, DEFAULT_SCHEMA, table);
+		return SqlUtils::FullName(metadata_location.catalog_name, metadata_location.schema_name, table);
 	};
 	// Build constrained TEMP schemas first. CREATE TABLE AS would discard the
 	// primary keys required by INSERT OR REPLACE metadata operations.
@@ -888,7 +893,8 @@ void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChun
 	state.finished = true;
 }
 
-string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog) {
+string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog,
+                              const string &metadata_schema) {
 	struct ProfileRow {
 		string view_name;
 		string step_name;
@@ -1013,7 +1019,7 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 			auto refresh_id = view_name + "_create_tx_" +
 			                  to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 			// The lifecycle program restores the caller search path before these writes.
-			auto profile_table = SqlUtils::FullName(metadata_catalog, DEFAULT_SCHEMA, openivm::PROFILE_TABLE);
+			auto profile_table = SqlUtils::FullName(metadata_catalog, metadata_schema, openivm::PROFILE_TABLE);
 			OPENIVM_DEBUG_PRINT("[PROFILE] Recording CREATE MV profile in %s\n", profile_table.c_str());
 			for (idx_t step_order = 0; step_order < profile_rows.size(); step_order++) {
 				auto &row = profile_rows[step_order];
