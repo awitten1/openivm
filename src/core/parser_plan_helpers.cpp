@@ -194,16 +194,35 @@ PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, uni
 	return needs;
 }
 
-string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
-                                const string &default_db, const string &default_schema) {
-	// Auxiliary state is built while the metadata schema is selected; qualify sources
-	// whenever that differs from the caller's catalog and schema.
-	if (current_catalog.empty() || (current_catalog == default_db && current_schema == default_schema) ||
-	    table_name.find('.') != string::npos || table_name.find('(') != string::npos) {
+string QualifyCreateSourceTable(const string &table_name, const CreateMVPlanFacts &facts, const string &current_catalog,
+                                const string &current_schema) {
+	if (table_name.find('.') != string::npos || table_name.find('(') != string::npos) {
 		return table_name;
 	}
-	return KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
-	       KeywordHelper::WriteOptionallyQuoted(current_schema) + "." + table_name;
+	// Auxiliary state is built while the metadata schema is selected. Name the relation the
+	// view actually bound, which can come from any schema on the caller's search path.
+	const SourceTableInfo *bound = nullptr;
+	bool bound_in_current_schema = false;
+	for (auto &entry : facts.source_table_info) {
+		auto &source = entry.second;
+		if (!StringUtil::CIEquals(source.table_name, table_name)) {
+			continue;
+		}
+		bool in_current_schema = StringUtil::CIEquals(source.catalog_name, current_catalog) &&
+		                         StringUtil::CIEquals(source.schema_name, current_schema);
+		// Same-named sources prefer the caller's schema, then a deterministic order.
+		if (!bound || (in_current_schema && !bound_in_current_schema) ||
+		    (in_current_schema == bound_in_current_schema &&
+		     SqlUtils::FullName(source.catalog_name, source.schema_name, source.table_name) <
+		         SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name))) {
+			bound = &source;
+			bound_in_current_schema = in_current_schema;
+		}
+	}
+	if (!bound) {
+		return table_name;
+	}
+	return SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name);
 }
 
 static string StripTrailingSemicolon(string sql) {

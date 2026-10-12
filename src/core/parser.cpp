@@ -1207,8 +1207,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (view_model.HasCountDistinctAux()) {
 		add_profile_marker("create_mv_count_distinct_aux");
 		const auto &meta = view_model.count_distinct_aux;
-		string source_table =
-		    QualifyCreateSourceTable(meta.source, current_catalog, current_schema, default_db, default_schema);
+		string source_table = QualifyCreateSourceTable(meta.source, facts, current_catalog, current_schema);
 		string aux_target = get_aux_state_target(meta.aux_table);
 		string aux_create =
 		    BuildCountDistinctAuxStateCreateSQL(aux_target, source_table, meta.group_cols, meta.group_source_exprs,
@@ -1225,8 +1224,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		add_profile_marker("create_mv_filtered_group_count_aux");
 		const auto &req = view_model.filtered_group_count_aux;
 		const auto &meta = req.meta;
-		string source_table =
-		    QualifyCreateSourceTable(req.create_source, current_catalog, current_schema, default_db, default_schema);
+		string source_table = QualifyCreateSourceTable(req.create_source, facts, current_catalog, current_schema);
 		string aux_target = get_aux_state_target(meta.aux_table);
 		string aux_create = BuildFilteredGroupCountAuxStateCreateSQL(
 		    aux_target, source_table, meta.group_col, meta.sum_col, meta.source_group_expr, meta.source_sum_expr,
@@ -1241,10 +1239,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (view_model.HasSemiAntiAux()) {
 		add_profile_marker("create_mv_semi_anti_aux");
 		const auto &meta = view_model.semi_anti_aux;
-		string left_source_table =
-		    QualifyCreateSourceTable(meta.left_table, current_catalog, current_schema, default_db, default_schema);
-		string right_source_table =
-		    QualifyCreateSourceTable(meta.right_table, current_catalog, current_schema, default_db, default_schema);
+		string left_source_table = QualifyCreateSourceTable(meta.left_table, facts, current_catalog, current_schema);
+		string right_source_table = QualifyCreateSourceTable(meta.right_table, facts, current_catalog, current_schema);
 		string aux_target = get_aux_state_target(meta.aux_table);
 		string aux_create = BuildSemiAntiAuxStateCreateSQL(
 		    aux_target, left_source_table, meta.left_alias, right_source_table, meta.right_alias, meta.predicate,

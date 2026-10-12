@@ -41,8 +41,10 @@ schema to use.
 Do not move OpenIVM tables by hand. When `openivm_metadata_schema` names a schema
 that does not yet hold a catalog's metadata, the next `CREATE MATERIALIZED VIEW`
 or refresh in that catalog moves all control-metadata tables into it in one
-transaction. Metadata tables created before the first view, such as the constraint
-cache, move with them. Until then, OpenIVM reads the metadata where it is.
+transaction. Metadata tables that `main` holds outside a view registry, such as the
+constraint cache created at `LOAD` or before a first view created inside a
+transaction, move with them, including declared RELY foreign keys. Until then,
+OpenIVM reads the metadata where it is.
 
 The move runs outside explicit transactions. Inside `BEGIN ... COMMIT`, OpenIVM
 keeps using the existing metadata schema. If a catalog has no metadata yet, the
@@ -63,6 +65,10 @@ Internal objects never move with the metadata schema:
 | Unique index on grouped backing tables | The backing table |
 | Native source delta `openivm_delta_<table>` | The source table's catalog and schema |
 | DuckLake source changes | DuckLake snapshots; no delta table |
+
+An MV in an external catalog other than DuckLake keeps its internal objects in the
+`main` schema of the native frontend database, beside its control metadata's catalog
+but never in the metadata schema.
 
 `<key>` is an internal view key derived from the view's catalog, schema and name.
 Same-named views in different schemas or catalogs therefore have separate internal

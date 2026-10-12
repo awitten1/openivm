@@ -103,13 +103,18 @@ void SelectMetadataLocation(Connection &con, const string &catalog, const string
 	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s for metadata schema '%s'\n", target.c_str(), schema.c_str());
 }
 
+// A helper's nested connections stay in the schema it selected for the same catalog.
+string PreferredMetadataSchema(ClientContext &context, const string &catalog) {
+	auto state = TryGetLocationState(context);
+	if (state && !state->schema_name.empty() && StringUtil::CIEquals(state->catalog_name, catalog)) {
+		return state->schema_name;
+	}
+	return RefreshMetadata::ConfiguredMetadataSchema(context);
+}
+
 } // namespace
 
 string RefreshMetadata::ConfiguredMetadataSchema(ClientContext &context) {
-	auto state = TryGetLocationState(context);
-	if (state && !state->schema_name.empty()) {
-		return state->schema_name;
-	}
 	Value value;
 	if (context.TryGetCurrentSetting(openivm::METADATA_SCHEMA_SETTING, value) && !value.IsNull()) {
 		return value.ToString();
@@ -148,7 +153,8 @@ string RefreshMetadata::ResolveMetadataSchema(Connection &con, const string &cat
 
 void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
 	auto catalog = ResolveMetadataCatalog(context, con, view_catalog);
-	SelectMetadataLocation(con, catalog, ResolveMetadataSchema(con, catalog, ConfiguredMetadataSchema(context)));
+	auto schema = ResolveMetadataSchema(con, catalog, PreferredMetadataSchema(context, catalog));
+	SelectMetadataLocation(con, catalog, schema);
 }
 
 void RefreshMetadata::UseSameLocation(ClientContext &context, Connection &con) {
@@ -194,19 +200,24 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 	MutationLockGuard guard(context);
 	auto catalog = ResolveMetadataCatalog(context, con, view_catalog);
 	auto current = FindMetadataSchemas(con, catalog, openivm::VIEWS_TABLE);
+	bool configured_holds_views = false;
 	for (auto &schema : current) {
-		if (StringUtil::CIEquals(schema, configured)) {
-			return;
-		}
+		configured_holds_views = configured_holds_views || StringUtil::CIEquals(schema, configured);
 	}
 	if (current.size() > 1) {
+		if (configured_holds_views) {
+			// The configured schema is authoritative; never merge another view registry into it.
+			return;
+		}
 		throw CatalogException("OpenIVM metadata exists in schemas %s of catalog '%s'; set openivm_metadata_schema "
 		                       "to one of them",
 		                       StringUtil::Join(current, ", "), catalog);
 	}
-	string legacy = current.empty() ? "" : current[0];
-	if (legacy.empty() && create_schema && !StringUtil::CIEquals(configured, DEFAULT_SCHEMA)) {
-		// Tables created before the first view (for example at LOAD) belong with the new metadata.
+	string legacy = current.empty() || configured_holds_views ? "" : current[0];
+	if (legacy.empty() && (configured_holds_views || create_schema) &&
+	    !StringUtil::CIEquals(configured, DEFAULT_SCHEMA)) {
+		// Tables created outside a view registry (at LOAD, or before a first CREATE inside an
+		// explicit transaction) still belong with the metadata, including declared RELY FKs.
 		for (auto &table : MetadataTableNames()) {
 			if (con.TableInfo(catalog, DEFAULT_SCHEMA, table)) {
 				legacy = DEFAULT_SCHEMA;
@@ -214,7 +225,7 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 			}
 		}
 	}
-	if (legacy.empty() && (!create_schema || SchemaExists(con, catalog, configured))) {
+	if (legacy.empty() && (configured_holds_views || !create_schema || SchemaExists(con, catalog, configured))) {
 		return;
 	}
 	auto run = [&](const string &sql) {

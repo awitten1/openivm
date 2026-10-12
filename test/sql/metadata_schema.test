@@ -101,6 +101,11 @@ statement ok
 SET openivm_profile_refresh = false;
 
 query I
+SELECT count(*) FROM ((SELECT * FROM legacy_mv EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM legacy_src GROUP BY k) UNION ALL (SELECT k, SUM(v), COUNT(*) FROM legacy_src GROUP BY k EXCEPT ALL SELECT * FROM legacy_mv));
+----
+0
+
+query I
 SELECT count(*) > 0 FROM "OpenIVM Meta".openivm_refresh_profile p JOIN "OpenIVM Meta".openivm_views v USING (view_name)
 WHERE v.view_sql_name = 'legacy_mv';
 ----
@@ -257,6 +262,56 @@ query I
 SELECT count(*) FROM ((SELECT * FROM "Other Schema"."Totals MV" EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM "Other Schema".items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM "Other Schema".items GROUP BY grp EXCEPT ALL SELECT * FROM "Other Schema"."Totals MV"));
 ----
 0
+
+# Auxiliary state reads the source the view bound, even when that source comes
+# from a later schema on the search path.
+statement ok
+CREATE TABLE main_only_src (g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO main_only_src VALUES (1, 10), (1, 20), (1, 10), (2, 30);
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+statement ok
+SET search_path = 's1,main';
+
+statement ok
+CREATE MATERIALIZED VIEW aux_mv AS SELECT g, COUNT(DISTINCT x) AS dx FROM main_only_src GROUP BY g;
+
+statement ok
+USE openivm_metadata_schema.main;
+
+query III
+SELECT
+    (SELECT view_schema FROM "OpenIVM Meta".openivm_views WHERE view_sql_name = 'aux_mv'),
+    (SELECT type FROM "OpenIVM Meta".openivm_views WHERE view_sql_name = 'aux_mv'),
+    (SELECT count(*) FROM duckdb_tables() t JOIN "OpenIVM Meta".openivm_views v
+        ON t.table_name = 'openivm_aux_' || v.view_name AND t.schema_name = 's1'
+     WHERE v.view_sql_name = 'aux_mv');
+----
+s1	11	1
+
+statement ok
+INSERT INTO main_only_src VALUES (1, 40), (2, 30), (3, 99);
+
+statement ok
+DELETE FROM main_only_src WHERE g = 1 AND x = 20;
+
+statement ok
+UPDATE main_only_src SET x = 10 WHERE g = 3;
+
+statement ok
+PRAGMA refresh('s1.aux_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.aux_mv EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main_only_src GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main_only_src GROUP BY g EXCEPT ALL SELECT * FROM s1.aux_mv));
+----
+0
+
+statement ok
+SET openivm_stateful_auxstate = false;
 
 # ---------------------------------------------------------------------------
 # Replacement keeps one metadata row in the configured schema.
