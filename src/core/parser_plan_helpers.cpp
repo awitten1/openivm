@@ -7,7 +7,11 @@
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/main/settings.hpp"
+#include "duckdb/parser/query_error_context.hpp"
 #include "duckdb/optimizer/cte_inlining.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/keyword_helper.hpp"
@@ -194,8 +198,9 @@ PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, uni
 	return needs;
 }
 
-string QualifyCreateSourceTable(const string &table_name, const CreateMVPlanFacts &facts, const string &current_catalog,
-                                const string &current_schema) {
+string QualifyCreateSourceTable(ClientContext &context, const string &table_name, const CreateMVPlanFacts &facts,
+                                const string &current_catalog, const string &current_schema, const string &default_db,
+                                const string &default_schema) {
 	if (table_name.find('.') != string::npos || table_name.find('(') != string::npos) {
 		return table_name;
 	}
@@ -219,10 +224,24 @@ string QualifyCreateSourceTable(const string &table_name, const CreateMVPlanFact
 			bound_in_current_schema = in_current_schema;
 		}
 	}
-	if (!bound) {
+	if (bound) {
+		return SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name);
+	}
+	// Sources such as another MV bind through a view; resolve the name as the caller's
+	// search path did when the view was planned.
+	QueryErrorContext error_context;
+	for (auto type : {CatalogType::TABLE_ENTRY, CatalogType::VIEW_ENTRY}) {
+		auto entry = Catalog::GetEntry(context, INVALID_CATALOG, INVALID_SCHEMA,
+		                               EntryLookupInfo(type, table_name, error_context), OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			return SqlUtils::FullName(entry->ParentCatalog().GetName(), entry->ParentSchema().name, entry->name);
+		}
+	}
+	if (current_catalog.empty() || (current_catalog == default_db && current_schema == default_schema)) {
 		return table_name;
 	}
-	return SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name);
+	return KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
+	       KeywordHelper::WriteOptionallyQuoted(current_schema) + "." + table_name;
 }
 
 static string StripTrailingSemicolon(string sql) {

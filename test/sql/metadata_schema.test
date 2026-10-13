@@ -193,15 +193,16 @@ CREATE MATERIALIZED VIEW "Totals MV" AS SELECT grp, SUM(amount) AS total, COUNT(
 statement ok
 USE openivm_metadata_schema.main;
 
+# SQL names compare case-insensitively, as DuckDB identifiers do.
 query II
-SELECT view_schema, view_sql_name FROM "OpenIVM Meta".openivm_views WHERE view_sql_name = 'Totals MV' ORDER BY view_schema;
+SELECT view_schema, lower(view_sql_name) FROM "OpenIVM Meta".openivm_views WHERE lower(view_sql_name) = 'totals mv' ORDER BY view_schema;
 ----
-Other Schema	Totals MV
-s1	Totals MV
+Other Schema	totals mv
+s1	totals mv
 
 query II
 SELECT d.source_schema, d.table_name FROM "OpenIVM Meta".openivm_delta_tables d JOIN "OpenIVM Meta".openivm_views v USING (view_name)
-WHERE v.view_sql_name = 'Totals MV' ORDER BY d.source_schema;
+WHERE lower(v.view_sql_name) = 'totals mv' ORDER BY d.source_schema;
 ----
 Other Schema	openivm_delta_items
 s1	openivm_delta_items
@@ -212,7 +213,7 @@ SELECT
     (SELECT count(*) FROM duckdb_tables() t JOIN "OpenIVM Meta".openivm_views v
         ON t.table_name IN ('openivm_data_' || v.view_name, 'openivm_delta_' || v.view_name, 'openivm_visible_' || v.view_name)
         AND t.schema_name = v.view_schema
-     WHERE v.view_sql_name = 'Totals MV'),
+     WHERE lower(v.view_sql_name) = 'totals mv'),
     (SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_delta_items' AND schema_name IN ('s1', 'Other Schema'));
 ----
 6	2
@@ -322,7 +323,7 @@ SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM s1.items WHERE amount > 1
 
 query II
 SELECT
-    (SELECT count(*) FROM "OpenIVM Meta".openivm_views WHERE view_sql_name = 'Totals MV' AND view_schema = 's1'),
+    (SELECT count(*) FROM "OpenIVM Meta".openivm_views WHERE lower(view_sql_name) = 'totals mv' AND view_schema = 's1'),
     (SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'main' AND table_name = 'openivm_views');
 ----
 1	0
@@ -367,7 +368,7 @@ statement ok
 DROP VIEW s1."Totals MV";
 
 query I
-SELECT count(*) FROM "OpenIVM Meta".openivm_views WHERE view_sql_name = 'Totals MV';
+SELECT count(*) FROM "OpenIVM Meta".openivm_views WHERE lower(view_sql_name) = 'totals mv';
 ----
 0
 
@@ -375,7 +376,7 @@ statement ok
 ROLLBACK;
 
 query I
-SELECT count(*) FROM "OpenIVM Meta".openivm_views WHERE view_sql_name = 'Totals MV';
+SELECT count(*) FROM "OpenIVM Meta".openivm_views WHERE lower(view_sql_name) = 'totals mv';
 ----
 1
 
@@ -523,7 +524,7 @@ PRAGMA refresh('legacy_mv');
 query II
 SELECT
     (SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'OpenIVM Meta'),
-    (SELECT count(*) FROM main.openivm_views WHERE view_sql_name IN ('legacy_mv', 'new_mv', 'Totals MV', 'after_reopen'));
+    (SELECT count(*) FROM main.openivm_views WHERE lower(view_sql_name) IN ('legacy_mv', 'new_mv', 'totals mv', 'after_reopen'));
 ----
 0	4
 
@@ -531,7 +532,7 @@ query I
 SELECT count(*) FROM duckdb_tables() t JOIN main.openivm_views v
     ON t.table_name IN ('openivm_data_' || v.view_name, 'openivm_delta_' || v.view_name, 'openivm_visible_' || v.view_name)
     AND t.schema_name = v.view_schema
-WHERE v.view_sql_name IN ('legacy_mv', 'new_mv', 'Totals MV', 'after_reopen');
+WHERE lower(v.view_sql_name) IN ('legacy_mv', 'new_mv', 'totals mv', 'after_reopen');
 ----
 12
 
