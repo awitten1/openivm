@@ -41,21 +41,25 @@ def encoded_key(catalog: str, schema: str, name: str) -> str:
 
 
 class FakeOpenIVMConnection:
-    def __init__(self, metadata_schema="main", types=None, fail_create=(), legacy_columns=False):
+    def __init__(self, metadata_schema="main", types=None, fail_create=(), legacy_columns=False,
+                 create_metadata=True):
         self.con = duckdb.connect(":memory:")
         self.types = dict(types or {})
         self.fail_create = set(fail_create)
         self.metadata_schema = metadata_schema
         self.legacy_columns = legacy_columns
+        self.has_metadata = create_metadata
         self.created = []
         self.dropped = []
-        if metadata_schema != "main":
-            self.con.execute(f"CREATE SCHEMA {metadata_schema}")
-        self.con.execute(
-            f"CREATE TABLE {metadata_schema}.openivm_views (view_name VARCHAR PRIMARY KEY, "
-            "view_catalog VARCHAR DEFAULT NULL, view_schema VARCHAR DEFAULT NULL, "
-            "view_sql_name VARCHAR DEFAULT NULL, sql_string VARCHAR, type TINYINT)"
-        )
+        self.created_keys = {}  # user-facing name -> internal keys written by this fake's CREATE
+        if create_metadata:
+            if metadata_schema != "main":
+                self.con.execute(f"CREATE SCHEMA {metadata_schema}")
+            self.con.execute(
+                f"CREATE TABLE {metadata_schema}.openivm_views (view_name VARCHAR PRIMARY KEY, "
+                "view_catalog VARCHAR DEFAULT NULL, view_schema VARCHAR DEFAULT NULL, "
+                "view_sql_name VARCHAR DEFAULT NULL, sql_string VARCHAR, type TINYINT)"
+            )
 
     def insert_view(self, key, sql_name, ordinal, catalog="memory", schema="main"):
         self.con.execute(
@@ -70,19 +74,20 @@ class FakeOpenIVMConnection:
             self.created.append(name)
             if name in self.fail_create:
                 raise duckdb.CatalogException(f"Catalog Error: cannot create {name}")
-            if name in self.types:
+            if name in self.types and self.has_metadata:
                 key = name if self.legacy_columns else encoded_key("memory", "main", name)
                 self.insert_view(key, None if self.legacy_columns else name, self.types[name])
+                self.created_keys.setdefault(name, []).append(key)
             return self.con.execute("SELECT 1")
         drop = DROP_RE.match(sql)
         if drop:
             name = drop.group(1)
             self.dropped.append(name)
-            self.con.execute(
-                f"DELETE FROM {self.metadata_schema}.openivm_views "
-                "WHERE view_sql_name = ? OR view_name = ?",
-                [name, name],
-            )
+            # Like the extension, DROP removes only this view's own metadata row; rows seeded by a
+            # test for other identities (duplicates, other schemas) must survive.
+            if self.has_metadata:
+                for key in self.created_keys.pop(name, []):
+                    self.con.execute(f"DELETE FROM {self.metadata_schema}.openivm_views WHERE view_name = ?", [key])
             return self.con.execute("SELECT 1")
         return self.con.execute(sql, *args)
 
@@ -154,8 +159,8 @@ class ClassifyQueryTest(unittest.TestCase):
         self.assertEqual(con.dropped, ["validate_mv", "validate_mv"])  # cleanup still happens
 
     def test_missing_metadata_table_is_metadata_failed(self):
-        con = FakeOpenIVMConnection(types={"validate_mv": AGGREGATE_GROUP})
-        con.con.execute("DROP TABLE openivm_views")
+        # CREATE succeeds but there is no openivm_views table anywhere
+        con = FakeOpenIVMConnection(types={"validate_mv": AGGREGATE_GROUP}, create_metadata=False)
         result, _ = vi.classify_query(con, "SELECT 1", "validate_mv")
         self.assertEqual(result, "metadata_failed")
 
