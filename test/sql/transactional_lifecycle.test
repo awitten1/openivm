@@ -4,6 +4,9 @@
 
 require openivm
 
+statement ok
+SET openivm_archive_compiled_sql = true;
+
 require parquet
 
 statement ok
@@ -13,6 +16,9 @@ statement ok
 LOAD ducklake;
 
 load __TEST_DIR__/openivm_transactional_lifecycle.db
+
+statement ok
+SET openivm_archive_compiled_sql = true;
 
 # CREATE rollback removes every object created for the MV.
 statement ok
@@ -1442,6 +1448,9 @@ SELECT count(*) FROM (
 # Use a different persistent host so refresh cannot accidentally find the state there.
 load __TEST_DIR__/openivm_attachment_host.db
 
+statement ok
+SET openivm_archive_compiled_sql = true;
+
 # Keep an identically named view in the host to catch accidental metadata fallback.
 statement ok
 CREATE TABLE attached_src(id INTEGER, g INTEGER, v INTEGER);
@@ -1498,6 +1507,9 @@ statement ok
 USE openivm_attachment_host;
 
 restart
+
+statement ok
+SET openivm_archive_compiled_sql = true;
 
 statement ok
 ATTACH '__TEST_DIR__/openivm_attachment_state.db' AS attached_state;
@@ -1671,6 +1683,9 @@ SELECT (SELECT count(*) FROM (SELECT * FROM metadata_stale_retry EXCEPT ALL SELE
 load __TEST_DIR__/qualified_source_lifecycle.db
 
 statement ok
+SET openivm_archive_compiled_sql = true;
+
+statement ok
 SET openivm_disable_daemon=true;
 
 statement ok
@@ -1735,6 +1750,9 @@ statement ok
 INSERT INTO "Source.B"."rows.with""quote" VALUES(1,11),(2,22);
 
 restart
+
+statement ok
+SET openivm_archive_compiled_sql = true;
 
 statement ok
 SET openivm_disable_daemon=true;
@@ -1825,6 +1843,9 @@ INSERT INTO dl.a.t VALUES(2,22),(2,22);
 restart
 
 statement ok
+SET openivm_archive_compiled_sql = true;
+
+statement ok
 SET openivm_disable_daemon=true;
 
 statement ok
@@ -1888,6 +1909,9 @@ SELECT count(*) FROM ((SELECT * FROM résumé$final EXCEPT ALL SELECT id,SUM(v) 
 
 # CREATE profiles follow the metadata owner even after the caller search path is restored.
 load __TEST_DIR__/profile_creation_host.db
+
+statement ok
+SET openivm_archive_compiled_sql = true;
 
 statement ok
 ATTACH '__TEST_DIR__/profile_creation_target.db' AS "profile.target";

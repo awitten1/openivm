@@ -11,6 +11,12 @@
 
 namespace duckdb {
 
+bool CompiledSQLArchiveEnabled(ClientContext &context) {
+	Value value;
+	return context.TryGetCurrentSetting("openivm_archive_compiled_sql", value) && !value.IsNull() &&
+	       value.GetValue<bool>();
+}
+
 const char *CompiledProgramOutcomeName(CompiledProgramOutcome outcome) {
 	switch (outcome) {
 	case CompiledProgramOutcome::ATTEMPTED:
@@ -29,6 +35,23 @@ static string ArchiveTableName(const string &catalog, const string &schema, cons
 	return SqlUtils::FullName(catalog, schema.empty() ? string(DEFAULT_SCHEMA) : schema, table);
 }
 
+static vector<string> ArchiveRetentionStatements(ClientContext &context, const CompiledProgram &program,
+                                                 const string &catalog, const string &schema) {
+	Value retention;
+	if (!context.TryGetCurrentSetting("openivm_compiled_sql_retention", retention) || retention.IsNull()) {
+		throw InternalException("Compiled SQL archive retention setting is missing");
+	}
+	auto programs = ArchiveTableName(catalog, schema, openivm::COMPILED_PROGRAMS_TABLE);
+	auto statements = ArchiveTableName(catalog, schema, openivm::COMPILED_STATEMENTS_TABLE);
+	auto filter = "view_name = " + Value(program.view_name).ToSQLString() +
+	              " AND operation = " + Value(program.operation).ToSQLString();
+	auto obsolete = filter + " AND version NOT IN (SELECT version FROM " + programs + " WHERE " + filter +
+	                " ORDER BY version DESC LIMIT " + to_string(retention.GetValue<int64_t>()) + ")";
+	// Delete complete versions together, in the same transaction as the archive write.
+	// The newest version stays present, preserving deduplication and version numbering.
+	return {"DELETE FROM " + statements + " WHERE " + obsolete, "DELETE FROM " + programs + " WHERE " + obsolete};
+}
+
 vector<string> CompiledSQLArchiveSchemaDDL(const string &catalog, const string &schema) {
 	return {"create table if not exists " + ArchiveTableName(catalog, schema, openivm::COMPILED_PROGRAMS_TABLE) +
 	            " (view_name varchar, view_catalog varchar, view_schema varchar, view_sql_name varchar,"
@@ -42,10 +65,11 @@ vector<string> CompiledSQLArchiveSchemaDDL(const string &catalog, const string &
 	            " primary key (view_name, operation, version, stmt_order))"};
 }
 
-vector<string> BuildCompiledSQLArchiveStatements(const CompiledProgram &program, CompiledProgramOutcome outcome,
-                                                 const string &catalog, const string &schema) {
+vector<string> BuildCompiledSQLArchiveStatements(ClientContext &context, const CompiledProgram &program,
+                                                 CompiledProgramOutcome outcome, const string &catalog,
+                                                 const string &schema) {
 	vector<string> result;
-	if (program.statements.empty()) {
+	if (!CompiledSQLArchiveEnabled(context) || program.statements.empty()) {
 		return result;
 	}
 	result = CompiledSQLArchiveSchemaDDL(catalog, schema);
@@ -96,12 +120,14 @@ vector<string> BuildCompiledSQLArchiveStatements(const CompiledProgram &program,
 	                 ", last_outcome = " + outcome_name + ", last_outcome_at = " + openivm::UTC_NOW_SQL +
 	                 ", committed_count = COALESCE(committed_count, 0) + " + committed + " WHERE " + view_filter +
 	                 " AND version = " + latest_version + " AND compilation_id IS DISTINCT FROM " + compilation_id);
+	auto cleanup = ArchiveRetentionStatements(context, program, catalog, schema);
+	result.insert(result.end(), cleanup.begin(), cleanup.end());
 	return result;
 }
 
-string WriteCompiledProgram(Connection &con, const CompiledProgram &program, CompiledProgramOutcome outcome,
-                            const string &catalog, const string &schema) {
-	if (program.statements.empty()) {
+string WriteCompiledProgram(ClientContext &context, Connection &con, const CompiledProgram &program,
+                            CompiledProgramOutcome outcome, const string &catalog, const string &schema) {
+	if (!CompiledSQLArchiveEnabled(context) || program.statements.empty()) {
 		return string();
 	}
 	// Same rules as BuildCompiledSQLArchiveStatements, but with bound parameters: DuckDB
@@ -190,27 +216,35 @@ string WriteCompiledProgram(Connection &con, const CompiledProgram &program, Com
 		    !describe_version()) {
 			return error;
 		}
-		return string();
+	} else {
+		auto updated =
+		    execute("UPDATE " + programs +
+		                " SET last_compilation_id = $1, last_outcome = $2, last_outcome_at = " + openivm::UTC_NOW_SQL +
+		                ", committed_count = COALESCE(committed_count, 0) + $3"
+		                " WHERE view_name = $4 AND operation = $5 AND version = $6",
+		            {compilation_id, outcome_name, committed, view_name, operation, Value::INTEGER(version)}, error);
+		if (!updated) {
+			return error;
+		}
+		// A version row deleted by hand is described again, as in the SQL form.
+		if (updated->GetValue(0, 0).GetValue<int64_t>() == 0 && !describe_version()) {
+			return error;
+		}
 	}
-	auto updated =
-	    execute("UPDATE " + programs +
-	                " SET last_compilation_id = $1, last_outcome = $2, last_outcome_at = " + openivm::UTC_NOW_SQL +
-	                ", committed_count = COALESCE(committed_count, 0) + $3"
-	                " WHERE view_name = $4 AND operation = $5 AND version = $6",
-	            {compilation_id, outcome_name, committed, view_name, operation, Value::INTEGER(version)}, error);
-	if (!updated) {
-		return error;
+	for (auto &sql : ArchiveRetentionStatements(context, program, catalog, schema)) {
+		auto pruned = con.Query(sql);
+		if (pruned->HasError()) {
+			return pruned->GetError();
+		}
 	}
-	// A version row deleted by hand is described again, as in the SQL form.
-	if (updated->GetValue(0, 0).GetValue<int64_t>() == 0 && !describe_version()) {
-		return error;
-	}
+	OPENIVM_DEBUG_PRINT("[ARCHIVE] Applied version retention for %s (%s)\n", program.view_name.c_str(),
+	                    program.operation.c_str());
 	return string();
 }
 
 string RecordCompiledProgram(ClientContext &context, const string &view_catalog, const CompiledProgram &program,
                              CompiledProgramOutcome outcome) {
-	if (program.statements.empty()) {
+	if (!CompiledSQLArchiveEnabled(context) || program.statements.empty()) {
 		return string();
 	}
 	try {
@@ -228,7 +262,7 @@ string RecordCompiledProgram(ClientContext &context, const string &view_catalog,
 		}
 		// One metadata commit for the whole program, never one per statement.
 		con.BeginTransaction();
-		error = WriteCompiledProgram(con, program, outcome, catalog, schema);
+		error = WriteCompiledProgram(context, con, program, outcome, catalog, schema);
 		if (!error.empty()) {
 			con.Rollback();
 			return error;

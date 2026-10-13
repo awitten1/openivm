@@ -27,11 +27,15 @@ Code: `src/include/core/metadata_location.hpp` defines `MetadataLocation` and
 `MetadataLocator`. Every metadata read and write resolves its location there:
 `RefreshMetadata::UseCatalog` selects it on helper connections, and every generated
 statement that names a metadata table qualifies it with the resolved catalog **and**
-schema. The compiled-SQL archive (#83) follows the same rule: native refreshes write it
+schema. When enabled with `SET openivm_archive_compiled_sql = true`, the compiled-SQL
+archive (#83) follows the same rule: native refreshes write it
 in their data transaction, transactional refreshes in the caller's transaction, and
 cross-catalog or remote refreshes in one metadata transaction after the refresh committed,
 always in the resolved catalog and schema. Its writes avoid `INSERT OR IGNORE`/`REPLACE`
-so they also run on PostgreSQL. Further metadata, such as a dedicated internal schema
+so they also run on PostgreSQL. `openivm_compiled_sql_retention` bounds distinct versions
+per view and operation (default 10); pruning program and statement rows shares the
+archive transaction. See [archive controls and cleanup](../build/building.md#archived-compiled-sql).
+Further metadata, such as a dedicated internal schema
 (#82), should take its catalog and schema from `MetadataLocator::Resolve`, not assume `main`.
 
 ## Placement rules

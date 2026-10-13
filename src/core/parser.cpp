@@ -1816,6 +1816,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// written before execution, so it describes them with comments instead.
 	string system_tables_sql;
 	string compiled_sql;
+	const bool archive_enabled = CompiledSQLArchiveEnabled(context);
 	vector<string> compiled_program;
 	for (size_t i = 0; i < ddl.size(); i++) {
 		if (StringUtil::StartsWith(ddl[i], OPENIVM_DDL_PROFILE_PREFIX) ||
@@ -1835,6 +1836,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			                "at DDL execution time.";
 		}
 		compiled_sql += executor_note.empty() ? ddl[i] + ";\n\n" : executor_note + "\n\n";
+		if (!archive_enabled) {
+			continue;
+		}
 		if (caller_transactional_ddl) {
 			auto rendered = RenderTransactionalStatement(ddl[i]);
 			compiled_program.insert(compiled_program.end(), rendered.begin(), rendered.end());
@@ -1851,7 +1855,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		SqlUtils::WriteFile(base_path + "/openivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
 	}
 
-	{
+	if (archive_enabled) {
 		// Archive the program atomically with CREATE's metadata: inside the caller's
 		// transaction, inside the batched native metadata transaction, or in one
 		// dedicated metadata transaction for staged programs (whose cleanup removes
@@ -1869,8 +1873,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		archived.statements = std::move(compiled_program);
 		vector<string> archive_ddl;
 		if (caller_transactional_ddl) {
-			archive_ddl = BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED, default_db,
-			                                                default_schema);
+			archive_ddl = BuildCompiledSQLArchiveStatements(context, archived, CompiledProgramOutcome::COMMITTED,
+			                                                default_db, default_schema);
 		} else {
 			auto mode = batch_ducklake_creation        ? DDLArchiveMode::CURRENT_TRANSACTION
 			            : staged_cross_catalog_replace ? DDLArchiveMode::AFTER_COMMIT

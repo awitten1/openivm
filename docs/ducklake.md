@@ -148,9 +148,12 @@ DuckLake MV delta objects would require a code change, not manual deletion.
 SQL files are written only when `openivm_files_path` is set before the relevant
 compilation. `PRAGMA openivm_files('product_summary')` shows their paths and whether
 they exist. See [Inspect the generated SQL](build/building.md#inspect-the-generated-sql)
-for directory setup and [saving compiled SQL in a table](build/building.md#inspect-or-save-compiled-sql-without-files).
-Saving compiler output as rows already works; automatically retaining the last
-executed program in OpenIVM's own metadata is not currently implemented.
+for directory setup. For automatic storage in metadata tables, set
+`openivm_archive_compiled_sql = true` before CREATE or refresh. The default retains
+the latest 10 distinct programs per view and operation; set
+`openivm_compiled_sql_retention = 1` to retain only the latest of each kind.
+No SQL artifact files are needed. See [archive controls](build/building.md#archived-compiled-sql)
+and [compile-only output](build/building.md#inspect-or-save-compiled-sql-without-files).
 
 ## How it works
 

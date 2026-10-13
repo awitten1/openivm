@@ -339,14 +339,17 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			precomputed_delta_activity = &delta_activity;
 		}
 	}
+	const bool archive_enabled = CompiledSQLArchiveEnabled(context);
 	CompiledProgram archived;
-	archived.view_name = vn;
-	auto archived_location = probe_meta.GetStoredViewLocation(vn, view_catalog_name, view_schema_name);
-	archived.view_catalog = archived_location.catalog_name;
-	archived.view_schema = archived_location.schema_name;
-	archived.view_sql_name = probe_meta.GetViewSQLName(vn);
-	archived.operation = "refresh";
-	archived.compilation_id = profiler.RefreshId();
+	if (archive_enabled) {
+		archived.view_name = vn;
+		auto archived_location = probe_meta.GetStoredViewLocation(vn, view_catalog_name, view_schema_name);
+		archived.view_catalog = archived_location.catalog_name;
+		archived.view_schema = archived_location.schema_name;
+		archived.view_sql_name = probe_meta.GetViewSQLName(vn);
+		archived.operation = "refresh";
+		archived.compilation_id = profiler.RefreshId();
+	}
 	// Which archive outcome a failure implies. Native refreshes archive inside their
 	// transaction; cross-catalog refreshes archive after their last commit.
 	bool execution_started = false;
@@ -428,6 +431,9 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		const string *executed_program = &sql;
 		string publish_sql;
 		auto set_archived_program = [&]() {
+			if (!archive_enabled) {
+				return;
+			}
 			archived.statements.clear();
 			vector<const string *> parts {executed_program};
 			if (cross_system) {
@@ -460,7 +466,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// The archive lives in the metadata location exec_con selected (catalog and schema).
 		string archive_catalog;
 		string archive_schema;
-		if (!cross_system) {
+		if (archive_enabled && !cross_system) {
 			auto location_error = ResolveCompiledSQLArchiveLocation(exec_con, archive_catalog, archive_schema);
 			if (!location_error.empty()) {
 				throw CatalogException("OpenIVM could not resolve the compiled-SQL archive location: %s",
@@ -637,11 +643,11 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			advance_watermarks(RequireUnchangedSources(context, source_pins, display_name));
 			sources_verified = true;
 		}
-		if (tx_open && !cross_system) {
+		if (archive_enabled && tx_open && !cross_system) {
 			// Same transaction as the refresh: the archive is visible exactly when the
 			// refresh commits, and an archive failure rolls the refresh back.
 			auto archive_start = std::chrono::steady_clock::now();
-			auto archive_error = WriteCompiledProgram(exec_con, archived, CompiledProgramOutcome::COMMITTED,
+			auto archive_error = WriteCompiledProgram(context, exec_con, archived, CompiledProgramOutcome::COMMITTED,
 			                                          archive_catalog, archive_schema);
 			if (!archive_error.empty()) {
 				throw Exception(ExceptionType::EXECUTOR,
@@ -808,7 +814,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			                    (long)duration_ms);
 			profiler.AddStep("record_refresh_history", history_start, method);
 		}
-		if (cross_system) {
+		if (archive_enabled && cross_system) {
 			// DuckDB cannot commit the native archive with external-catalog data. Record
 			// it once everything committed; if that fails, report the committed refresh
 			// with an error instead of success.
@@ -874,7 +880,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// Record the failed execution in its own metadata transaction. If that write
 		// also fails, say so in the refresh error rather than dropping it silently.
 		string archive_error;
-		if (execution_started && !archive_handled) {
+		if (archive_enabled && execution_started && !archive_handled) {
 			auto outcome =
 			    effects_may_be_committed ? CompiledProgramOutcome::UNKNOWN : CompiledProgramOutcome::ATTEMPTED;
 			archive_error = RecordCompiledProgram(context, view_catalog_name, archived, outcome);
@@ -1314,6 +1320,9 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 		stamped += sql + ";\n";
 		archived.statements.push_back(std::move(sql));
 	}
+	if (!CompiledSQLArchiveEnabled(context)) {
+		return stamped;
+	}
 	// The archive write joins the caller's transaction: it commits with the refresh,
 	// a failure aborts it, and a rollback leaves no archive row.
 	string archive_catalog;
@@ -1329,7 +1338,7 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	archived.view_sql_name = metadata.GetViewSQLName(view_name);
 	archived.operation = "refresh";
 	archived.compilation_id = NewCompilationId(view_name);
-	for (auto &statement : BuildCompiledSQLArchiveStatements(archived, CompiledProgramOutcome::COMMITTED,
+	for (auto &statement : BuildCompiledSQLArchiveStatements(context, archived, CompiledProgramOutcome::COMMITTED,
 	                                                         archive_catalog, archive_schema)) {
 		stamped += statement + ";\n";
 	}

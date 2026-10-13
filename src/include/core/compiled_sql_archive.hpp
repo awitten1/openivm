@@ -5,10 +5,12 @@
 
 namespace duckdb {
 
+bool CompiledSQLArchiveEnabled(ClientContext &context);
+
 // Archive of the compiled CREATE/REFRESH programs OpenIVM executed, stored in the
 // view's metadata catalog/schema. A new version is stored only when the complete
 // statement list differs from the latest stored version for the same view and
-// operation; all versions are retained until users delete them with SQL. The SQL
+// operation; retention keeps the configured number of latest versions. The SQL
 // is an inspection artifact: it embeds state-specific cutoffs, snapshot IDs, and
 // catalog references, so later operations always compile against current state.
 enum class CompiledProgramOutcome : uint8_t {
@@ -41,13 +43,14 @@ vector<string> CompiledSQLArchiveSchemaDDL(const string &catalog = "", const str
 
 // One batch of statements that stores `program` as a new version if it changed and
 // records `outcome` for the stored version. Runs in the caller's transaction.
-vector<string> BuildCompiledSQLArchiveStatements(const CompiledProgram &program, CompiledProgramOutcome outcome,
-                                                 const string &catalog, const string &schema);
+vector<string> BuildCompiledSQLArchiveStatements(ClientContext &context, const CompiledProgram &program,
+                                                 CompiledProgramOutcome outcome, const string &catalog,
+                                                 const string &schema);
 
 // Same as executing BuildCompiledSQLArchiveStatements through `con`, in its current
 // transaction, but with bound parameters. Returns an empty string or the error message.
-string WriteCompiledProgram(Connection &con, const CompiledProgram &program, CompiledProgramOutcome outcome,
-                            const string &catalog, const string &schema);
+string WriteCompiledProgram(ClientContext &context, Connection &con, const CompiledProgram &program,
+                            CompiledProgramOutcome outcome, const string &catalog, const string &schema);
 
 // Records `program` in its own metadata transaction on a helper connection. Returns
 // an empty string on success or the error message; it never throws.

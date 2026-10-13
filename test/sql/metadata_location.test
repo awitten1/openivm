@@ -4,7 +4,13 @@
 
 require openivm
 
+statement ok
+SET openivm_archive_compiled_sql = true;
+
 load __TEST_DIR__/openivm_metadata_host.db
+
+statement ok
+SET openivm_archive_compiled_sql = true;
 
 statement ok
 ATTACH '__TEST_DIR__/openivm_metadata_control.db' AS control;
@@ -808,6 +814,9 @@ statement ok
 SET openivm_metadata_schema = 'main';
 
 restart
+
+statement ok
+SET openivm_archive_compiled_sql = true;
 
 statement ok
 ATTACH '__TEST_DIR__/openivm_metadata_control.db' AS control;

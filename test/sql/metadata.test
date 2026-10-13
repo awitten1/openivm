@@ -585,9 +585,12 @@ SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'openivm_delta
 0
 
 # ==========================================
-# Compiled SQL archive: CREATE and refresh programs are archived automatically in
+# Compiled SQL archive: opt-in CREATE and refresh programs are archived in
 # the metadata catalog, independently of openivm_files_path (set above).
 # ==========================================
+
+statement ok
+SET openivm_archive_compiled_sql = true;
 
 statement ok
 CREATE TABLE arch_src (id INT, grp VARCHAR, val INT);
@@ -1087,6 +1090,9 @@ PRAGMA refresh('mv_arch');
 restart
 
 statement ok
+SET openivm_archive_compiled_sql = true;
+
+statement ok
 SET openivm_refresh_mode = 'full';
 
 statement ok
@@ -1171,5 +1177,340 @@ mv_arch_migrated	create	1	committed
 query II
 SELECT (SELECT count(*) FROM (SELECT * FROM mv_arch EXCEPT ALL SELECT grp, SUM(val), COUNT(*) FROM arch_src GROUP BY grp)),
        (SELECT count(*) FROM (SELECT grp, SUM(val), COUNT(*) FROM arch_src GROUP BY grp EXCEPT ALL SELECT * FROM mv_arch));
+----
+0	0
+
+# Archive controls: off by default; opt-in history is bounded per identity/operation.
+load __TEST_DIR__/archive_controls.db
+
+statement ok
+RESET openivm_archive_compiled_sql;
+
+statement ok
+RESET openivm_compiled_sql_retention;
+
+statement ok
+RESET openivm_files_path;
+
+query II
+SELECT current_setting('openivm_archive_compiled_sql'), current_setting('openivm_compiled_sql_retention');
+----
+false	10
+
+statement error
+SET openivm_compiled_sql_retention = 0;
+----
+must be at least 1
+
+statement error
+SET openivm_compiled_sql_retention = -1;
+----
+must be at least 1
+
+statement error
+SET openivm_compiled_sql_retention = NULL;
+----
+must be at least 1
+
+statement ok
+CREATE TABLE controls_src(k INT, v INT);
+
+statement ok
+INSERT INTO controls_src VALUES (1,10),(2,20);
+
+statement ok
+CREATE MATERIALIZED VIEW controls_mv AS SELECT k,SUM(v) AS total FROM controls_src GROUP BY k;
+
+# Disabled archival must not read or write even an incompatible archive table.
+statement ok
+ALTER TABLE openivm_compiled_statements RENAME COLUMN sql TO disabled_sql;
+
+statement ok
+INSERT INTO controls_src VALUES (1,3),(3,9);
+
+statement ok
+UPDATE controls_src SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM controls_src WHERE k=3;
+
+statement ok
+PRAGMA refresh('controls_mv');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM controls_mv EXCEPT ALL SELECT k,SUM(v) FROM controls_src GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_mv));
+----
+0	0
+
+query II
+SELECT (SELECT count(*) FROM openivm_compiled_programs), (SELECT count(*) FROM openivm_compiled_statements);
+----
+0	0
+
+# File export still works with table archival disabled.
+statement ok
+SET openivm_files_path='__TEST_DIR__';
+
+statement ok
+CREATE MATERIALIZED VIEW controls_file AS SELECT * FROM controls_src;
+
+query I
+SELECT count(*) FROM glob('__TEST_DIR__/openivm_compiled_queries_*.sql')
+WHERE file = '__TEST_DIR__/openivm_compiled_queries_' ||
+      (SELECT view_name FROM openivm_views WHERE view_sql_name='controls_file') || '.sql';
+----
+1
+
+query I
+SELECT count(*) FROM openivm_compiled_programs;
+----
+0
+
+statement ok
+DROP VIEW controls_file;
+
+statement ok
+RESET openivm_files_path;
+
+statement ok
+ALTER TABLE openivm_compiled_statements RENAME COLUMN disabled_sql TO sql;
+
+# Session settings must reach helper connections without affecting file export.
+statement ok
+SET SESSION openivm_archive_compiled_sql = true;
+
+loop i 0 12
+
+statement ok
+INSERT INTO controls_src VALUES (1,3),(3,9);
+
+statement ok
+UPDATE controls_src SET v=v+1 WHERE k=1;
+
+statement ok
+DELETE FROM controls_src WHERE k=3;
+
+statement ok
+PRAGMA refresh('controls_mv');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM controls_mv EXCEPT ALL SELECT k,SUM(v) FROM controls_src GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_mv));
+----
+0	0
+
+endloop
+
+query III
+SELECT count(*), min(version), max(version) FROM openivm_compiled_programs WHERE operation='refresh';
+----
+10	3	12
+
+# Pruning cannot leave partial programs or orphan statements.
+query II
+SELECT (SELECT count(*) FROM openivm_compiled_programs p WHERE statement_count !=
+        (SELECT count(*) FROM openivm_compiled_statements s WHERE s.view_name=p.view_name AND s.operation=p.operation AND s.version=p.version)),
+       (SELECT count(*) FROM openivm_compiled_statements s WHERE NOT EXISTS
+        (SELECT 1 FROM openivm_compiled_programs p WHERE p.view_name=s.view_name AND p.operation=s.operation AND p.version=s.version));
+----
+0	0
+
+# Disabling recording leaves existing history untouched, without pruning or changing counters.
+statement ok
+CREATE TEMP TABLE retained_programs AS SELECT * FROM openivm_compiled_programs;
+
+statement ok
+CREATE TEMP TABLE retained_statements AS SELECT * FROM openivm_compiled_statements;
+
+statement ok
+SET SESSION openivm_archive_compiled_sql = false;
+
+statement ok
+INSERT INTO controls_src VALUES (2,5);
+
+statement ok
+PRAGMA refresh('controls_mv');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM controls_mv EXCEPT ALL SELECT k,SUM(v) FROM controls_src GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_mv));
+----
+0	0
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM openivm_compiled_programs EXCEPT ALL SELECT * FROM retained_programs)
+       UNION ALL (SELECT * FROM retained_programs EXCEPT ALL SELECT * FROM openivm_compiled_programs))),
+       (SELECT count(*) FROM ((SELECT * FROM openivm_compiled_statements EXCEPT ALL SELECT * FROM retained_statements)
+       UNION ALL (SELECT * FROM retained_statements EXCEPT ALL SELECT * FROM openivm_compiled_statements)));
+----
+0	0
+
+statement ok
+SET SESSION openivm_archive_compiled_sql = true;
+
+statement ok
+SET SESSION openivm_compiled_sql_retention = 1;
+
+# Transaction-local pruning rolls back with the MV and source changes.
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO controls_src VALUES (2,7);
+
+statement ok
+PRAGMA refresh('controls_mv');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM controls_mv EXCEPT ALL SELECT k,SUM(v) FROM controls_src GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_mv));
+----
+0	0
+
+query III
+SELECT count(*), min(version), max(version) FROM openivm_compiled_programs WHERE operation='refresh';
+----
+1	13	13
+
+statement ok
+ROLLBACK;
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM controls_mv EXCEPT ALL SELECT k,SUM(v) FROM controls_src GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_mv));
+----
+0	0
+
+query II
+SELECT (SELECT count(*) FROM ((SELECT * FROM openivm_compiled_programs EXCEPT ALL SELECT * FROM retained_programs)
+       UNION ALL (SELECT * FROM retained_programs EXCEPT ALL SELECT * FROM openivm_compiled_programs))),
+       (SELECT count(*) FROM ((SELECT * FROM openivm_compiled_statements EXCEPT ALL SELECT * FROM retained_statements)
+       UNION ALL (SELECT * FROM retained_statements EXCEPT ALL SELECT * FROM openivm_compiled_statements)));
+----
+0	0
+
+statement ok
+BEGIN;
+
+statement ok
+INSERT INTO controls_src VALUES (2,7);
+
+statement ok
+PRAGMA refresh('controls_mv');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM controls_mv EXCEPT ALL SELECT k,SUM(v) FROM controls_src GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_mv));
+----
+0	0
+
+statement ok
+COMMIT;
+
+query III
+SELECT count(*), min(version), max(version) FROM openivm_compiled_programs WHERE operation='refresh';
+----
+1	13	13
+
+# Independent identities and operations are never pruned with this refresh history.
+statement ok
+CREATE SCHEMA controls_other;
+
+statement ok
+CREATE MATERIALIZED VIEW controls_other.controls_mv AS SELECT k,SUM(v) AS total FROM controls_src GROUP BY k;
+
+statement ok
+SET openivm_cascade_refresh='off';
+
+statement ok
+INSERT INTO controls_src VALUES (2,4);
+
+statement ok
+PRAGMA refresh('controls_mv');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM controls_mv EXCEPT ALL SELECT k,SUM(v) FROM controls_src GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_mv));
+----
+0	0
+
+query IIII
+SELECT view_schema, operation, count(*), max(version) FROM openivm_compiled_programs
+GROUP BY view_schema, operation ORDER BY view_schema, operation;
+----
+controls_other	create	1	1
+main	refresh	1	14
+
+# Repeated identical full-refresh SQL keeps its version, including after pruning.
+statement ok
+SET openivm_refresh_mode='full';
+
+statement ok
+UPDATE controls_src SET v=v+1 WHERE k=1;
+
+statement ok
+PRAGMA refresh('controls_mv');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM controls_mv EXCEPT ALL SELECT k,SUM(v) FROM controls_src GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_mv));
+----
+0	0
+
+statement ok
+UPDATE controls_src SET v=v+1 WHERE k=1;
+
+statement ok
+PRAGMA refresh('controls_mv');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM controls_mv EXCEPT ALL SELECT k,SUM(v) FROM controls_src GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_mv));
+----
+0	0
+
+query III
+SELECT count(*), max(version), sum(committed_count) FROM openivm_compiled_programs WHERE view_schema='main' AND operation='refresh';
+----
+1	15	2
+
+statement ok
+RESET openivm_refresh_mode;
+
+statement ok
+RESET openivm_cascade_refresh;
+
+# CREATE replacement uses the same retention policy, including caller rollback.
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW controls_other.controls_mv AS SELECT k,COUNT(*) AS n FROM controls_src GROUP BY k;
+
+query III
+SELECT count(*), min(version), max(version) FROM openivm_compiled_programs WHERE view_schema='controls_other' AND operation='create';
+----
+1	2	2
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW controls_other.controls_mv AS SELECT k,SUM(v) AS total FROM controls_src GROUP BY k;
+
+query III
+SELECT count(*), min(version), max(version) FROM openivm_compiled_programs WHERE view_schema='controls_other' AND operation='create';
+----
+1	3	3
+
+statement ok
+ROLLBACK;
+
+query III
+SELECT count(*), min(version), max(version) FROM openivm_compiled_programs WHERE view_schema='controls_other' AND operation='create';
+----
+1	2	2
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM controls_other.controls_mv EXCEPT ALL SELECT k,COUNT(*) FROM controls_src GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,COUNT(*) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_other.controls_mv));
 ----
 0	0

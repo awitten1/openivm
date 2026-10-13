@@ -202,9 +202,16 @@ to obtain an inspection file.
 
 ### Archived compiled SQL
 
-OpenIVM always archives the programs it runs for `CREATE MATERIALIZED VIEW` and
+Enable automatic archival before creating or refreshing a view:
+
+```sql
+SET openivm_archive_compiled_sql = true;  -- default: false
+SET openivm_compiled_sql_retention = 10;  -- latest distinct versions per view and operation
+```
+
+OpenIVM then archives the programs it runs for `CREATE MATERIALIZED VIEW` and
 refresh in two tables next to the view's `openivm_views` metadata, independently of
-`openivm_files_path`. For DuckLake views the default is the native frontend database's
+`openivm_files_path`. Neither setting creates SQL artifact files. For DuckLake views the default is the native frontend database's
 `main` schema. With [custom metadata placement](../internals/metadata-placement.md),
 the archive follows the selected catalog and schema; qualify the tables below, for
 example as `control.openivm.openivm_compiled_programs` and
@@ -268,10 +275,24 @@ ORDER BY s.stmt_order;
   cross-catalog refresh or DuckLake `CREATE OR REPLACE` commits but its archive
   write fails, it returns an error that says it committed. If recording a failed refresh also fails, both
   errors are reported.
-- **Retention.** All versions are kept until you delete them. History survives
-  `DROP VIEW` and `CREATE OR REPLACE`, and a recreated view continues the same
-  version sequence. To prune, delete matching
-  `(view_name, operation, version)` rows from both tables.
+- **Retention.** `openivm_compiled_sql_retention` must be at least 1 and defaults
+  to 10. Each archived operation retains the newest N distinct versions for that
+  view and operation (`create` or `refresh`), deleting older program and statement
+  rows in the same transaction. All outcomes count toward the limit. Set it to 1
+  to keep only the latest program of each kind. Identical programs reuse their
+  version and still apply the current limit; empty-delta skips do not prune.
+  Lowering the limit takes effect on the next archived operation for each view
+  and operation, not immediately across the database. Pruning rolls back with
+  transactional archive writes. Version numbers continue increasing after pruning.
+- **Disabling and cleanup.** `SET openivm_archive_compiled_sql = false` stops
+  recording and pruning without deleting existing history or disabling file
+  export. Enabling it later records future operations, not earlier ones. History
+  survives `DROP VIEW` and `CREATE OR REPLACE`; a recreated view continues the same
+  version sequence. This is a per-view history bound, not a total byte limit or
+  expiration policy for dropped views. To remove history manually, delete matching
+  `(view_name, operation, version)` rows from both tables in one transaction.
+  Empty archive tables may exist even when recording is disabled. Reapply the
+  settings after reopening the database; use global settings for daemon refreshes.
 
 Archived SQL is for inspection and auditing. Later refreshes always compile against
 current state; do not run an archived program to refresh a view.

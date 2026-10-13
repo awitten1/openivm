@@ -4,6 +4,9 @@
 
 require openivm
 
+statement ok
+SET openivm_archive_compiled_sql = true;
+
 require parquet
 
 statement ok

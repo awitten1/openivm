@@ -672,8 +672,8 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 						return begun->GetError();
 					}
 				}
-				auto error =
-				    WriteCompiledProgram(*conn, program, CompiledProgramOutcome::COMMITTED, fields[1], fields[2]);
+				auto error = WriteCompiledProgram(context, *conn, program, CompiledProgramOutcome::COMMITTED, fields[1],
+				                                  fields[2]);
 				if (!error.empty() || !own_transaction) {
 					return error;
 				}

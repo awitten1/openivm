@@ -324,6 +324,16 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             LogicalType::BIGINT, Value::BIGINT(50));
 	db_config.AddExtensionOption("openivm_profile_refresh", "record per-step materialized view refresh timings",
 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_archive_compiled_sql",
+	                             "archive executed CREATE and refresh SQL in metadata tables", LogicalType::BOOLEAN,
+	                             Value::BOOLEAN(false));
+	db_config.AddExtensionOption("openivm_compiled_sql_retention", "maximum archived versions per view and operation",
+	                             LogicalType::BIGINT, Value::BIGINT(10), [](ClientContext &, SetScope, Value &value) {
+		                             if (value.IsNull() || value.GetValue<int64_t>() < 1) {
+			                             throw InvalidInputException(
+			                                 "openivm_compiled_sql_retention must be at least 1");
+		                             }
+	                             });
 	db_config.AddExtensionOption("openivm_profile_retention_days",
 	                             "delete refresh profile rows older than this many days when profiling is written",
 	                             LogicalType::BIGINT, Value::BIGINT(31));

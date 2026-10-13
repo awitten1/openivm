@@ -32,7 +32,11 @@ class Client:
     def __init__(self, binary: Path, dsn: str, schema: str, database: str, lake: Path = None, configure=True):
         self.binary = binary
         self.database = database
-        preamble = EXTENSIONS + f"ATTACH {sql_literal(dsn)} AS control (TYPE postgres);\n"
+        preamble = (
+            "SET openivm_archive_compiled_sql=true;\n"
+            + EXTENSIONS
+            + f"ATTACH {sql_literal(dsn)} AS control (TYPE postgres);\n"
+        )
         if lake is not None:
             preamble += (
                 f"ATTACH {sql_literal('ducklake:sqlite:' + str(lake / 'lake.sqlite'))} AS lake "
@@ -263,6 +267,46 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
             "PRAGMA refresh('sales');\n"
         )
         assert client.value(bag_difference("sales", base)) == "0", "recovery after an uncommitted crash diverged"
+
+        # Retention also prunes complete programs in a remote metadata transaction.
+        for index in range(2):
+            client.run(
+                "SET SESSION openivm_compiled_sql_retention=1;\n"
+                f"INSERT INTO orders VALUES ({100 + index},'retention',7);\n"
+                "UPDATE orders SET amount=amount+1 WHERE product='a';\n"
+                f"DELETE FROM orders WHERE id={100 + index};\n"
+                "PRAGMA refresh('sales');\n"
+            )
+            assert client.value(bag_difference("sales", base)) == "0"
+            assert (
+                client.value(
+                    f"SELECT count(*) FROM control.{schema}.openivm_compiled_programs WHERE operation='refresh';"
+                )
+                == "1"
+            )
+            assert (
+                client.value(
+                    f"SELECT count(*) FROM control.{schema}.openivm_compiled_statements s WHERE NOT EXISTS "
+                    f"(SELECT 1 FROM control.{schema}.openivm_compiled_programs p WHERE "
+                    "p.view_name=s.view_name AND p.operation=s.operation AND p.version=s.version);"
+                )
+                == "0"
+            )
+        before = client.value(
+            f"SELECT count(*),max(version),sum(committed_count) FROM control.{schema}.openivm_compiled_programs;"
+        )
+        client.run(
+            "SET SESSION openivm_archive_compiled_sql=false;\n"
+            "UPDATE orders SET amount=amount+1 WHERE product='a';\n"
+            "PRAGMA refresh('sales');\n"
+        )
+        assert client.value(bag_difference("sales", base)) == "0"
+        assert (
+            client.value(
+                f"SELECT count(*),max(version),sum(committed_count) FROM control.{schema}.openivm_compiled_programs;"
+            )
+            == before
+        )
 
         client.run("DROP VIEW sales;\n")
         assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_views;") == "0"

@@ -181,15 +181,18 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 - **Can metadata stay outside DuckLake?** It already does. Start the built CLI with
   `./build/release/duckdb openivm_frontend.duckdb`, then attach your lake. Reopen
   that frontend and reattach the same lake under the same name in later sessions.
-  A configurable metadata schema such as `openivm` is not implemented; use `main`.
+  Use `openivm_metadata_catalog` and `openivm_metadata_schema` for
+  [custom metadata placement](docs/internals/metadata-placement.md), including PostgreSQL.
 - **Where is the generated SQL?** File export is opt-in. Create an output directory
   and set `openivm_files_path` before CREATE or refresh. Then call
   `PRAGMA openivm_files('dl.observation.product_summary')` to inspect exact paths.
   This pragma reports files; it does not generate them.
-- **Can compiled SQL be stored in a table?** It is archived automatically: every
-  CREATE and executed refresh program is kept in `openivm_compiled_programs` and
-  `openivm_compiled_statements`, with a new version only when the SQL changes. File
-  export stays independent. Compiled SQL contains state-specific cutoffs; it is an
+- **Can compiled SQL be stored in a table?** Set `openivm_archive_compiled_sql = true`
+  before CREATE or refresh to record executed programs in `openivm_compiled_programs`
+  and `openivm_compiled_statements`. Recording defaults to off; when enabled,
+  `openivm_compiled_sql_retention` keeps the latest 10 distinct programs per view and
+  operation by default (set it to 1 for latest-only history). File export stays
+  independent. Compiled SQL contains state-specific cutoffs; it is an
   inspection record, not a reusable refresh procedure.
 
 See [schema and metadata examples](docs/ducklake.md#schemas-metadata-and-internal-tables),
