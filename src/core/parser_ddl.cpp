@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_create_mv_helpers.hpp"
 #include "core/published_view.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/refresh_metadata.hpp"
@@ -86,6 +87,35 @@ static string MakeTemporaryMetadataDDL(const string &statement) {
 		return statement;
 	}
 	return "create temp table if not exists " + statement.substr(prefix.size());
+}
+
+// Search-path changes are never rolled back. A program run in the caller's session
+// must not depend on them, or a failure would leave the caller in another schema.
+static bool IsSearchPathStatement(const string &statement) {
+	auto trimmed = statement;
+	StringUtil::Trim(trimmed);
+	auto lower = StringUtil::Lower(trimmed);
+	return StringUtil::StartsWith(lower, "use ") || StringUtil::StartsWith(lower, "set search_path");
+}
+
+// Name the metadata location explicitly instead of selecting it with USE.
+static string QualifyMetadataStatement(const string &statement, const string &catalog, const string &schema) {
+	auto qualified = statement;
+	for (auto &table : MetadataTableNames()) {
+		auto target = SqlUtils::FullName(catalog, schema, table);
+		auto trimmed = qualified;
+		StringUtil::Trim(trimmed);
+		auto lower = StringUtil::Lower(trimmed);
+		for (const string prefix : {"create table if not exists ", "alter table "}) {
+			if (HasMetadataTarget(lower, prefix, table)) {
+				trimmed = trimmed.substr(0, prefix.size()) + target + trimmed.substr(prefix.size() + table.size());
+				qualified = trimmed;
+				break;
+			}
+		}
+		qualified = SqlUtils::ReplaceTableReferences(qualified, table, target);
+	}
+	return qualified;
 }
 
 static bool IsMetadataSchemaStatement(const string &statement) {
@@ -992,6 +1022,12 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 			                 false);
 			continue;
 		}
+		// The caller's search path already resolves the view query as the user wrote it;
+		// metadata is reached through explicit qualification.
+		if (IsSearchPathStatement(statement)) {
+			continue;
+		}
+		statement = QualifyMetadataStatement(statement, metadata_catalog, metadata_schema);
 
 		try {
 			Parser parser;

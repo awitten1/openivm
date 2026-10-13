@@ -302,7 +302,7 @@ void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog
 		// Legacy keys must still belong to the requested relation.
 		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +
 		              " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) +
-		              "' AND (lower(COALESCE(view_catalog, current_database())) <> lower('" +
+		              "' AND (lower(COALESCE(view_catalog, " + Value(catalog).ToSQLString() + ")) <> lower('" +
 		              SqlUtils::EscapeValue(view_catalog) + "') OR lower(COALESCE(view_schema, 'main')) <> lower('" +
 		              SqlUtils::EscapeValue(view_schema) +
 		              "'))) THEN error('Cannot replace materialized view: its internal key belongs to another "

@@ -156,6 +156,34 @@ SELECT count(*) FROM ((SELECT * FROM new_mv EXCEPT ALL SELECT k, SUM(v) FROM new
 ----
 0
 
+# A CREATE that fails during its initial load must not leave the caller's
+# session in the metadata schema.
+statement ok
+CREATE TABLE cast_src (v INTEGER);
+
+statement ok
+INSERT INTO cast_src VALUES (1000);
+
+statement error
+CREATE MATERIALIZED VIEW cast_mv AS SELECT v::TINYINT AS t FROM cast_src;
+----
+Conversion Error
+
+query T
+SELECT current_schema();
+----
+main
+
+statement ok
+CREATE TABLE after_failed_create (i INTEGER);
+
+query II
+SELECT
+    (SELECT string_agg(schema_name, ',') FROM duckdb_tables() WHERE table_name = 'after_failed_create'),
+    (SELECT count(*) FROM "OpenIVM Meta".openivm_views WHERE view_sql_name = 'cast_mv');
+----
+main	0
+
 # ---------------------------------------------------------------------------
 # Same-named sources and MVs in different schemas, quoted names, and a
 # non-default search path keep separate physical identities.
