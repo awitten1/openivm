@@ -113,7 +113,19 @@ static string QualifyMetadataStatement(const string &statement, const string &ca
 				break;
 			}
 		}
-		qualified = SqlUtils::ReplaceTableReferences(qualified, table, target);
+		// Only unqualified references mean "this metadata location". Qualified ones, such as
+		// consumer checks against other catalogs' openivm_delta_tables, keep their identity.
+		for (idx_t occurrence = 0;; occurrence++) {
+			auto reference = SqlUtils::FindTableReferenceOccurrence(qualified, table, occurrence);
+			if (reference.empty()) {
+				break;
+			}
+			if (reference.find('.') != string::npos) {
+				continue;
+			}
+			bool replaced = false;
+			qualified = SqlUtils::ReplaceTableReferenceOccurrence(qualified, table, occurrence, target, replaced);
+		}
 	}
 	return qualified;
 }

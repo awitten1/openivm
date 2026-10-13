@@ -204,8 +204,8 @@ string QualifyCreateSourceTable(ClientContext &context, const string &table_name
 	if (table_name.find('.') != string::npos || table_name.find('(') != string::npos) {
 		return table_name;
 	}
-	// Auxiliary state is built while the metadata schema is selected. Name the relation the
-	// view actually bound, which can come from any schema on the caller's search path.
+	// The staged executor builds auxiliary state with the metadata schema selected. Name the
+	// relation the view actually bound, which can come from any schema on the search path.
 	const SourceTableInfo *bound = nullptr;
 	bool bound_in_current_schema = false;
 	for (auto &entry : facts.source_table_info) {
