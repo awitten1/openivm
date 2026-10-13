@@ -750,6 +750,63 @@ SET openivm_metadata_catalog = '';
 statement ok
 SET openivm_metadata_schema = 'main';
 
+# A durable intent affects the archive outcome, but a clean data rollback must not
+# force recovery. Keep these decisions independent when combining SQL archival and
+# separate metadata placement.
+statement ok
+SET openivm_metadata_catalog = 'control';
+
+statement ok
+SET openivm_metadata_schema = 'openivm';
+
+statement ok
+CREATE TABLE rollback_source(k INTEGER, v VARCHAR);
+
+statement ok
+INSERT INTO rollback_source VALUES (1, '10');
+
+statement ok
+CREATE MATERIALIZED VIEW rollback_totals AS SELECT k, SUM(v::BIGINT) AS s FROM rollback_source GROUP BY k;
+
+statement ok
+INSERT INTO rollback_source VALUES (1, 'bad');
+
+statement error
+PRAGMA refresh('rollback_totals');
+----
+Could not convert string 'bad'
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'rollback_totals';
+----
+false
+
+query I
+SELECT last_outcome FROM control.openivm.openivm_compiled_programs
+WHERE view_sql_name = 'rollback_totals' AND operation = 'refresh';
+----
+unknown
+
+# The failing source query has no valid result; the failed refresh must retain the
+# exact previously materialized bag.
+query I
+SELECT count(*) FROM ((SELECT * FROM rollback_totals EXCEPT ALL SELECT 1, 10::HUGEINT)
+                     UNION ALL (SELECT 1, 10::HUGEINT EXCEPT ALL SELECT * FROM rollback_totals));
+----
+0
+
+statement ok
+DROP VIEW rollback_totals;
+
+statement ok
+DROP TABLE rollback_source;
+
+statement ok
+SET openivm_metadata_catalog = '';
+
+statement ok
+SET openivm_metadata_schema = 'main';
+
 restart
 
 statement ok

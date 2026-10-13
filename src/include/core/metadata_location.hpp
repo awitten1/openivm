@@ -2,6 +2,7 @@
 #define OPENIVM_METADATA_LOCATION_HPP
 
 #include "duckdb.hpp"
+#include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/connection.hpp"
 
 #include <mutex>
@@ -96,7 +97,7 @@ public:
 	explicit SimulatedCrashException(const string &point);
 };
 
-// Mutual exclusion of refreshes across clients sharing a remote metadata catalog.
+// Mutual exclusion of refreshes and lifecycle changes across clients sharing remote metadata.
 // Native metadata is single-process (DuckDB file lock) and uses the mutation gate.
 // A live holder renews its lease in the background, so only a crashed or partitioned
 // client's lease can expire and be taken over. Lease times are PostgreSQL server times.
@@ -122,6 +123,9 @@ public:
 	// transaction or makes it fail. Returns an error unless exactly one row was owned.
 	// Always succeeds for native metadata.
 	string Fence(Connection &con) const;
+	// Reconfirm ownership before destructive failure cleanup. Failure to contact the
+	// metadata server must retain objects, never remove a new owner's objects.
+	bool ConfirmOwnership() const;
 	// Holds back this client's background renewal; keep it from before Fence() until the
 	// fenced transaction commits or rolls back. Empty for native metadata.
 	std::unique_lock<std::timed_mutex> PauseRenewal() const;
@@ -141,6 +145,30 @@ private:
 	string token;
 	int64_t lease_seconds = 0;
 	shared_ptr<Heartbeat> heartbeat;
+};
+
+class MutationLockGuard;
+
+// DDL leases outlive planning and its transaction, including staged execution and
+// failure cleanup. QueryEnd also releases them after a planning error.
+class LifecycleLeaseState : public ClientContextState {
+public:
+	static LifecycleLeaseState &Get(ClientContext &context);
+	static optional_ptr<LifecycleLeaseState> TryGet(ClientContext &context);
+	static string SourceKey(const string &catalog, const string &schema, const string &table);
+	~LifecycleLeaseState() override;
+	bool Active() const {
+		return !leases.empty();
+	}
+	void Acquire(ClientContext &context, const MetadataLocation &location, vector<string> view_names);
+	void Require() const;
+	bool CanCleanup() const;
+	void SimulateTakeover();
+	void QueryEnd() override;
+
+private:
+	unique_ptr<MutationLockGuard> mutation_guard;
+	vector<pair<string, unique_ptr<RefreshLease>>> leases;
 };
 
 } // namespace duckdb

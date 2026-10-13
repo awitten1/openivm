@@ -2,12 +2,14 @@
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -188,20 +190,11 @@ MetadataLocation MetadataLocator::Resolve(ClientContext &context, Connection &co
 		}
 		return location;
 	}
-	// Legacy placement: native view catalogs own their metadata; external catalogs use the
-	// connection's default native database.
+	// External catalogs resolve through the physical frontend, even if this helper was
+	// already switched to a controller while resolving another pipeline target.
 	auto info = DescribeCatalog(con, catalog);
 	if (!info.found || !StringUtil::CIEquals(info.type, NATIVE_CATALOG_TYPE)) {
-		// Same resolution as the historical unqualified "USE main" on this connection.
-		auto selected = con.Query("USE main");
-		if (selected->HasError()) {
-			throw CatalogException("OpenIVM could not select metadata catalog: %s", selected->GetError());
-		}
-		auto current = con.Query("SELECT current_database()");
-		if (current->HasError()) {
-			throw CatalogException("OpenIVM could not resolve metadata catalog: %s", current->GetError());
-		}
-		info = DescribeCatalog(con, current->GetValue(0, 0).ToString());
+		info = DescribeCatalog(con, PhysicalDefaultCatalog(DatabaseInstance::GetDatabase(context)));
 	}
 	if (!info.found) {
 		return location;
@@ -532,8 +525,8 @@ RefreshLease::RefreshLease(ClientContext &context, const MetadataLocation &locat
 	auto clock_error = ReadServerClock(con, row, server_now, lease_until);
 	if (!clock_error.empty()) {
 		con.Query("ROLLBACK");
-		throw IOException("Cannot refresh materialized view '%s': OpenIVM %s (metadata catalog %s)", view_name,
-		                  clock_error, location.DisplayName());
+		throw IOException("Cannot acquire lifecycle/refresh lease for '%s': OpenIVM %s (metadata catalog %s)",
+		                  view_name, clock_error, location.DisplayName());
 	}
 	// Both the expiry check and the new deadline are server times.
 	auto result = con.Query("DELETE FROM " + row.table + " WHERE view_name = " + view_literal + " AND lease_until < " +
@@ -553,9 +546,9 @@ RefreshLease::RefreshLease(ClientContext &context, const MetadataLocation &locat
 		if (!current->HasError() && current->RowCount() > 0 && !current->GetValue(0, 0).IsNull()) {
 			holder = current->GetValue(0, 0).ToString();
 		}
-		throw TransactionException("Materialized view '%s' is being refreshed by another OpenIVM client sharing "
+		throw TransactionException("Materialized view '%s' is locked by another OpenIVM client sharing "
 		                           "metadata catalog %s (lease held until %s UTC, PostgreSQL server time). Retry "
-		                           "after that refresh finishes or its lease expires "
+		                           "after that operation finishes or its lease expires "
 		                           "(openivm_metadata_lease_seconds). Details: %s",
 		                           view_name, location.DisplayName(), holder, result->GetError());
 	}
@@ -683,6 +676,31 @@ string RefreshLease::Fence(Connection &con) const {
 	return "";
 }
 
+bool RefreshLease::ConfirmOwnership() const {
+	if (!Active()) {
+		return true;
+	}
+	if (Expired()) {
+		return false;
+	}
+	try {
+		auto pause = PauseRenewal();
+		Connection con(db);
+		con.BeginTransaction();
+		auto error = Fence(con);
+		if (!error.empty()) {
+			con.Rollback();
+			OPENIVM_DEBUG_PRINT("[LEASE] Cleanup ownership check failed: %s\n", error.c_str());
+			return false;
+		}
+		con.Commit();
+		return !Expired();
+	} catch (std::exception &ex) {
+		OPENIVM_DEBUG_PRINT("[LEASE] Cannot confirm cleanup ownership: %s\n", ex.what());
+		return false;
+	}
+}
+
 std::unique_lock<std::timed_mutex> RefreshLease::PauseRenewal() const {
 	if (!heartbeat) {
 		return std::unique_lock<std::timed_mutex>();
@@ -725,6 +743,71 @@ void RefreshLease::Abandon() {
 	if (entry != registry.held.end()) {
 		entry->second.abandoned = true;
 	}
+}
+
+LifecycleLeaseState &LifecycleLeaseState::Get(ClientContext &context) {
+	return *context.registered_state->GetOrCreate<LifecycleLeaseState>("openivm_lifecycle_leases");
+}
+
+optional_ptr<LifecycleLeaseState> LifecycleLeaseState::TryGet(ClientContext &context) {
+	return context.registered_state->Get<LifecycleLeaseState>("openivm_lifecycle_leases").get();
+}
+
+LifecycleLeaseState::~LifecycleLeaseState() {
+	QueryEnd();
+}
+
+string LifecycleLeaseState::SourceKey(const string &catalog, const string &schema, const string &table) {
+	return "source:" +
+	       SqlUtils::FullName(StringUtil::Lower(catalog), StringUtil::Lower(schema), StringUtil::Lower(table));
+}
+
+void LifecycleLeaseState::Acquire(ClientContext &context, const MetadataLocation &location, vector<string> view_names) {
+	if (!location.explicit_placement || location.IsNative()) {
+		return;
+	}
+	if (!mutation_guard) {
+		// RefreshLease's re-entry is database-local; unrelated local queries must not
+		// inherit each other's lease token while one DDL is still being planned.
+		mutation_guard = make_uniq<MutationLockGuard>(context);
+	}
+	std::sort(view_names.begin(), view_names.end());
+	for (auto &view_name : view_names) {
+		auto key = StringUtil::Lower(location.Prefix()) + view_name;
+		bool held = false;
+		for (auto &lease : leases) {
+			held |= lease.first == key;
+		}
+		if (!held) {
+			leases.emplace_back(key, make_uniq<RefreshLease>(context, location, view_name));
+		}
+	}
+	Require();
+}
+
+void LifecycleLeaseState::Require() const {
+	for (auto &lease : leases) {
+		lease.second->Require(lease.first);
+	}
+}
+
+bool LifecycleLeaseState::CanCleanup() const {
+	for (auto &lease : leases) {
+		if (!lease.second->ConfirmOwnership()) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void LifecycleLeaseState::SimulateTakeover() {
+	D_ASSERT(!leases.empty());
+	leases.front().second->SimulateTakeover(false);
+}
+
+void LifecycleLeaseState::QueryEnd() {
+	leases.clear();
+	mutation_guard.reset();
 }
 
 } // namespace duckdb

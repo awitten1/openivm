@@ -1269,7 +1269,7 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 			resolved.view_schema_name = parts[0];
 		}
 	}
-	RefreshMetadata::UseCatalog(context, con, resolved.view_catalog_name);
+	auto metadata_location = RefreshMetadata::UseCatalog(context, con, resolved.view_catalog_name);
 	RefreshMetadata metadata(con);
 	auto key = metadata.FindViewKey(resolved.view_catalog_name, resolved.view_schema_name, name);
 	if (key.empty() && parts.size() == 1) {
@@ -1304,8 +1304,8 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 
 	if (key.empty()) {
 		throw CatalogException("Materialized view '%s' does not exist in IVM metadata; check view_sql_name, "
-		                       "view_catalog and view_schema in the native database's main.openivm_views",
-		                       view_name);
+		                       "view_catalog and view_schema in %s",
+		                       view_name, metadata_location.Table(openivm::VIEWS_TABLE));
 	}
 	auto location = metadata.GetStoredViewLocation(key, resolved.view_catalog_name, resolved.view_schema_name);
 	resolved.view_catalog_name = location.catalog_name;

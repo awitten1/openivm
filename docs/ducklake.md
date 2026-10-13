@@ -44,7 +44,7 @@ schemas can contain views with the same name. Use a qualified name when refreshi
 or inspecting one of those views:
 
 ```sql
--- Control metadata stays in the native frontend database's main schema.
+-- By default, control metadata stays in the native frontend database's main schema.
 SELECT view_sql_name, view_catalog, view_schema, view_name AS internal_key
 FROM main.openivm_views;
 PRAGMA refresh('dl.observation.product_summary');

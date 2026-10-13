@@ -51,6 +51,7 @@ class Client:
             text=True,
             capture_output=True,
             check=False,
+            timeout=120,
         )
         if check and result.returncode != 0:
             raise AssertionError(f"DuckDB failed:\n{sql}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}")
@@ -239,10 +240,10 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
             == "true"
         ), "lease_until was not computed from the PostgreSQL server clock"
         # Another client cannot refresh while the lease is live on the server clock...
-        client.expect_error("PRAGMA refresh('sales');\n", "being refreshed by another OpenIVM client")
+        client.expect_error("PRAGMA refresh('sales');\n", "locked by another OpenIVM client")
         client.expect_error(
             set_server_lease(schema, "+ interval '120 seconds'") + "PRAGMA refresh('sales');\n",
-            "being refreshed by another OpenIVM client",
+            "locked by another OpenIVM client",
         )
         # ...and recovers once it expired on the server clock, recomputing instead of
         # replaying the deltas.
@@ -315,7 +316,7 @@ def ducklake_concurrency_scenario(binary: Path, dsn: str, root: Path):
                 if not any(
                     expected in failure
                     for expected in (
-                        "being refreshed by another OpenIVM client",
+                        "locked by another OpenIVM client",
                         "database is locked",
                         "could not be checked for changes while refreshing",
                     )
@@ -423,7 +424,7 @@ def ducklake_concurrent_writer_scenario(binary: Path, dsn: str, root: Path):
             # (or could not be checked) through every retry; each leaves the view consistent
             # for the next refresh.
             "refresh": (
-                "being refreshed by another OpenIVM client",
+                "locked by another OpenIVM client",
                 "database is locked",
                 "changed while refreshing",
                 "could not be checked for changes while refreshing",
@@ -514,6 +515,114 @@ def ducklake_lease_scenario(binary: Path, dsn: str, root: Path):
         drop_schema(binary, dsn, schema)
 
 
+def ducklake_lifecycle_scenario(binary: Path, dsn: str, root: Path):
+    """DDL shares refresh leases; failed creators never remove a winning creator's objects."""
+    schema = "openivm_it_" + uuid.uuid4().hex[:12]
+    lake = root / "lifecycle_lake"
+    (lake / "data").mkdir(parents=True)
+    client = Client(binary, dsn, schema, ":memory:", lake=lake)
+    base = "SELECT k, SUM(v) AS s FROM lake.main.events GROUP BY k"
+    try:
+        client.run(
+            "CREATE TABLE lake.main.events(id INTEGER, k INTEGER, v INTEGER);\n"
+            "INSERT INTO lake.main.events VALUES (1,1,10),(2,2,20);\n"
+            f"CREATE MATERIALIZED VIEW lake.main.totals AS {base};\n"
+            "CREATE MATERIALIZED VIEW lake.main.child AS SELECT * FROM lake.main.totals;\n"
+        )
+        for held_view, statements in [
+            (
+                "totals",
+                [
+                    "PRAGMA refresh('lake.main.totals');",
+                    f"CREATE MATERIALIZED VIEW lake.main.totals AS {base};",
+                    f"CREATE OR REPLACE MATERIALIZED VIEW lake.main.totals AS {base};",
+                    "DROP VIEW lake.main.totals CASCADE;",
+                    "CREATE MATERIALIZED VIEW lake.main.new_child AS SELECT * FROM lake.main.totals;",
+                    "DROP TABLE lake.main.events CASCADE;",
+                ],
+            ),
+            (
+                "child",
+                [
+                    "DROP VIEW lake.main.totals CASCADE;",
+                    f"CREATE OR REPLACE MATERIALIZED VIEW lake.main.totals AS {base};",
+                ],
+            ),
+        ]:
+            client.run(
+                f"INSERT INTO control.{schema}.openivm_refresh_leases "
+                "SELECT view_name, 'test-lifecycle-owner', TIMESTAMP '2099-01-01' "
+                f"FROM control.{schema}.openivm_views WHERE view_sql_name = '{held_view}';\n"
+            )
+            for statement in statements:
+                client.expect_error(statement + "\n", "locked by another OpenIVM client")
+                assert client.value(bag_difference("lake.main.totals", base)) == "0", statement
+                assert client.value(bag_difference("lake.main.child", base)) == "0", statement
+                assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "1"
+            client.run(f"DELETE FROM control.{schema}.openivm_refresh_leases;\n")
+
+        for round_index in range(4):
+            name = f"lake.main.concurrent_create_{round_index}"
+            results = []
+            ready = threading.Barrier(3)
+
+            def create():
+                ready.wait()
+                results.append(client.run(f"CREATE MATERIALIZED VIEW {name} AS {base};\n", check=False))
+
+            workers = [threading.Thread(target=create) for _ in range(3)]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join()
+            assert len(results) == 3, "a concurrent creator did not return"
+            assert sum(result.returncode == 0 for result in results) == 1, [r.stderr for r in results]
+            for result in results:
+                if result.returncode:
+                    assert any(
+                        text in result.stderr
+                        for text in (
+                            "locked by another OpenIVM client",
+                            "already exists",
+                            "Duplicate key: materialized view",
+                        )
+                    ), result.stderr
+            assert client.value(bag_difference(name, base)) == "0", "failed creator removed the winning MV"
+            client.run(
+                f"INSERT INTO lake.main.events VALUES ({100 + round_index},1,7),({200 + round_index},2,8);\n"
+                f"UPDATE lake.main.events SET v=v+1 WHERE id IN (1,{100 + round_index});\n"
+                f"DELETE FROM lake.main.events WHERE id={200 + round_index};\n"
+                f"PRAGMA refresh('{name}');\n"
+            )
+            assert client.value(bag_difference(name, base)) == "0", "winning MV no longer refreshes"
+            assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"
+
+        # Loss is not noticed locally: cleanup must check server ownership, not just
+        # whether the local heartbeat has reported a problem yet.
+        client.expect_error(
+            "SET openivm_test_fail_point='ddl_lease_lost_after_data';\n"
+            f"CREATE MATERIALIZED VIEW lake.main.retained AS {base};\n",
+            "lifecycle lease was taken over after the data commit",
+        )
+        assert client.value(bag_difference("lake.main.retained", base)) == "0", "cleanup removed a new owner's objects"
+        client.run(f"CREATE OR REPLACE MATERIALIZED VIEW lake.main.retained AS {base};\n")
+        assert client.value(bag_difference("lake.main.retained", base)) == "0"
+        assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"
+        client.run("DROP VIEW lake.main.totals CASCADE;\n")
+        assert (
+            client.value(
+                f"SELECT count(*) FROM control.{schema}.openivm_views WHERE view_sql_name IN ('totals','child');"
+            )
+            == "0"
+        )
+        client.run("DROP TABLE lake.main.events CASCADE;\n")
+        assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_views;") == "0"
+        assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_delta_tables;") == "0"
+        assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"
+    finally:
+        drop_schema(binary, dsn, schema)
+
+
 def main():
     if len(sys.argv) < 2:
         raise SystemExit("usage: test_remote_metadata.py <duckdb binary> [--require]")
@@ -530,6 +639,7 @@ def main():
         ducklake_concurrency_scenario(binary, dsn, root)
         ducklake_concurrent_writer_scenario(binary, dsn, root)
         ducklake_lease_scenario(binary, dsn, root)
+        ducklake_lifecycle_scenario(binary, dsn, root)
     print(
         "Remote PostgreSQL metadata: placement, reopen, crash recovery, lease takeover, concurrent clients and "
         "concurrent source writers passed"

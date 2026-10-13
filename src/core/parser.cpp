@@ -315,6 +315,17 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	string view_name = RefreshMetadata(con).AllocateViewKey(target.catalog_name, target.schema_name, sql_view_name);
 	view_key = view_name;
+	if (remote_metadata) {
+		auto descendants =
+		    parse_data_ref.is_replace ? RefreshMetadata(con).GetDownstreamViewsStrict(view_name) : vector<string>();
+		auto lease_keys = descendants;
+		lease_keys.push_back(view_name);
+		LifecycleLeaseState::Get(context).Acquire(context, metadata_location, std::move(lease_keys));
+		if (parse_data_ref.is_replace && descendants != RefreshMetadata(con).GetDownstreamViewsStrict(view_name)) {
+			throw TransactionException(
+			    "Materialized view dependencies changed while acquiring lifecycle leases; retry CREATE OR REPLACE");
+		}
+	}
 	string view_target_catalog = target.catalog_name;
 	string view_target_schema = target.schema_name;
 	if (target.qualified) {
@@ -405,6 +416,23 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	add_create_profile_step("create_compile_get_table_names", table_names_start,
 	                        "tables=" + to_string(table_names.size()));
+	if (remote_metadata && !table_names.empty()) {
+		vector<string> candidates;
+		for (auto &table : table_names) {
+			candidates.push_back(Value(PublishedSourceViewName(SqlUtils::LastIdentifierPart(table))).ToSQLString());
+		}
+		Connection dependency_con(*context.db);
+		auto parents = dependency_con.Query("SELECT view_name FROM " + metadata_location.Table(openivm::VIEWS_TABLE) +
+		                                    " WHERE view_name IN (" + StringUtil::Join(candidates, ", ") + ")");
+		if (parents->HasError()) {
+			throw CatalogException("Cannot resolve CREATE lifecycle dependencies: %s", parents->GetError());
+		}
+		vector<string> parent_keys;
+		for (idx_t row = 0; row < parents->RowCount(); row++) {
+			parent_keys.push_back(parents->GetValue(0, row).ToString());
+		}
+		LifecycleLeaseState::Get(context).Acquire(context, metadata_location, std::move(parent_keys));
+	}
 
 	// Plan the full CREATE TABLE AS SELECT statement (for plan walking)
 	auto full_plan_start = create_profile_now();
@@ -1011,6 +1039,20 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		OPENIVM_DEBUG_PRINT(" %s", t.c_str());
 	}
 	OPENIVM_DEBUG_PRINT("\n");
+
+	if (remote_metadata) {
+		vector<string> source_leases;
+		for (auto &entry : facts.source_table_info) {
+			auto &source = entry.second;
+			source_leases.push_back(
+			    LifecycleLeaseState::SourceKey(source.catalog_name, source.schema_name, source.table_name));
+			auto parent = PublishedSourceViewName(source.table_name);
+			if (parent != source.table_name) {
+				source_leases.push_back(std::move(parent));
+			}
+		}
+		LifecycleLeaseState::Get(context).Acquire(context, metadata_location, std::move(source_leases));
+	}
 
 	vector<string> ddl;
 	vector<string> cleanup_ddl;
@@ -2072,9 +2114,13 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	bool staged_drop = false;
 	for (auto &metadata_location : locations) {
 		MetadataLocator::Use(con, metadata_location);
+		LifecycleLeaseState::Get(context).Acquire(
+		    context, metadata_location,
+		    {LifecycleLeaseState::SourceKey(drop_info.catalog, drop_info.schema, drop_info.name)});
 		auto dependent_rows = con.Query(
 		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 		    RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(drop_info.name), drop_info.catalog, drop_info.schema) +
+		    " OR " + RefreshMetadata::SourcePredicate(drop_info.name, drop_info.catalog, drop_info.schema) +
 		    " ORDER BY view_name");
 		if (dependent_rows->HasError()) {
 			throw CatalogException("OpenIVM could not resolve materialized views depending on '%s': %s", drop_info.name,
@@ -2110,6 +2156,17 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 			}
 		}
 		string local_program;
+		LifecycleLeaseState::Get(context).Acquire(context, metadata_location, local_views);
+		if (metadata_location.explicit_placement && !metadata_location.IsNative()) {
+			for (auto &view_name : local_views) {
+				for (auto &child : metadata.GetDownstreamViewsStrict(view_name)) {
+					if (!seen.count(child)) {
+						throw TransactionException("Materialized view dependencies changed while acquiring lifecycle "
+						                           "leases; retry DROP TABLE");
+					}
+				}
+			}
+		}
 		for (auto &view_name : local_views) {
 			auto location = metadata.GetStoredViewLocation(view_name);
 			AppendTrackedViewDropProgram(context, metadata, view_name, location, local_program, sources, true,
@@ -2130,7 +2187,12 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	for (auto &source : sources) {
 		staged_drop |= !StringUtil::CIEquals(source.catalog_name, drop_info.catalog);
 	}
-	program += BuildDropTableStatement(drop_info) + ";\n";
+	// OpenIVM has removed tracked descendants; DuckLake itself rejects CASCADE.
+	DropInfo source_drop(drop_info);
+	if (table_entry && table_entry->ParentCatalog().GetCatalogType() == "ducklake") {
+		source_drop.cascade = false;
+	}
+	program += BuildDropTableStatement(source_drop) + ";\n";
 	if (context.transaction.IsAutoCommit()) {
 		if (staged_drop) {
 			ExecuteStagedDDL(context, {Value(program)});
@@ -2203,6 +2265,15 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		metadata_state->Apply(con);
 	}
 	auto view_key = RefreshMetadata(con).FindViewKey(catalog_name, schema_name, drop.info->name);
+	if (view_key.empty() && metadata_location.explicit_placement && !metadata_location.IsNative() &&
+	    con.TableInfo(metadata_location.catalog, metadata_location.schema, openivm::REFRESH_LEASE_TABLE)) {
+		// A CREATE may own this name before publishing its metadata. Even IF EXISTS
+		// must not remove that creator's physical view in the publication window.
+		LifecycleLeaseState::Get(context).Acquire(
+		    context, metadata_location,
+		    {RefreshMetadata(con).AllocateViewKey(catalog_name, schema_name, drop.info->name)});
+		view_key = RefreshMetadata(con).FindViewKey(catalog_name, schema_name, drop.info->name);
+	}
 	if (view_key.empty()) {
 		return BuildDropViewStatement(*drop.info) + ";\n";
 	}
@@ -2258,6 +2329,18 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		std::reverse(drop_views.begin(), drop_views.end());
 	}
 	drop_views.push_back(view_key);
+	if (metadata_location.explicit_placement && !metadata_location.IsNative()) {
+		LifecycleLeaseState::Get(context).Acquire(context, metadata_location, drop_views);
+		if (drop.info->cascade) {
+			auto current = metadata.GetDownstreamViewsStrict(view_key);
+			std::reverse(current.begin(), current.end());
+			current.push_back(view_key);
+			if (current != drop_views) {
+				throw TransactionException(
+				    "Materialized view dependencies changed while acquiring lifecycle leases; retry DROP VIEW");
+			}
+		}
+	}
 	string excluded_views;
 	bool staged_drop = false;
 	for (auto &view_name : drop_views) {

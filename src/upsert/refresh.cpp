@@ -95,21 +95,23 @@ public:
 		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
 		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
 		                  to_string(retention_days) + " days'");
+		string values;
 		for (auto &step : steps) {
-			// refresh_id is unique per refresh; remote catalogs support neither INSERT OR
-			// REPLACE nor DuckDB column defaults.
-			auto result = profile_con.Query(
-			    "INSERT INTO " + string(openivm::PROFILE_TABLE) +
-			    " (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail) VALUES ('" +
-			    SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) +
-			    "', CAST(current_timestamp AS TIMESTAMP), " + to_string(step.step_order) + ", '" +
-			    SqlUtils::EscapeValue(step.step_name) + "', " + to_string(step.duration_ms) + ", '" +
-			    SqlUtils::EscapeValue(step.detail) + "')");
-			if (result->HasError()) {
-				OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record refresh step '%s': %s\n", step.step_name.c_str(),
-				                    result->GetError().c_str());
-				return;
+			if (!values.empty()) {
+				values += ", ";
 			}
+			values += "('" + SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) +
+			          "', CAST(current_timestamp AS TIMESTAMP), " + to_string(step.step_order) + ", '" +
+			          SqlUtils::EscapeValue(step.step_name) + "', " + to_string(step.duration_ms) + ", '" +
+			          SqlUtils::EscapeValue(step.detail) + "')";
+		}
+		// One insert avoids a network round trip per step with PostgreSQL metadata.
+		auto result = profile_con.Query(
+		    "INSERT INTO " + string(openivm::PROFILE_TABLE) +
+		    " (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail) VALUES " + values);
+		if (result->HasError()) {
+			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record refresh profile: %s\n", result->GetError().c_str());
+			return;
 		}
 		auto committed = profile_con.Query("COMMIT");
 		if (committed->HasError()) {
@@ -349,6 +351,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// transaction; cross-catalog refreshes archive after their last commit.
 	bool execution_started = false;
 	bool effects_may_be_committed = false;
+	bool data_may_be_committed = false;
 	bool archive_handled = false;
 	// Track whether we're inside an open exec_con transaction so any exception path can
 	// rollback cleanly. Without explicit rollback, a throw mid-transaction relies on the
@@ -520,6 +523,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			execution_started = true;
 			// Cross-catalog data statements outside a transaction commit individually.
 			effects_may_be_committed = effects_may_be_committed || !tx_open;
+			data_may_be_committed = data_may_be_committed || !tx_open;
 			// Under a lease every statement is checked first, so a client past its deadline
 			// stops before the next write; the data transaction then rolls back.
 			bool crash_after_view_delta = MetadataLocator::TestPoint(context, "after_view_delta");
@@ -654,6 +658,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 			// A failure inside COMMIT leaves the outcome unknown; never compensate for it.
 			effects_may_be_committed = true;
+			data_may_be_committed = true;
 			exec_con.Commit();
 			tx_open = false;
 			archive_handled = !cross_system;
@@ -850,9 +855,10 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 			tx_open = false;
 		}
-		if (split_protocol && intent_recorded && !effects_may_be_committed && !was_interrupted) {
+		if (split_protocol && intent_recorded && !data_may_be_committed && !was_interrupted) {
 			// The data transaction rolled back, so nothing changed: retract our marker
-			// rather than force a full recompute. Best effort; a set marker is still safe.
+			// rather than force a full recompute. The committed intent still makes the
+			// archive outcome unknown. Best effort; a set marker is still safe.
 			try {
 				auto cleared = run_metadata(
 				    "UPDATE " + metadata_location.Table(openivm::VIEWS_TABLE) +

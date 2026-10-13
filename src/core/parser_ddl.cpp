@@ -8,8 +8,11 @@
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
@@ -178,11 +181,18 @@ public:
 		return enabled;
 	}
 
-	void SetViewName(const string &view_name_p) {
-		if (view_name.empty()) {
-			view_name = view_name_p;
-			refresh_id = view_name + "_" + refresh_id;
+	void SetViewName(const string &view_name_p, Connection &con) {
+		if (!enabled || !view_name.empty()) {
+			return;
 		}
+		view_name = view_name_p;
+		refresh_id = view_name + "_" + refresh_id;
+		// The executor has selected CREATE's metadata location before its first marker.
+		// Keep that owner: a fresh connection cannot discover a data catalog's marker.
+		auto &entry = ClientData::Get(*con.context).catalog_search_path->GetDefault();
+		auto catalog = entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(*con.context) : entry.catalog;
+		profile_table =
+		    SqlUtils::FullName(catalog, entry.schema.empty() ? DEFAULT_SCHEMA : entry.schema, openivm::PROFILE_TABLE);
 	}
 
 	void AddStep(const string &step_name, std::chrono::steady_clock::time_point start,
@@ -212,16 +222,10 @@ public:
 		}
 		flushed = true;
 		Connection profile_con(db);
-		// Profiles belong to the selected metadata location (the default database by default).
-		try {
-			MetadataLocator::Use(profile_con, MetadataLocator::Resolve(*profile_con.context, profile_con, ""));
-		} catch (std::exception &ex) {
-			OPENIVM_DEBUG_PRINT("[PROFILE] Cannot select CREATE MV profile location: %s\n", ex.what());
-			return;
-		}
+		OPENIVM_DEBUG_PRINT("[PROFILE] Recording staged CREATE MV profile in %s\n", profile_table.c_str());
 		// Retention and the new profile share one durable metadata commit.
 		profile_con.BeginTransaction();
-		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
+		profile_con.Query("DELETE FROM " + profile_table +
 		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
 		                  to_string(retention_days) + " days'");
 		// Statement profiles should not add a metadata commit for every DDL operation.
@@ -238,7 +242,7 @@ public:
 		// refresh_id is unique per statement; remote catalogs support neither INSERT OR
 		// REPLACE nor DuckDB column defaults.
 		auto result = profile_con.Query(
-		    "INSERT INTO " + string(openivm::PROFILE_TABLE) +
+		    "INSERT INTO " + profile_table +
 		    " (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail) VALUES " + values);
 		if (result->HasError()) {
 			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV profile: %s\n", result->GetError().c_str());
@@ -252,6 +256,7 @@ public:
 
 private:
 	bool enabled;
+	string profile_table;
 	bool flushed = false;
 	int64_t retention_days;
 	string view_name;
@@ -445,6 +450,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		suspended_autocommit_transaction = true;
 	}
 	CreateMVProfiler profiler(context);
+	auto lifecycle_leases = LifecycleLeaseState::TryGet(context);
 	string current_profile_step = "create_mv_unclassified";
 	string current_profile_detail;
 	vector<string> pending_ddl;
@@ -461,6 +467,11 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			conn->Rollback();
 		}
 		for (const auto &cleanup : cleanup_ddl) {
+			if (lifecycle_leases && !lifecycle_leases->CanCleanup()) {
+				Printer::Print(
+				    "OpenIVM retained staged objects because lifecycle lease ownership could not be confirmed");
+				return;
+			}
 			OPENIVM_DEBUG_PRINT("[DDLExecutorExecuteFunction] Cleanup DDL: %s\n", cleanup.c_str());
 			auto cleanup_result = conn->Query(cleanup);
 			if (cleanup_result->HasError()) {
@@ -475,6 +486,15 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		profiler.Flush(db);
 		restore_outer_transaction();
 		throw CatalogException("Failed to execute IVM DDL: " + message);
+	};
+	auto require_lifecycle = [&]() {
+		if (lifecycle_leases) {
+			try {
+				lifecycle_leases->Require();
+			} catch (std::exception &ex) {
+				fail_ddl(ex.what());
+			}
+		}
 	};
 	auto flush_pending = [&]() {
 		if (pending_ddl.empty()) {
@@ -493,9 +513,10 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		                    (unsigned long)pending_ddl.size(), query.c_str());
 		auto ddl_start = std::chrono::steady_clock::now();
 		unique_ptr<MaterializedQueryResult> r;
-		if (profiler.Enabled()) {
+		if (profiler.Enabled() || (lifecycle_leases && lifecycle_leases->Active())) {
 			auto statements = SqlUtils::SplitSQLStatements(query);
 			for (idx_t i = 0; i < statements.size(); i++) {
+				require_lifecycle();
 				auto statement_start = std::chrono::steady_clock::now();
 				r = conn->Query(statements[i]);
 				profiler.AddStep("create_mv_sql_stmt", statement_start,
@@ -524,9 +545,15 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			}
 			fail_ddl(r->GetError());
 		}
+		if (lifecycle_leases && lifecycle_leases->Active() && current_profile_step == "create_mv_physical_commit" &&
+		    MetadataLocator::TestPoint(context, "ddl_lease_lost_after_data")) {
+			lifecycle_leases->SimulateTakeover();
+			fail_ddl("lifecycle lease was taken over after the data commit");
+		}
 		pending_ddl.clear();
 	};
 	for (auto &q : ddl) {
+		require_lifecycle();
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX)) {
 			flush_pending();
 			auto payload = q.substr(strlen(OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX));
@@ -553,7 +580,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			ParseCreateMVProfileRecord(q.substr(strlen(OPENIVM_DDL_PROFILE_RECORD_PREFIX)), marker_view_name,
 			                           measured_step_name, measured_duration_ms, measured_detail);
 			if (!marker_view_name.empty()) {
-				profiler.SetViewName(marker_view_name);
+				profiler.SetViewName(marker_view_name, *conn);
 			}
 			profiler.AddMeasuredStep(measured_step_name, measured_duration_ms, measured_detail);
 			continue;
@@ -564,7 +591,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			ParseCreateMVProfileMarker(q.substr(strlen(OPENIVM_DDL_PROFILE_PREFIX)), marker_view_name,
 			                           current_profile_step, current_profile_detail);
 			if (!marker_view_name.empty()) {
-				profiler.SetViewName(marker_view_name);
+				profiler.SetViewName(marker_view_name, *conn);
 			}
 			continue;
 		}

@@ -213,7 +213,17 @@ becomes delete plus insert (CREATE publishes these rows last, so an interruption
 row and `CREATE OR REPLACE` rebuilds the view), and inserts supply every key column instead
 of relying on DuckDB defaults.
 
-Refreshes of one view are serialized across clients by `openivm_refresh_leases`:
+Refreshes and materialized-view lifecycle changes coordinate across clients through
+`openivm_refresh_leases`. CREATE holds the target name before publishing metadata;
+REPLACE and cascading DROP acquire the affected view leases in sorted order and recheck
+dependencies before changing objects. CREATE also leases its sources while registering
+dependencies, so a concurrent source drop cannot miss the new consumer. Conflicts fail
+promptly; retry the operation after the competing operation finishes. These leases are
+held through staged execution and failure cleanup, then released when the statement ends.
+Cleanup confirms ownership with PostgreSQL before deleting objects. If ownership is lost
+or cannot be confirmed, it retains staged objects for recovery with CREATE OR REPLACE.
+
+The lease protocol is:
 
 - **Server clock.** Every lease time is a PostgreSQL server time. DuckDB evaluates
   `now()` on the client, so OpenIVM reads `clock_timestamp() AT TIME ZONE 'UTC'` and that
@@ -222,7 +232,7 @@ Refreshes of one view are serialized across clients by `openivm_refresh_leases`:
   their clock offsets cannot make a live lease look expired.
 - A client reads the server time, deletes the view's lease if `lease_until` is before that
   time, and inserts `(view_name, owner, server time + L)`, all in one transaction. The
-  primary key makes acquisition atomic. A losing client gets `being refreshed by another
+  primary key makes acquisition atomic. A losing client gets `locked by another
   OpenIVM client`.
 - While the refresh runs, a background thread renews the lease every third of
   `openivm_metadata_lease_seconds` (L, default 600, minimum 1), again to server time + L.

@@ -232,6 +232,19 @@ SELECT current_setting('openivm_metadata_catalog'), current_setting('openivm_met
 statement ok
 DELETE FROM dl.main.events WHERE id = 401;
 
+# Resolving several pipeline targets reuses a helper already switched to control.
+# Discovery must still follow the frontend marker, not control.main.
+statement ok
+PRAGMA refresh_pipeline('dl.main.totals', 'dl.main.totals');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM dl.main.totals
+                              EXCEPT ALL SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k))
+     + (SELECT count(*) FROM (SELECT k, SUM(v), COUNT(*) FROM dl.main.events GROUP BY k
+                              EXCEPT ALL SELECT * FROM dl.main.totals));
+----
+0
+
 statement ok
 PRAGMA refresh('dl.main.totals');
 

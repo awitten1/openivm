@@ -203,9 +203,12 @@ to obtain an inspection file.
 ### Archived compiled SQL
 
 OpenIVM always archives the programs it runs for `CREATE MATERIALIZED VIEW` and
-refresh in two tables next to the view's `openivm_views` metadata (for DuckLake
-views, the native frontend database's `main` schema), independently of
-`openivm_files_path`:
+refresh in two tables next to the view's `openivm_views` metadata, independently of
+`openivm_files_path`. For DuckLake views the default is the native frontend database's
+`main` schema. With [custom metadata placement](../internals/metadata-placement.md),
+the archive follows the selected catalog and schema; qualify the tables below, for
+example as `control.openivm.openivm_compiled_programs` and
+`control.openivm.openivm_compiled_statements`.
 
 ```sql
 SELECT view_catalog, view_schema, view_sql_name, operation, version,
