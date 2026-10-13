@@ -225,8 +225,9 @@ SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'OpenIVM Meta' AND tabl
 ----
 0
 
+# Names with spaces are quoted inside the argument, as in a qualified name.
 statement error
-PRAGMA refresh('Totals MV');
+PRAGMA refresh('"Totals MV"');
 ----
 Ambiguous materialized view
 
