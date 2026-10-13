@@ -45,7 +45,9 @@ or inspecting one of those views:
 
 ```sql
 -- Control metadata stays in the native frontend database, in main unless
--- openivm_metadata_schema selects another schema.
+-- openivm_metadata_schema selects another schema. Find that schema first:
+SELECT database_name, schema_name FROM duckdb_tables() WHERE table_name = 'openivm_views';
+-- then, for example with the default schema:
 SELECT view_sql_name, view_catalog, view_schema, view_name AS internal_key
 FROM main.openivm_views;
 PRAGMA refresh('dl.observation.product_summary');

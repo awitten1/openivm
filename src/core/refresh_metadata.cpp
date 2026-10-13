@@ -93,7 +93,9 @@ void SelectMetadataLocation(Connection &con, const string &catalog, const string
 	state.catalog_name = catalog;
 	state.schema_name = schema;
 	// A configured schema is created with its catalog's first materialized view. Until then it
-	// holds no metadata, and unqualified lookups stay in the catalog's default schema.
+	// holds no metadata, and unqualified lookups stay in the catalog's default schema. Code
+	// that writes metadata must name CurrentLocation() explicitly or run after
+	// PrepareMetadataSchema created the schema; it must not rely on this fallback.
 	auto selected = SchemaExists(con, catalog, schema) ? schema : string(DEFAULT_SCHEMA);
 	auto target = SqlUtils::QuoteIdentifier(catalog) + "." + SqlUtils::QuoteIdentifier(selected);
 	auto result = con.Query("USE " + target);
