@@ -1,0 +1,347 @@
+# name: test/sql/internal_schema_ducklake.test
+# description: Dedicated internal schemas in DuckLake keep native metadata separate through refresh, replacement, reopen and drop
+# group: [sql]
+
+require openivm
+
+require parquet
+
+load __TEST_DIR__/internal_schema_host.db
+
+statement ok
+INSTALL ducklake;
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_metadata_schema = 'Control Space';
+
+statement ok
+SET openivm_internal_schema = 'Lake Internal';
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+CREATE SCHEMA dl.s1;
+
+statement ok
+CREATE SCHEMA dl."Other Schema";
+
+statement ok
+CREATE TABLE dl.s1.items (id INTEGER, grp VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO dl.s1.items VALUES (1,'a',10),(1,'a',10),(2,'b',20),(3,'b',NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.s1.totals AS SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.s1.items GROUP BY grp;
+
+statement ok
+CREATE TABLE dl."Other Schema".items (id INTEGER, grp VARCHAR, amount INTEGER);
+
+statement ok
+INSERT INTO dl."Other Schema".items VALUES (1,'a',10),(1,'a',10),(2,'b',20),(3,'b',NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW dl."Other Schema".totals AS SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM dl."Other Schema".items GROUP BY grp;
+
+query I
+SELECT count(*) FROM internal_schema_host."Control Space".openivm_views WHERE view_sql_name = 'totals' AND view_catalog = 'dl' AND internal_schema = 'Lake Internal';
+----
+2
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN internal_schema_host."Control Space".openivm_views v ON t.table_name IN ('openivm_data_' || v.view_name, 'openivm_delta_' || v.view_name, 'openivm_visible_' || v.view_name) WHERE v.view_sql_name = 'totals' AND t.database_name = 'dl' AND t.schema_name = 'Lake Internal';
+----
+6
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE (database_name = 'dl' AND schema_name IN ('s1','Other Schema') AND starts_with(table_name, 'openivm_')) OR (database_name = 'internal_schema_host' AND schema_name = 'Lake Internal') OR (database_name = 'dl' AND schema_name = 'Control Space');
+----
+0
+
+statement ok
+INSERT INTO dl.s1.items VALUES (4,'c',4),(5,'a',1);
+
+statement ok
+DELETE FROM dl.s1.items WHERE id = 2;
+
+statement ok
+UPDATE dl.s1.items SET amount = 11 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('dl.s1.totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM dl.s1.items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM dl.s1.items GROUP BY grp EXCEPT ALL SELECT * FROM dl.s1.totals));
+----
+0
+
+statement ok
+INSERT INTO dl."Other Schema".items VALUES (4,'c',4),(5,'a',1);
+
+statement ok
+DELETE FROM dl."Other Schema".items WHERE id = 2;
+
+statement ok
+UPDATE dl."Other Schema".items SET amount = 11 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('dl."Other Schema".totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl."Other Schema".totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM dl."Other Schema".items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM dl."Other Schema".items GROUP BY grp EXCEPT ALL SELECT * FROM dl."Other Schema".totals));
+----
+0
+
+# Quoted MV names and search paths keep publication separate from SQL identity.
+statement ok
+USE dl."Other Schema";
+
+statement ok
+CREATE MATERIALIZED VIEW "Quoted MV" AS SELECT id, amount FROM items;
+
+statement ok
+INSERT INTO dl."Other Schema".items VALUES (6,'q',6);
+
+statement ok
+PRAGMA refresh('dl."Other Schema"."Quoted MV"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl."Other Schema"."Quoted MV" EXCEPT ALL SELECT id, amount FROM dl."Other Schema".items) UNION ALL (SELECT id, amount FROM dl."Other Schema".items EXCEPT ALL SELECT * FROM dl."Other Schema"."Quoted MV"));
+----
+0
+
+# Replacement preserves the existing internal schema after a setting change.
+statement ok
+SET openivm_internal_schema = 'Elsewhere';
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.s1.totals AS SELECT grp, SUM(amount) AS total, COUNT(*) AS cnt FROM dl.s1.items WHERE amount > 1 GROUP BY grp;
+
+query T
+SELECT internal_schema FROM internal_schema_host."Control Space".openivm_views WHERE view_sql_name = 'totals' AND view_schema = 's1';
+----
+Lake Internal
+
+statement ok
+INSERT INTO dl.s1.items VALUES (7,'a',7),(8,'d',1);
+
+statement ok
+UPDATE dl.s1.items SET amount = 0 WHERE id = 4;
+
+statement ok
+PRAGMA refresh('dl.s1.totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM dl.s1.items WHERE amount > 1 GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM dl.s1.items WHERE amount > 1 GROUP BY grp EXCEPT ALL SELECT * FROM dl.s1.totals));
+----
+0
+
+# Auxiliary tables also stay in the lake, and obsolete state is removed on replacement.
+statement ok
+SET openivm_internal_schema = 'Lake Internal';
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.s1.counted AS SELECT grp, COUNT(DISTINCT amount) AS n FROM dl.s1.items GROUP BY grp;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN internal_schema_host."Control Space".openivm_views v ON t.table_name = 'openivm_aux_' || v.view_name WHERE v.view_sql_name = 'counted' AND t.database_name = 'dl' AND t.schema_name = 'Lake Internal';
+----
+1
+
+statement ok
+INSERT INTO dl.s1.items VALUES (9,'a',11),(10,'a',12);
+
+statement ok
+DELETE FROM dl.s1.items WHERE id = 1;
+
+statement ok
+UPDATE dl.s1.items SET amount = 12 WHERE id = 9;
+
+statement ok
+PRAGMA refresh('dl.s1.counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.counted EXCEPT ALL SELECT grp, COUNT(DISTINCT amount) FROM dl.s1.items GROUP BY grp) UNION ALL (SELECT grp, COUNT(DISTINCT amount) FROM dl.s1.items GROUP BY grp EXCEPT ALL SELECT * FROM dl.s1.counted));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.s1.counted AS SELECT grp, COUNT(*) AS n FROM dl.s1.items GROUP BY grp;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN internal_schema_host."Control Space".openivm_views v ON t.table_name = 'openivm_aux_' || v.view_name WHERE v.view_sql_name = 'counted';
+----
+0
+
+# A failed lake CTAS rolls back physical state before cleanup and retry.
+statement ok
+CREATE TABLE dl.s1.bad_values (v VARCHAR);
+
+statement ok
+INSERT INTO dl.s1.bad_values VALUES ('10'),('bad');
+
+statement error
+CREATE MATERIALIZED VIEW dl.s1.retry_mv AS SELECT v::INTEGER AS v FROM dl.s1.bad_values;
+----
+Could not convert string
+
+query II
+SELECT (SELECT count(*) FROM internal_schema_host."Control Space".openivm_views WHERE view_sql_name = 'retry_mv'),
+       (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dl' AND schema_name = 'Lake Internal' AND contains(table_name, '_72657472795f6d76_'));
+----
+0	0
+
+statement ok
+UPDATE dl.s1.bad_values SET v = '20' WHERE v = 'bad';
+
+statement ok
+CREATE MATERIALIZED VIEW dl.s1.retry_mv AS SELECT v::INTEGER AS v FROM dl.s1.bad_values;
+
+statement ok
+INSERT INTO dl.s1.bad_values VALUES ('30'),('30');
+
+statement ok
+DELETE FROM dl.s1.bad_values WHERE v = '10';
+
+statement ok
+UPDATE dl.s1.bad_values SET v = '25' WHERE v = '20';
+
+statement ok
+PRAGMA refresh('dl.s1.retry_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.retry_mv EXCEPT ALL SELECT v::INTEGER FROM dl.s1.bad_values) UNION ALL (SELECT v::INTEGER FROM dl.s1.bad_values EXCEPT ALL SELECT * FROM dl.s1.retry_mv));
+----
+0
+
+statement ok
+DROP VIEW dl.s1.retry_mv;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.s1.counted_drop AS SELECT grp, COUNT(DISTINCT amount) AS n FROM dl.s1.items GROUP BY grp;
+
+# Snapshot publications and their chained views use stored internal locations.
+statement ok
+SET openivm_snapshot_publication = true;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.s1.parent AS SELECT id, amount FROM dl.s1.items;
+
+statement ok
+CREATE MATERIALIZED VIEW dl."Other Schema".child AS SELECT * FROM dl.s1.parent;
+
+query I
+SELECT count(*) FROM duckdb_views() t JOIN internal_schema_host."Control Space".openivm_views v ON t.view_name = 'openivm_visible_' || v.view_name WHERE v.view_sql_name IN ('parent','child') AND t.database_name = 'dl' AND t.schema_name = 'Lake Internal';
+----
+2
+
+restart
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+INSERT INTO dl.s1.items VALUES (11,'z',5),(11,'z',5);
+
+statement ok
+DELETE FROM dl.s1.items WHERE id = 9;
+
+statement ok
+UPDATE dl.s1.items SET amount = amount + 1 WHERE id = 10;
+
+statement ok
+PRAGMA refresh('dl.s1.totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM dl.s1.items WHERE amount > 1 GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM dl.s1.items WHERE amount > 1 GROUP BY grp EXCEPT ALL SELECT * FROM dl.s1.totals));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.counted EXCEPT ALL SELECT grp, COUNT(*) FROM dl.s1.items GROUP BY grp) UNION ALL (SELECT grp, COUNT(*) FROM dl.s1.items GROUP BY grp EXCEPT ALL SELECT * FROM dl.s1.counted));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.parent');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.parent EXCEPT ALL SELECT id, amount FROM dl.s1.items) UNION ALL (SELECT id, amount FROM dl.s1.items EXCEPT ALL SELECT * FROM dl.s1.parent));
+----
+0
+
+statement ok
+UPDATE dl."Other Schema".items SET amount = 100 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('dl."Other Schema".totals');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl."Other Schema".totals EXCEPT ALL SELECT grp, SUM(amount), COUNT(*) FROM dl."Other Schema".items GROUP BY grp) UNION ALL (SELECT grp, SUM(amount), COUNT(*) FROM dl."Other Schema".items GROUP BY grp EXCEPT ALL SELECT * FROM dl."Other Schema".totals));
+----
+0
+
+statement ok
+PRAGMA refresh('dl."Other Schema".child');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl."Other Schema".child EXCEPT ALL SELECT id, amount FROM dl.s1.items) UNION ALL (SELECT id, amount FROM dl.s1.items EXCEPT ALL SELECT * FROM dl."Other Schema".child));
+----
+0
+
+# Dropping one same-named MV leaves the other intact; final cleanup removes all state.
+statement ok
+DROP VIEW dl."Other Schema".totals;
+
+query I
+SELECT count(*) FROM internal_schema_host."Control Space".openivm_views WHERE view_sql_name = 'totals';
+----
+1
+
+statement ok
+DROP VIEW dl."Other Schema".child;
+
+statement ok
+DROP VIEW dl.s1.parent;
+
+statement ok
+DROP VIEW dl.s1.counted;
+
+statement ok
+DROP VIEW dl.s1.counted_drop;
+
+statement ok
+DROP VIEW dl.s1.totals;
+
+statement ok
+DROP VIEW dl."Other Schema"."Quoted MV";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dl' AND schema_name = 'Lake Internal' AND starts_with(table_name, 'openivm_');
+----
+0
+
+query I
+SELECT count(*) FROM internal_schema_host."Control Space".openivm_views;
+----
+0
+

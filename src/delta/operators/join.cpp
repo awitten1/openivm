@@ -50,15 +50,39 @@ struct JoinColumnRef {
 	size_t leaf_index;
 	LogicalGet *get;
 	string table_name;
-	string delta_name;
+	// Qualified physical delta; it may sit in an internal schema rather than beside the source.
+	string delta_table_sql;
 	string column_name;
 	string last_update;
 };
 
 static string JoinSourceSQL(const JoinColumnRef &ref, bool delta) {
+	if (delta) {
+		return ref.delta_table_sql;
+	}
 	auto table = ref.get->GetTable();
-	return SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name,
-	                          delta ? ref.delta_name : ref.table_name);
+	return SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, ref.table_name);
+}
+
+// The view's watermark for a source (first column) and the source's physical delta table.
+static unique_ptr<MaterializedQueryResult> DeltaWatermark(Connection &con, const string &view_name,
+                                                          TableCatalogEntry &source, string &delta_table_sql) {
+	auto catalog = source.ParentCatalog().GetName();
+	auto schema = source.schema.name;
+	auto filter = " FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "' AND " +
+	              RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(source.name), catalog, schema);
+	auto result = con.Query("SELECT last_update, delta_schema" + filter);
+	if (result->HasError()) {
+		result = con.Query("SELECT last_update, NULL" + filter); // Metadata without internal schemas.
+	}
+	string delta_schema;
+	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(1, 0).IsNull()) {
+		delta_schema = result->GetValue(1, 0).ToString();
+	}
+	delta_table_sql = SqlUtils::FullName(catalog, delta_schema.empty() ? schema : delta_schema,
+	                                     RefreshMetadata::SourceDeltaTableName(schema, source.name, delta_schema));
+	return result;
 }
 
 static string QualifyColumn(const string &alias, const string &column_name) {
@@ -1106,12 +1130,9 @@ static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, c
 			                    get->function.name.c_str());
 			continue;
 		}
-		string delta_name = SqlUtils::DeltaName(table_ref.get()->name);
+		string delta_table_sql;
 		// Get last_update timestamp for this view+table pair
-		auto ts_result = con.Query(
-		    "SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-		    SqlUtils::EscapeValue(view_name) + "' AND " +
-		    RefreshMetadata::SourcePredicate(delta_name, table_ref->ParentCatalog().GetName(), table_ref->schema.name));
+		auto ts_result = DeltaWatermark(con, view_name, *table_ref, delta_table_sql);
 		if (ts_result->HasError() || ts_result->RowCount() == 0) {
 			continue;
 		}
@@ -1124,13 +1145,12 @@ static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, c
 		auto result = con.Query(
 		    "SELECT "
 		    "(SELECT COUNT(*) FROM " +
-		    SqlUtils::FullName(table_ref->ParentCatalog().GetName(), table_ref->schema.name, delta_name) + " WHERE " +
-		    string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) +
+		    delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
+		    SqlUtils::EscapeValue(last_update) +
 		    "'::TIMESTAMP), "
 		    "(SELECT COUNT(*) FROM " +
-		    SqlUtils::FullName(table_ref->ParentCatalog().GetName(), table_ref->schema.name, delta_name) + " WHERE " +
-		    string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP AND " +
-		    string(openivm::MULTIPLICITY_COL) +
+		    delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) + " >= '" +
+		    SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP AND " + string(openivm::MULTIPLICITY_COL) +
 		    " < 0), "
 		    "(SELECT COUNT(*) FROM " +
 		    SqlUtils::FullName(table_ref->ParentCatalog().GetName(), table_ref->schema.name, table_ref->name) + ")");
@@ -1620,19 +1640,15 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 				continue;
 			}
 			string table_name = table_ref.get()->name;
-			string delta_name = SqlUtils::DeltaName(table_name);
-			auto ts_result =
-			    key_probe_con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) +
-			                        " WHERE view_name = '" + SqlUtils::EscapeValue(input.context.view) + "' AND " +
-			                        RefreshMetadata::SourcePredicate(delta_name, table_ref->ParentCatalog().GetName(),
-			                                                         table_ref->schema.name));
+			string delta_table_sql;
+			auto ts_result = DeltaWatermark(key_probe_con, input.context.view, *table_ref, delta_table_sql);
 			if (ts_result->HasError() || ts_result->RowCount() == 0 || ts_result->GetValue(0, 0).IsNull()) {
 				continue;
 			}
 			leaf_refs[i].leaf_index = i;
 			leaf_refs[i].get = get;
 			leaf_refs[i].table_name = table_name;
-			leaf_refs[i].delta_name = delta_name;
+			leaf_refs[i].delta_table_sql = delta_table_sql;
 			leaf_refs[i].last_update = ts_result->GetValue(0, 0).ToString();
 
 			auto leaf_bindings = leaves[i].node->GetColumnBindings();
@@ -1647,7 +1663,7 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 				OPENIVM_DEBUG_PRINT("[DeltaJoin] Column ref leaf=%zu binding=%s -> %s.%s\n", i,
 				                    binding.ToString().c_str(), resolved_table.c_str(), resolved_column.c_str());
 				column_refs[DeltaJoinBindingKey(binding)] = {
-				    i, get, table_name, delta_name, resolved_column, leaf_refs[i].last_update};
+				    i, get, table_name, delta_table_sql, resolved_column, leaf_refs[i].last_update};
 			}
 		}
 		CollectDeltaJoinKeyProbes(input.plan.get(), column_refs, key_probes, "DeltaJoin");

@@ -107,7 +107,8 @@ static const vector<std::pair<string, string>> &MetadataTableDefinitions() {
 	     " lineage_json varchar default null,"
 	     " leftjoin_secondary_meta_json varchar default null,"
 	     " published_query varchar default null,"
-	     " pending_after_hook boolean default null)"},
+	     " pending_after_hook boolean default null,"
+	     " internal_schema varchar default null)"},
 	    {openivm::REFRESH_HOOKS_TABLE, "(view_name varchar primary key, hook_sql varchar not null,"
 	                                   " mode varchar not null default 'after')"},
 	    {openivm::DELTA_TABLES_TABLE, "(view_name varchar, table_name varchar, last_update timestamp,"
@@ -119,6 +120,7 @@ static const vector<std::pair<string, string>> &MetadataTableDefinitions() {
 	                                  " source_catalog varchar default null,"
 	                                  " source_schema varchar default null,"
 	                                  " source_table_id bigint default null,"
+	                                  " delta_schema varchar default null,"
 	                                  " primary key(view_name, table_name))"},
 	    {openivm::HISTORY_TABLE, "(view_name varchar, refresh_timestamp timestamp default "
 	                             "current_timestamp,"
@@ -207,6 +209,7 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "window_order_columns varchar default null");
 
 	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "pending_after_hook boolean default null");
+	AddColumnIfNotExists(ddl, openivm::VIEWS_TABLE, views, "internal_schema varchar default null");
 
 	ddl.push_back(CreateMetadataTableSQL(openivm::REFRESH_HOOKS_TABLE));
 	ddl.push_back(CreateMetadataTableSQL(openivm::DELTA_TABLES_TABLE));
@@ -217,6 +220,7 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_catalog varchar default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_schema varchar default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_table_id bigint default null");
+	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "delta_schema varchar default null");
 	ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) +
 	              " SET has_join = true WHERE has_join IS NULL AND (COALESCE(has_left_join, false) OR "
 	              "COALESCE(has_full_outer, false) OR view_name IN (SELECT view_name FROM " +
@@ -279,7 +283,8 @@ void InitializeMVMetadata(ClientContext &context, Connection &con, const string 
 		return SqlUtils::FullName(catalog, schema, name);
 	};
 	InitializeSharedDDL(context, con,
-	                    "SELECT v.view_sql_name, v.pending_after_hook, d.source_table_id, h.mode, "
+	                    "SELECT v.view_sql_name, v.pending_after_hook, v.internal_schema, d.source_table_id, "
+	                    "d.delta_schema, h.mode, "
 	                    "r.strategy, p.step_order, dep.edge_kind, m.query_hash, c.is_trusted FROM " +
 	                        table(openivm::VIEWS_TABLE) + " v, " + table(openivm::DELTA_TABLES_TABLE) + " d, " +
 	                        table(openivm::REFRESH_HOOKS_TABLE) + " h, " + table(openivm::HISTORY_TABLE) + " r, " +
@@ -315,13 +320,16 @@ void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog
 		string escaped_sql_name = SqlUtils::EscapeValue(sql_view_name);
 		string location_filter = " AND table_catalog = " + Value(view_catalog).ToSQLString() +
 		                         " AND table_schema = " + Value(view_schema).ToSQLString();
+		string internal_location_filter =
+		    " AND table_catalog = COALESCE(view_catalog, " + Value(view_catalog).ToSQLString() +
+		    ") AND table_schema = COALESCE(internal_schema, view_schema, " + Value(view_schema).ToSQLString() + ")";
 		string stale_mv_condition = "view_name = '" + escaped_view_name +
 		                            "' AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE "
 		                            "table_name = '" +
 		                            escaped_sql_name + "'" + location_filter +
 		                            ") AND NOT EXISTS (SELECT 1 FROM information_schema.tables WHERE "
 		                            "table_name = '" +
-		                            escaped_data_table + "'" + location_filter + ")";
+		                            escaped_data_table + "'" + internal_location_filter + ")";
 		// CREATE MV executes as multiple catalog statements. If a process dies or loses
 		// a DuckDB file lock after writing metadata but before creating the physical
 		// DuckLake/default-catalog objects, a retry should clean that stale row rather

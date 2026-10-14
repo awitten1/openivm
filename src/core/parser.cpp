@@ -301,15 +301,38 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	RefreshMetadata metadata(con);
 	bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_target_catalog);
-	string internal_catalog_prefix = view_catalog_prefix;
+	// Internal maintenance tables stay beside the MV unless openivm_internal_schema selects a
+	// schema of the MV's own catalog (the lake for DuckLake MVs). A replaced view keeps the
+	// placement of its existing tables, so dependants keep reading the same relations.
+	string internal_schema_setting;
+	{
+		Value internal_value;
+		if (context.TryGetCurrentSetting(openivm::INTERNAL_SCHEMA_SETTING, internal_value) &&
+		    !internal_value.IsNull()) {
+			internal_schema_setting = internal_value.ToString();
+		}
+	}
+	string internal_schema = internal_schema_setting;
+	if (parse_data_ref.is_replace && !metadata.GetViewQuery(view_name).empty()) {
+		internal_schema = metadata.GetInternalSchema(view_name);
+	}
+	if (StringUtil::CIEquals(internal_schema, view_target_schema)) {
+		internal_schema.clear();
+	}
+	string internal_catalog_prefix =
+	    internal_schema.empty() ? view_catalog_prefix : SqlUtils::QualifiedPrefix(view_target_catalog, internal_schema);
 	string internal_target_catalog = view_target_catalog;
-	string internal_target_schema = view_target_schema;
+	string internal_target_schema = internal_schema.empty() ? view_target_schema : internal_schema;
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Internal objects for %s use %s.%s\n", view_name.c_str(),
+	                    internal_target_catalog.c_str(), internal_target_schema.c_str());
 	string data_table = IncrementalTableNames::DataTableName(view_name);
 	string qdt = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table);
 	string qvn = view_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(sql_view_name);
 	bool staged_cross_catalog_replace = target_is_ducklake && parse_data_ref.is_replace;
+	auto replaced_auxiliary_tables =
+	    parse_data_ref.is_replace ? metadata.GetAuxiliaryTables(view_name) : vector<string>();
 	if (staged_cross_catalog_replace &&
-	    IsSnapshotPublication(context, view_target_catalog, view_target_schema, view_name)) {
+	    IsSnapshotPublication(context, internal_target_catalog, internal_target_schema, view_name)) {
 		throw NotImplementedException("CREATE OR REPLACE is not supported for "
 		                              "snapshot-published materialized views");
 	}
@@ -1022,6 +1045,12 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	AppendCreateMVSystemTablesDDL(context, default_db, default_schema, ddl, view_name, parse_data_ref.is_replace,
 	                              view_target_catalog, view_target_schema, sql_view_name);
 	auto system_ddl_end = ddl.size();
+	if (!internal_schema.empty()) {
+		// Created in the data catalog's own transaction: the caller's for native MVs,
+		// the staged lake connection for DuckLake MVs.
+		ddl.push_back("CREATE SCHEMA IF NOT EXISTS " + SqlUtils::QuoteIdentifier(internal_target_catalog) + "." +
+		              SqlUtils::QuoteIdentifier(internal_schema));
+	}
 
 	bool has_downstream_views = false;
 	bool preserve_consumer_deltas = false;
@@ -1102,6 +1131,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		ddl.push_back("DROP VIEW IF EXISTS " + qvn_drop);
 		ddl.push_back("DROP TABLE IF EXISTS " + qdt_drop);
 		ddl.push_back("DROP TABLE IF EXISTS " + qdv_drop);
+		for (auto &aux_table : replaced_auxiliary_tables) {
+			ddl.push_back("DROP TABLE IF EXISTS " + internal_catalog_prefix + SqlUtils::QuoteIdentifier(aux_table));
+		}
 		ddl.push_back("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 		              SqlUtils::EscapeSingleQuotes(view_name) + "'");
 		ddl.push_back("DELETE FROM " + string(openivm::HISTORY_TABLE) + " WHERE view_name = '" +
@@ -1138,7 +1170,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	    "refresh_interval, refresh_in_progress, group_columns, window_order_columns, aggregate_types, "
 	    "having_predicate, group_recompute_affected_mode, "
 	    "group_recompute_source_occurrences_json, has_full_outer, "
-	    "full_outer_join_cols) values ('" +
+	    "full_outer_join_cols, internal_schema) values ('" +
 	    SqlUtils::EscapeSingleQuotes(view_name) + "', '" + SqlUtils::EscapeSingleQuotes(sql_view_name) + "', '" +
 	    SqlUtils::EscapeSingleQuotes(view_target_catalog) + "', '" + SqlUtils::EscapeSingleQuotes(view_target_schema) +
 	    "', '" + SqlUtils::EscapeSingleQuotes(view_query) + "', " + to_string((int)refresh_type) + ", " +
@@ -1146,7 +1178,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	    (analysis.found_join ? "true" : "false") + ", " + string(openivm::UTC_NOW_SQL) + ", " + refresh_val +
 	    ", false, " + group_cols_val + ", " + window_order_cols_val + ", " + agg_types_val + ", " + having_val + ", " +
 	    group_recompute_mode_val + ", " + group_recompute_source_occurrences_val + ", " +
-	    (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ")");
+	    (analysis.found_full_outer ? "true" : "false") + ", " + full_outer_join_cols_val + ", " +
+	    (internal_schema.empty() ? string("null") : "'" + SqlUtils::EscapeSingleQuotes(internal_schema) + "'") + ")");
 
 	if (!lineage_json.empty()) {
 		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("lineage_json", lineage_json, view_name));
@@ -1290,6 +1323,43 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 	}
 
+	// Physical delta of each native source. A source has one delta shared by all its views,
+	// so an existing one is reused wherever it lives. New deltas of user tables go to the
+	// internal schema of the source's own catalog under a schema-qualified name; deltas of
+	// OpenIVM's own relations stay beside them.
+	struct SourceDeltaPlacement {
+		string schema_name;
+		string table_name;
+	};
+	unordered_map<string, SourceDeltaPlacement> source_delta_placements;
+	for (const auto &source_entry : source_table_info) {
+		if (dl_table_info.count(source_entry.first)) {
+			continue;
+		}
+		const auto &source = source_entry.second;
+		SourceDeltaPlacement placement;
+		auto existing =
+		    RefreshMetadata::FindSourceDelta(context, source.catalog_name, source.schema_name, source.table_name);
+		// Change capture looks for moved deltas only in native catalogs.
+		bool internal_relation = SqlUtils::IsDelta(source.table_name) ||
+		                         IncrementalTableNames::IsDataTable(source.table_name) ||
+		                         StringUtil::StartsWith(source.table_name, openivm::VISIBLE_TABLE_PREFIX) ||
+		                         Catalog::GetCatalog(context, source.catalog_name).GetCatalogType() != "duckdb";
+		if (existing) {
+			placement.schema_name = existing->schema.name;
+			placement.table_name = existing->name;
+		} else {
+			placement.schema_name =
+			    internal_schema_setting.empty() || internal_relation ? source.schema_name : internal_schema_setting;
+			placement.table_name =
+			    RefreshMetadata::SourceDeltaTableName(source.schema_name, source.table_name, placement.schema_name);
+		}
+		source_delta_placements[source_entry.first] = placement;
+		OPENIVM_DEBUG_PRINT(
+		    "[CREATE MV] Source %s uses delta %s\n", source_entry.first.c_str(),
+		    SqlUtils::FullName(source.catalog_name, placement.schema_name, placement.table_name).c_str());
+	}
+
 	vector<string> source_metadata_values;
 	unordered_map<string, vector<string>> snapshot_update_tables_by_catalog;
 	unordered_set<string> inserted_meta_table_names;
@@ -1302,6 +1372,12 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		string meta_table_name = SqlUtils::DeltaName(table_name);
 		string source_catalog_val = source.catalog_name;
 		string source_schema_val = source.schema_name;
+		string delta_schema_val = "null";
+		auto placement = source_delta_placements.find(source_entry.first);
+		if (placement != source_delta_placements.end() &&
+		    !StringUtil::CIEquals(placement->second.schema_name, source.schema_name)) {
+			delta_schema_val = "'" + SqlUtils::EscapeSingleQuotes(placement->second.schema_name) + "'";
+		}
 
 		auto it = dl_table_info.find(source_entry.first);
 		if (it != dl_table_info.end()) {
@@ -1336,13 +1412,14 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		    "', " + string(openivm::UTC_NOW_SQL) + ", '" + SqlUtils::EscapeSingleQuotes(catalog_type) + "', " +
 		    snapshot_val + ", " + string(openivm::UTC_NOW_SQL) + ", '" +
 		    SqlUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
-		    SqlUtils::EscapeSingleQuotes(source_schema_val) + "', " + source_table_id_val + ")");
+		    SqlUtils::EscapeSingleQuotes(source_schema_val) + "', " + source_table_id_val + ", " + delta_schema_val +
+		    ")");
 	}
 	vector<string> source_metadata_ddl;
 	if (!source_metadata_values.empty()) {
 		source_metadata_ddl.push_back("insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
 		                              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
-		                              "last_refresh_ts, source_catalog, source_schema, source_table_id) "
+		                              "last_refresh_ts, source_catalog, source_schema, source_table_id, delta_schema) "
 		                              "values " +
 		                              StringUtil::Join(source_metadata_values, ", "));
 	}
@@ -1423,6 +1500,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 		ddl.push_back("create or replace table " + qdt + " as select * from " + staged_qdt);
 		ddl.push_back("drop table " + staged_qdt);
+		for (auto &aux_table : replaced_auxiliary_tables) {
+			if (!aux_state_targets.count(aux_table)) {
+				ddl.push_back("DROP TABLE IF EXISTS " + internal_catalog_prefix + SqlUtils::QuoteIdentifier(aux_table));
+			}
+		}
 	}
 	if (!view_catalog_prefix.empty()) {
 		// Keep the same connection after a DuckLake CTAS. Reopening here can force
@@ -1573,15 +1655,23 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		Value schema_value(source.schema_name);
 
 		auto catalog_schema = SqlUtils::QualifiedPrefix(catalog_value.ToString(), schema_value.ToString());
+		auto &placement = source_delta_placements.at(source_entry.first);
+		auto delta_prefix = SqlUtils::QualifiedPrefix(source.catalog_name, placement.schema_name);
+		string create_schema;
+		if (!StringUtil::CIEquals(placement.schema_name, source.schema_name)) {
+			// The internal schema belongs to the source's catalog and transaction.
+			create_schema = "CREATE SCHEMA IF NOT EXISTS " + SqlUtils::QuoteIdentifier(source.catalog_name) + "." +
+			                SqlUtils::QuoteIdentifier(placement.schema_name) + ";\n";
+		}
 
-		ddl.push_back("create table if not exists " + catalog_schema +
-		              KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(table_name)) +
-		              " as select *, 1::INTEGER as " + string(openivm::MULTIPLICITY_COL) + ", " +
-		              string(openivm::UTC_NOW_SQL) + " as " + string(openivm::TIMESTAMP_COL) + " from " +
-		              catalog_schema + KeywordHelper::WriteOptionallyQuoted(table_name) + " limit 0");
+		ddl.push_back(create_schema + "create table if not exists " + delta_prefix +
+		              SqlUtils::QuoteIdentifier(placement.table_name) + " as select *, 1::INTEGER as " +
+		              string(openivm::MULTIPLICITY_COL) + ", " + string(openivm::UTC_NOW_SQL) + " as " +
+		              string(openivm::TIMESTAMP_COL) + " from " + catalog_schema +
+		              KeywordHelper::WriteOptionallyQuoted(table_name) + " limit 0");
 		// The initial load already includes every visible source delta, including
 		// writes earlier in this transaction and changes retained for other MVs.
-		auto source_delta = catalog_schema + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(table_name));
+		auto source_delta = delta_prefix + SqlUtils::QuoteIdentifier(placement.table_name);
 		InitializeSourceDelta(context, con, source_delta, ddl.back());
 		if (context.transaction.IsAutoCommit()) {
 			// Shared initialization has committed this DDL already. Reissuing even
@@ -1796,8 +1886,10 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	if (view_entry) {
 		data_ref = SqlUtils::FindTableReference(view_entry->Cast<ViewCatalogEntry>().GetQuery().ToString(), data_name);
 	}
-	string internal_prefix = SqlUtils::QualifiedPrefix(location.catalog_name, location.schema_name);
-	if (!data_ref.empty()) {
+	auto internal_schema = metadata.GetInternalSchema(view_name);
+	string internal_prefix = SqlUtils::QualifiedPrefix(
+	    location.catalog_name, internal_schema.empty() ? location.schema_name : internal_schema);
+	if (!data_ref.empty() && internal_schema.empty()) {
 		auto separator = data_ref.rfind('.');
 		internal_prefix = separator == string::npos ? "" : data_ref.substr(0, separator + 1);
 	} else {
@@ -1817,12 +1909,16 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	program += "DROP TABLE IF EXISTS " + data_ref + ";\n";
 	program += "DROP TABLE IF EXISTS " + internal_prefix +
 	           KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name)) + ";\n";
-	program += string(IsSnapshotPublication(context, location.catalog_name, location.schema_name, view_name)
+	program += string(IsSnapshotPublication(context, location.catalog_name,
+	                                        internal_schema.empty() ? location.schema_name : internal_schema, view_name)
 	                      ? "DROP VIEW IF EXISTS "
 	                      : "DROP TABLE IF EXISTS ") +
 	           internal_prefix + SqlUtils::QuoteIdentifier(PublishedViewName(view_name)) + ";\n";
 	program += "DROP TABLE IF EXISTS " + internal_prefix +
 	           SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(PublishedViewName(view_name))) + ";\n";
+	for (auto &aux_table : metadata.GetAuxiliaryTables(view_name)) {
+		program += "DROP TABLE IF EXISTS " + internal_prefix + SqlUtils::QuoteIdentifier(aux_table) + ";\n";
+	}
 	program += "DELETE FROM " + string(openivm::REFRESH_HOOKS_TABLE) + " WHERE view_name = '" +
 	           SqlUtils::EscapeValue(view_name) + "';\n";
 	program += "DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE parent_view = '" +
@@ -1872,10 +1968,9 @@ static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshM
 			has_consumers |= remaining->GetValue(0, 0).GetValue<int64_t>() != 0;
 		}
 		if (!has_consumers) {
+			// The physical delta may sit in an internal schema under a schema-qualified name.
 			program += "DROP TABLE IF EXISTS " +
-			           SqlUtils::FullName(source.catalog_name, source.schema_name,
-			                              RefreshMetadata::SourceTableName(source.table_name, source.catalog_name,
-			                                                               source.schema_name)) +
+			           SqlUtils::FullName(source.catalog_name, source.delta_schema_name, source.delta_table_name) +
 			           ";\n";
 		}
 	}

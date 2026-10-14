@@ -190,7 +190,10 @@ static bool SameRelationLocus(const string &left_catalog, const string &left_sch
 }
 
 static string MVInternalPrefix(ClientContext &context, const RefreshMetadata::StoredViewLocation &location,
-                               const string &view_name, const string &sql_name) {
+                               const string &view_name, const string &sql_name, const string &internal_schema) {
+	if (!internal_schema.empty()) {
+		return SqlUtils::QualifiedPrefix(location.catalog_name, internal_schema);
+	}
 	QueryErrorContext error_context;
 	auto entry = Catalog::GetEntry(context, location.catalog_name, location.schema_name,
 	                               EntryLookupInfo(CatalogType::VIEW_ENTRY, sql_name, error_context),
@@ -212,7 +215,9 @@ static void DropTrackedMaterializedView(ClientContext &context, Connection &con,
 	auto location = metadata.GetStoredViewLocation(view_name);
 	auto delta_sources = metadata.GetDeltaSources(view_name, location.catalog_name, location.schema_name);
 	auto sql_name = metadata.GetViewSQLName(view_name);
-	auto internal_prefix = MVInternalPrefix(context, location, view_name, sql_name);
+	auto auxiliary_tables = metadata.GetAuxiliaryTables(view_name);
+	auto internal_prefix =
+	    MVInternalPrefix(context, location, view_name, sql_name, metadata.GetInternalSchema(view_name));
 	auto escaped_view_name = SqlUtils::EscapeValue(view_name);
 	auto view_predicate = "view_name = '" + escaped_view_name + "'";
 	RegisterMetadataRestore(context, con, openivm::VIEWS_TABLE, view_predicate);
@@ -240,6 +245,11 @@ static void DropTrackedMaterializedView(ClientContext &context, Connection &con,
 		                          location.schema_name, CatalogType::TABLE_ENTRY);
 	}
 
+	for (auto &aux_table : auxiliary_tables) {
+		DropQualifiedCatalogEntry(context, internal_prefix + SqlUtils::QuoteIdentifier(aux_table),
+		                          location.catalog_name, location.schema_name, CatalogType::TABLE_ENTRY);
+	}
+
 	for (auto &source : delta_sources) {
 		// DuckLake entries store the base table name — never drop it.
 		if (source.catalog_type == "ducklake" || metadata.IsMaterializedViewDelta(source)) {
@@ -249,10 +259,8 @@ static void DropTrackedMaterializedView(ClientContext &context, Connection &con,
 		    con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 		              RefreshMetadata::SourcePredicate(source.table_name, source.catalog_name, source.schema_name));
 		if (!remaining->HasError() && remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
-			DropCatalogEntry(
-			    context, source.catalog_name, source.schema_name,
-			    RefreshMetadata::SourceTableName(source.table_name, source.catalog_name, source.schema_name),
-			    CatalogType::TABLE_ENTRY);
+			DropCatalogEntry(context, source.catalog_name, source.delta_schema_name, source.delta_table_name,
+			                 CatalogType::TABLE_ENTRY);
 		}
 	}
 }
@@ -263,13 +271,13 @@ static optional_ptr<TableCatalogEntry> TryGetTrackedDeltaTable(ClientContext &co
 	    table.catalog.GetCatalogType() == "ducklake") {
 		return nullptr;
 	}
+	// The delta may live in an internal schema (openivm_internal_schema).
 	auto delta_table =
-	    Catalog::GetEntry<TableCatalogEntry>(context, table.catalog.GetName(), table.schema.name,
-	                                         SqlUtils::DeltaName(table_name), OnEntryNotFound::RETURN_NULL);
+	    RefreshMetadata::FindSourceDelta(context, table.catalog.GetName(), table.schema.name, table_name);
 	if (!delta_table) {
 		return nullptr;
 	}
-	return &delta_table->Cast<TableCatalogEntry>();
+	return delta_table;
 }
 
 static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert &insert) {
@@ -459,11 +467,13 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		// Resolve only the source's delta table in the caller transaction. Scanning
 		// information_schema touches unrelated external catalogs and can silently
 		// skip schema synchronization when one of them is unavailable.
-		auto delta_entry = Catalog::GetEntry<TableCatalogEntry>(input.context, source_locus.first, source_locus.second,
-		                                                        delta_name, OnEntryNotFound::RETURN_NULL);
+		auto delta_entry =
+		    RefreshMetadata::FindSourceDelta(input.context, source_locus.first, source_locus.second, table_name);
 		if (!delta_entry) {
 			return; // not an IVM-tracked table
 		}
+		// The physical delta may sit in an internal schema; metadata still keys it by delta_name.
+		auto delta_locus = std::make_pair(delta_entry->schema.name, delta_entry->name);
 		Connection con(*input.context.db);
 		RefreshMetadata::UseCatalog(input.context, con, source_locus.first);
 		TransactionalMVLockState::Get(input.context).AcquireMutationLock();
@@ -476,8 +486,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			}
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE ADD COLUMN '%s' — syncing delta table\n",
 			                    add_info->new_column.Name().c_str());
-			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, source_locus.second,
-			                              delta_name);
+			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, delta_locus.first,
+			                              delta_locus.second);
 			break;
 		}
 		case AlterTableType::REMOVE_COLUMN: {
@@ -497,8 +507,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				}
 			}
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE DROP COLUMN '%s' — syncing delta table\n", col_name.c_str());
-			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, source_locus.second,
-			                              delta_name);
+			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, delta_locus.first,
+			                              delta_locus.second);
 			break;
 		}
 		case AlterTableType::RENAME_COLUMN: {
@@ -519,8 +529,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			}
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE RENAME COLUMN '%s' → '%s' — syncing delta table\n",
 			                    old_name.c_str(), new_name.c_str());
-			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, source_locus.second,
-			                              delta_name);
+			AlterDeltaInCallerTransaction(input.context, *alter_info, source_locus.first, delta_locus.first,
+			                              delta_locus.second);
 			break;
 		}
 		default:

@@ -333,14 +333,17 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			exec_con.Commit();
 			tx_open = false;
 		}
-		if (cross_system && IsSnapshotPublication(*exec_con.context, view_catalog_name, view_schema_name, vn)) {
+		// Publication tables live in the MV's internal location.
+		auto internal_schema = probe_meta.GetInternalSchema(vn);
+		auto internal_schema_name = internal_schema.empty() ? view_schema_name : internal_schema;
+		if (cross_system && IsSnapshotPublication(*exec_con.context, view_catalog_name, internal_schema_name, vn)) {
 			auto publication_start = std::chrono::steady_clock::now();
 			auto publication = probe_con.Query("SELECT published_query FROM openivm_views WHERE view_name='" +
 			                                   SqlUtils::EscapeValue(vn) + "'");
 			if (publication->HasError() || publication->RowCount() != 1 || publication->GetValue(0, 0).IsNull()) {
 				throw CatalogException("Could not read snapshot publication query for '%s'", vn);
 			}
-			auto prefix = SqlUtils::QualifiedPrefix(view_catalog_name, view_schema_name);
+			auto prefix = SqlUtils::QualifiedPrefix(view_catalog_name, internal_schema_name);
 			auto publish_sql = BuildSnapshotPublicationSQL(
 			    exec_con, view_catalog_name, prefix + SqlUtils::QuoteIdentifier(PublishedViewName(vn)),
 			    prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(vn)),
@@ -461,7 +464,7 @@ struct AuxCatalogTarget {
 	string schema_name;
 };
 
-static AuxCatalogTarget ResolveAuxCatalogTarget(RefreshMetadata &metadata, Connection &con,
+static AuxCatalogTarget ResolveAuxCatalogTarget(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                                 const string &view_catalog_name, const string &view_schema_name) {
 	// Auxiliary state follows the MV, never the configured metadata schema.
 	string default_db = RefreshMetadata::CurrentLocation(con).catalog_name;
@@ -473,6 +476,10 @@ static AuxCatalogTarget ResolveAuxCatalogTarget(RefreshMetadata &metadata, Conne
 	    view_catalog_name != default_db) {
 		target.catalog_name = default_db;
 		target.schema_name = DEFAULT_SCHEMA;
+	}
+	auto internal_schema = metadata.GetInternalSchema(view_name);
+	if (!internal_schema.empty() && StringUtil::CIEquals(target.catalog_name, view_catalog_name)) {
+		target.schema_name = internal_schema;
 	}
 	return target;
 }
@@ -487,7 +494,7 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
 	if (metadata.GetViewType(view_name) == RefreshType::FULL_REFRESH) {
 		return false;
 	}
-	auto aux_target = ResolveAuxCatalogTarget(metadata, con, view_catalog_name, view_schema_name);
+	auto aux_target = ResolveAuxCatalogTarget(metadata, con, view_name, view_catalog_name, view_schema_name);
 	if (metadata.AuxStateNeedsRepair(view_name, aux_target.catalog_name, aux_target.schema_name)) {
 		return false;
 	}

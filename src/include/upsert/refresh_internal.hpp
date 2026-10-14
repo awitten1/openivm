@@ -179,6 +179,9 @@ string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &quer
                                     const string &old_table, const string &new_table, const string &filter);
 bool IsSummableLogicalType(const LogicalType &type);
 string NormalizeColumnNameForMatch(const string &name);
+// Resolve a logical source to its metadata key using catalog and schema as well as its name.
+string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
+                               const vector<string> &delta_table_names);
 string BaseTableNameFromDeltaKey(const string &delta_key);
 string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec);
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,

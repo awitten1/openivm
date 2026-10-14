@@ -567,6 +567,73 @@ string RefreshMetadata::SourcePredicate(const string &table, const string &catal
 	       SqlUtils::EscapeValue(schema) + "'";
 }
 
+string RefreshMetadata::InternalSourceDeltaName(const string &source_schema, const string &table) {
+	// Hex-encode the schema like view keys: the separator can then never be ambiguous.
+	string encoded;
+	const char *hex = "0123456789abcdef";
+	for (unsigned char c : StringUtil::Lower(source_schema)) {
+		encoded += hex[c >> 4];
+		encoded += hex[c & 15];
+	}
+	return string(openivm::DELTA_PREFIX) + encoded + "_" + table;
+}
+
+string RefreshMetadata::SourceDeltaTableName(const string &source_schema, const string &table,
+                                             const string &delta_schema) {
+	if (delta_schema.empty() || StringUtil::CIEquals(delta_schema, source_schema)) {
+		return SqlUtils::DeltaName(table);
+	}
+	return InternalSourceDeltaName(source_schema, table);
+}
+
+optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDelta(ClientContext &context, const string &catalog,
+                                                                 const string &schema, const string &table) {
+	auto colocated = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, SqlUtils::DeltaName(table),
+	                                                      OnEntryNotFound::RETURN_NULL);
+	if (colocated) {
+		return colocated;
+	}
+	// Deltas of OpenIVM's own relations always stay beside them; only native sources move.
+	if (SqlUtils::IsDelta(table) || IncrementalTableNames::IsDataTable(table) ||
+	    StringUtil::StartsWith(table, openivm::VISIBLE_TABLE_PREFIX)) {
+		return nullptr;
+	}
+	auto &source_catalog = Catalog::GetCatalog(context, catalog);
+	if (source_catalog.GetCatalogType() != "duckdb") {
+		return nullptr;
+	}
+	vector<string> schemas;
+	source_catalog.ScanSchemas(context, [&](SchemaCatalogEntry &entry) { schemas.push_back(entry.name); });
+	std::sort(schemas.begin(), schemas.end());
+	auto internal_name = InternalSourceDeltaName(schema, table);
+	optional_ptr<TableCatalogEntry> delta;
+	for (auto &candidate : schemas) {
+		auto entry = Catalog::GetEntry<TableCatalogEntry>(context, catalog, candidate, internal_name,
+		                                                  OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			if (delta) {
+				throw CatalogException("OpenIVM found multiple internal deltas for source '%s'",
+				                       SqlUtils::FullName(catalog, schema, table));
+			}
+			delta = entry;
+		}
+	}
+	return delta;
+}
+
+// Physical delta of a source row; legacy rows (no delta_schema) keep it beside the source.
+static void SetSourceDelta(const string &delta_key, const string &schema, const string &delta_schema,
+                           string &delta_schema_name, string &delta_table_name) {
+	delta_schema_name = delta_schema.empty() ? schema : delta_schema;
+	if (delta_schema.empty() || StringUtil::CIEquals(delta_schema, schema)) {
+		delta_table_name = delta_key;
+		return;
+	}
+	static const string prefix(openivm::DELTA_PREFIX);
+	auto base = StringUtil::StartsWith(delta_key, prefix) ? delta_key.substr(prefix.size()) : delta_key;
+	delta_table_name = RefreshMetadata::InternalSourceDeltaName(schema, base);
+}
+
 RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string &view_name, const string &table_name,
                                                                    const string &fallback_catalog,
                                                                    const string &fallback_schema) {
@@ -574,9 +641,16 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 	loc.catalog_name = fallback_catalog;
 	loc.schema_name = fallback_schema;
 	loc.table_name = table_name;
-	auto result = con.Query("SELECT source_catalog, source_schema FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-	                        SqlUtils::EscapeValue(table_name) + "'");
+	string delta_schema;
+	auto filter = " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	              SqlUtils::EscapeValue(table_name) + "'";
+	auto result = con.Query("SELECT source_catalog, source_schema, delta_schema FROM " +
+	                        string(openivm::DELTA_TABLES_TABLE) + filter);
+	if (result->HasError()) {
+		// Metadata written before internal schemas existed.
+		result = con.Query("SELECT source_catalog, source_schema, NULL FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		                   filter);
+	}
 	if (!result->HasError() && result->RowCount() > 0) {
 		if (!result->GetValue(0, 0).IsNull()) {
 			loc.catalog_name = result->GetValue(0, 0).ToString();
@@ -584,9 +658,28 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 		if (!result->GetValue(1, 0).IsNull()) {
 			loc.schema_name = result->GetValue(1, 0).ToString();
 		}
+		if (!result->GetValue(2, 0).IsNull()) {
+			delta_schema = result->GetValue(2, 0).ToString();
+		}
 	}
 	loc.table_name = SourceTableName(table_name, loc.catalog_name, loc.schema_name);
+	SetSourceDelta(loc.table_name, loc.schema_name, delta_schema, loc.delta_schema_name, loc.delta_table_name);
 	return loc;
+}
+
+string RefreshMetadata::GetInternalSchema(const string &view_name) {
+	return ReadViewString(view_name, "internal_schema");
+}
+
+RefreshMetadata::StoredViewLocation RefreshMetadata::GetInternalLocation(const string &view_name,
+                                                                         const string &fallback_catalog,
+                                                                         const string &fallback_schema) {
+	auto location = GetStoredViewLocation(view_name, fallback_catalog, fallback_schema);
+	auto internal_schema = GetInternalSchema(view_name);
+	if (!internal_schema.empty()) {
+		location.schema_name = internal_schema;
+	}
+	return location;
 }
 
 RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const string &view_name,
@@ -620,11 +713,18 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source) {
 		return false;
 	}
 	auto owner = PublishedSourceViewName(source.table_name);
-	auto result = con.Query(
-	    "SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name='" + SqlUtils::EscapeValue(owner) +
-	    "' AND COALESCE(view_catalog,'" + SqlUtils::EscapeValue(source.catalog_name) + "')='" +
-	    SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(view_schema,'" +
-	    SqlUtils::EscapeValue(source.schema_name) + "')='" + SqlUtils::EscapeValue(source.schema_name) + "'");
+	// An MV's own deltas live in its internal location, which may differ from the view's schema.
+	auto query = [&](const string &schema_expression) {
+		return con.Query(
+		    "SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name='" + SqlUtils::EscapeValue(owner) +
+		    "' AND COALESCE(view_catalog,'" + SqlUtils::EscapeValue(source.catalog_name) + "')='" +
+		    SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(" + schema_expression + ",'" +
+		    SqlUtils::EscapeValue(source.schema_name) + "')='" + SqlUtils::EscapeValue(source.schema_name) + "'");
+	};
+	auto result = query("internal_schema, view_schema");
+	if (result->HasError()) {
+		result = query("view_schema"); // Metadata written before internal schemas existed.
+	}
 	if (result->HasError()) {
 		throw CatalogException("Cannot resolve delta owner for '%s': %s", source.table_name, result->GetError());
 	}
@@ -634,9 +734,13 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source) {
 vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
                                                                       const string &fallback_catalog,
                                                                       const string &fallback_schema) {
-	auto result = con.Query("SELECT table_name, catalog_type, source_catalog, source_schema FROM " +
-	                        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
+	auto filter = " FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "'";
+	auto result = con.Query("SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema" + filter);
+	if (result->HasError()) {
+		// Metadata written before internal schemas existed.
+		result = con.Query("SELECT table_name, catalog_type, source_catalog, source_schema, NULL" + filter);
+	}
 	vector<DeltaSource> sources;
 	if (result->HasError()) {
 		return sources;
@@ -648,6 +752,9 @@ vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const stri
 		source.catalog_name =
 		    result->GetValue(2, row).IsNull() ? fallback_catalog : result->GetValue(2, row).ToString();
 		source.schema_name = result->GetValue(3, row).IsNull() ? fallback_schema : result->GetValue(3, row).ToString();
+		auto delta_schema = result->GetValue(4, row).IsNull() ? string() : result->GetValue(4, row).ToString();
+		SetSourceDelta(SourceTableName(source.table_name, source.catalog_name, source.schema_name), source.schema_name,
+		               delta_schema, source.delta_schema_name, source.delta_table_name);
 		sources.push_back(std::move(source));
 	}
 	return sources;
@@ -657,12 +764,10 @@ string RefreshMetadata::ResolveDeltaQualifiedName(const string &view_name, const
                                                   const string &fallback_catalog, const string &fallback_schema) {
 	auto loc = GetSourceLocation(view_name, delta_table_name, fallback_catalog, fallback_schema);
 	if (loc.catalog_name.empty()) {
-		return SqlUtils::QuoteIdentifier(loc.table_name);
+		return SqlUtils::QuoteIdentifier(loc.delta_table_name);
 	}
-	if (loc.schema_name.empty()) {
-		loc.schema_name = "main";
-	}
-	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name);
+	auto schema = loc.delta_schema_name.empty() ? string("main") : loc.delta_schema_name;
+	return SqlUtils::FullName(loc.catalog_name, schema, loc.delta_table_name);
 }
 
 RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(const string &delta_table_sql,
@@ -832,15 +937,23 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 		selected.insert(target);
 	}
 	// Read the same source metadata used by single-view cascades, not the optional matcher edges.
-	auto edges = con.Query(
-	    "SELECT DISTINCT p.view_name, d.view_name FROM " + string(openivm::VIEWS_TABLE) + " p JOIN " +
-	    string(openivm::DELTA_TABLES_TABLE) + " d ON (d.table_name = '" + string(openivm::DELTA_PREFIX) +
-	    "' || p.view_name OR d.table_name = '" + string(openivm::DATA_TABLE_PREFIX) +
-	    "' || p.view_name OR d.table_name = '" + string(openivm::VISIBLE_TABLE_PREFIX) +
-	    "' || p.view_name OR d.table_name = '" + string(openivm::DELTA_PREFIX) + string(openivm::VISIBLE_TABLE_PREFIX) +
-	    "' || p.view_name)"
-	    " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR d.source_catalog=p.view_catalog)"
-	    " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR d.source_schema=p.view_schema)");
+	// A child reads the parent's internal tables, which may live in the parent's internal schema.
+	auto edge_query = [&](const string &parent_schema) {
+		return con.Query("SELECT DISTINCT p.view_name, d.view_name FROM " + string(openivm::VIEWS_TABLE) + " p JOIN " +
+		                 string(openivm::DELTA_TABLES_TABLE) + " d ON (d.table_name = '" +
+		                 string(openivm::DELTA_PREFIX) + "' || p.view_name OR d.table_name = '" +
+		                 string(openivm::DATA_TABLE_PREFIX) + "' || p.view_name OR d.table_name = '" +
+		                 string(openivm::VISIBLE_TABLE_PREFIX) + "' || p.view_name OR d.table_name = '" +
+		                 string(openivm::DELTA_PREFIX) + string(openivm::VISIBLE_TABLE_PREFIX) +
+		                 "' || p.view_name)"
+		                 " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR d.source_catalog=p.view_catalog)"
+		                 " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR d.source_schema=" +
+		                 parent_schema + ")");
+	};
+	auto edges = edge_query("COALESCE(p.internal_schema, p.view_schema)");
+	if (edges->HasError()) {
+		edges = edge_query("p.view_schema"); // Metadata written before internal schemas existed.
+	}
 	if (edges->HasError()) {
 		throw CatalogException("refresh_pipeline: cannot read dependencies: %s", edges->GetError());
 	}
@@ -1016,14 +1129,17 @@ void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_prog
 
 string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
                                              const string &delta_metadata_table, vector<string> *deferred_cleanup,
-                                             const vector<string> &delta_metadata_tables) {
+                                             const vector<string> &delta_metadata_tables, const string &source_catalog,
+                                             const string &source_schema) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
 	                 SqlUtils::EscapeValue(metadata_key) + "'";
 	auto parts = SqlUtils::ParseQualifiedIdentifier(qtarget);
 	if (parts.size() == 3) {
-		auto predicate = SourcePredicate(parts[2], parts[0], parts[1]);
+		// Consumers are keyed by the source, which an internal-schema delta does not reveal.
+		auto predicate = source_catalog.empty() ? SourcePredicate(parts[2], parts[0], parts[1])
+		                                        : SourcePredicate(metadata_key, source_catalog, source_schema);
 		consumers = "SELECT last_update FROM " + metadata_table + " WHERE " + predicate;
 		for (auto &other : delta_metadata_tables) {
 			if (!StringUtil::CIEquals(other, metadata_table)) {
@@ -1704,6 +1820,27 @@ vector<string> RefreshMetadata::ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta
 		expected.push_back("_right_null_count");
 	}
 	return expected;
+}
+
+vector<string> RefreshMetadata::GetAuxiliaryTables(const string &view_name) {
+	vector<string> tables;
+	DistinctAuxMeta distinct;
+	if (GetDistinctAuxMeta(view_name, distinct)) {
+		tables.push_back(distinct.aux_table);
+	}
+	CountDistinctAuxMeta count_distinct;
+	if (GetCountDistinctAuxMeta(view_name, count_distinct)) {
+		tables.push_back(count_distinct.aux_table);
+	}
+	FilteredGroupCountAuxMeta filtered;
+	if (GetFilteredGroupCountAuxMeta(view_name, filtered)) {
+		tables.push_back(filtered.aux_table);
+	}
+	SemiAntiAuxMeta semi;
+	if (GetSemiAntiAuxMeta(view_name, semi)) {
+		tables.push_back(semi.aux_table);
+	}
+	return tables;
 }
 
 bool RefreshMetadata::AuxStateNeedsRepair(const string &view_name, const string &catalog_name,

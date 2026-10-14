@@ -8,6 +8,8 @@
 
 namespace duckdb {
 
+class TableCatalogEntry;
+
 // Centralized access to IVM metadata stored in system tables.
 // Wraps all raw SQL queries to openivm_views and openivm_delta_tables
 // behind typed methods. Takes a Connection reference — does NOT create its own.
@@ -90,10 +92,14 @@ public:
 	static string SourceTableName(const string &key, const string &catalog, const string &schema);
 	static string SourcePredicate(const string &table, const string &catalog, const string &schema);
 
+	// A source's delta table lives beside the source unless openivm_internal_schema placed it in
+	// an internal schema of the same catalog; there its name encodes the source schema.
 	struct SourceLocation {
 		string catalog_name;
 		string schema_name;
 		string table_name;
+		string delta_schema_name;
+		string delta_table_name;
 	};
 	struct StoredViewLocation {
 		string catalog_name;
@@ -104,12 +110,28 @@ public:
 		string catalog_type;
 		string catalog_name;
 		string schema_name;
+		string delta_schema_name;
+		string delta_table_name;
 	};
+
+	// Physical source-delta naming. Internal-schema deltas encode the source schema so that
+	// same-named sources of different schemas never collide.
+	static string InternalSourceDeltaName(const string &source_schema, const string &table);
+	static string SourceDeltaTableName(const string &source_schema, const string &table, const string &delta_schema);
+	// The source's delta table: beside it, or in any internal schema of its native catalog.
+	// Requires an active transaction on `context`.
+	static optional_ptr<TableCatalogEntry> FindSourceDelta(ClientContext &context, const string &catalog,
+	                                                       const string &schema, const string &table);
 
 	SourceLocation GetSourceLocation(const string &view_name, const string &table_name,
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");
 	StoredViewLocation GetStoredViewLocation(const string &view_name, const string &fallback_catalog = "",
 	                                         const string &fallback_schema = "");
+	// Schema of a view's backing, publication, auxiliary-state and MV delta tables when
+	// openivm_internal_schema placed them apart from the view; empty means the view's schema.
+	string GetInternalSchema(const string &view_name);
+	StoredViewLocation GetInternalLocation(const string &view_name, const string &fallback_catalog = "",
+	                                       const string &fallback_schema = "");
 	bool IsMaterializedViewDelta(const DeltaSource &source);
 	vector<DeltaSource> GetDeltaSources(const string &view_name, const string &fallback_catalog = "",
 	                                    const string &fallback_schema = "");
@@ -163,10 +185,13 @@ public:
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
 	// delta_metadata_tables: qualified openivm_delta_tables of every native metadata location.
+	// source_catalog/source_schema identify the source when the target is an internal-schema
+	// delta whose physical location differs from its source.
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
 	                                   const string &delta_metadata_table = "",
 	                                   vector<string> *deferred_cleanup = nullptr,
-	                                   const vector<string> &delta_metadata_tables = {});
+	                                   const vector<string> &delta_metadata_tables = {},
+	                                   const string &source_catalog = "", const string &source_schema = "");
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);
@@ -399,6 +424,7 @@ public:
 	static vector<string> ExpectedFilteredGroupCountAuxColumns(const FilteredGroupCountAuxMeta &meta);
 	static vector<string> ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta &meta);
 	bool AuxStateNeedsRepair(const string &view_name, const string &catalog_name, const string &schema_name);
+	vector<string> GetAuxiliaryTables(const string &view_name);
 };
 
 } // namespace duckdb

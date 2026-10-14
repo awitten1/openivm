@@ -328,8 +328,10 @@ static bool RewriteStoredViewQuery(Connection &con, RefreshMetadata &metadata, c
 	if (!persist) {
 		return true;
 	}
-	PreserveTopLevelOutputAliases(stmt,
-	                              metadata.GetTableColumns("", "", IncrementalTableNames::DataTableName(view_name)));
+	auto internal_location = metadata.GetInternalLocation(view_name);
+	PreserveTopLevelOutputAliases(stmt, metadata.GetTableColumns(internal_location.catalog_name,
+	                                                             internal_location.schema_name,
+	                                                             IncrementalTableNames::DataTableName(view_name)));
 	string rewritten = stmt.ToString();
 	UpdateViewMetadataValue(con, view_name, "sql_string", rewritten);
 	return true;

@@ -306,6 +306,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 	                             "schema for OpenIVM control metadata in each native catalog; empty keeps existing "
 	                             "metadata where it is and uses main for new metadata",
 	                             LogicalType::VARCHAR, Value(""));
+	db_config.AddExtensionOption(openivm::INTERNAL_SCHEMA_SETTING,
+	                             "schema for OpenIVM internal maintenance tables within each data catalog; empty keeps "
+	                             "them beside the materialized view and its sources",
+	                             LogicalType::VARCHAR, Value(""));
 	Connection con(instance);
 	// Upgrade existing metadata in the schema that already holds it.
 	try {
@@ -324,6 +328,10 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS published_query VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS internal_schema VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS delta_schema VARCHAR DEFAULT NULL");
 
 	// Migration: create refresh history table for learned cost model.
 	// Silently fails on fresh DB (core_functions not yet loaded → DEFAULT

@@ -10,6 +10,9 @@ constexpr const char *ROWS_POSITION_PREFIX = "openivm_rows_position_";
 
 // Schema for control metadata. Unset keeps each catalog's existing metadata schema (main for new metadata).
 constexpr const char *METADATA_SCHEMA_SETTING = "openivm_metadata_schema";
+// Schema for internal maintenance tables within each data catalog. Unset keeps them beside
+// the materialized view and its sources. Applies to objects created while it is set.
+constexpr const char *INTERNAL_SCHEMA_SETTING = "openivm_internal_schema";
 
 // System table names
 constexpr const char *VIEWS_TABLE = "openivm_views";

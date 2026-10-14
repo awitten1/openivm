@@ -52,15 +52,24 @@ void WarnSnapshotHistoryDeletion(ClientContext &context, LogicalOperator &plan) 
 	Connection con(*context.db);
 	vector<string> affected;
 	for (auto &views_table : RefreshMetadata::MetadataTables(con, openivm::VIEWS_TABLE)) {
-		auto views = con.Query("SELECT view_name, view_schema, COALESCE(view_sql_name, view_name) FROM " + views_table +
-		                       " WHERE lower(view_catalog) = lower('" + SqlUtils::EscapeValue(catalog) + "')");
+		// Publications live in the MV's internal location; report the user-facing name.
+		auto query = [&](const string &internal_expression) {
+			return con.Query("SELECT view_name, view_schema, COALESCE(view_sql_name, view_name), " +
+			                 internal_expression + " FROM " + views_table + " WHERE lower(view_catalog) = lower('" +
+			                 SqlUtils::EscapeValue(catalog) + "')");
+		};
+		auto views = query("COALESCE(internal_schema, view_schema)");
+		if (views->HasError()) {
+			views = query("view_schema"); // Metadata written before internal schemas existed.
+		}
 		if (views->HasError()) {
 			throw CatalogException("Could not check snapshot publication before history deletion: %s",
 			                       views->GetError());
 		}
 		for (idx_t row = 0; row < views->RowCount(); row++) {
 			auto schema = views->GetValue(1, row).ToString();
-			if (IsSnapshotPublication(context, catalog, schema, views->GetValue(0, row).ToString())) {
+			auto internal_schema = views->GetValue(3, row).ToString();
+			if (IsSnapshotPublication(context, catalog, internal_schema, views->GetValue(0, row).ToString())) {
 				affected.push_back(SqlUtils::FullName(catalog, schema, views->GetValue(2, row).ToString()));
 			}
 		}

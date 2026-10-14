@@ -31,11 +31,12 @@ int main(int argc, char **argv) {
 		if (!metadata.GetScheduledViews().empty()) {
 			throw InvalidInputException("Expected no scheduled views");
 		}
-		// The last catalog keeps its control metadata in a configured, quoted schema.
+		// The last catalog separates control metadata and maintenance objects into quoted schemas.
 		for (auto catalog : {"memory", "other", "configured"}) {
 			bool configured = string(catalog) == "configured";
 			Execute(con, "USE " + string(catalog));
 			Execute(con, string("SET openivm_metadata_schema = '") + (configured ? "OpenIVM Control" : "") + "';");
+			Execute(con, string("SET openivm_internal_schema = '") + (configured ? "OpenIVM Internal" : "") + "';");
 			Execute(con, "CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1), (1), (2);");
 			Execute(con, "CREATE MATERIALIZED VIEW scheduled REFRESH EVERY '1 hour' AS SELECT * FROM source;");
 			Execute(con, "INSERT INTO source VALUES (2), (3); DELETE FROM source WHERE i=1; "
@@ -46,6 +47,7 @@ int main(int argc, char **argv) {
 			             "THEN error('Scheduled view differs from source') ELSE true END;");
 		}
 		Execute(con, "SET openivm_metadata_schema = '';");
+		Execute(con, "SET openivm_internal_schema = '';");
 		Execute(con, "SELECT CASE WHEN (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'configured' "
 		             "AND schema_name = 'OpenIVM Control' AND table_name = 'openivm_views') = 1 "
 		             "AND (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'configured' "
@@ -53,8 +55,10 @@ int main(int argc, char **argv) {
 		             "'openivm_refresh_hooks', 'openivm_refresh_history', 'openivm_refresh_profile', "
 		             "'openivm_mv_dependencies')) = 0 "
 		             "AND (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'configured' "
-		             "AND schema_name = 'main' AND table_name = 'openivm_delta_source') = 1 "
-		             "THEN true ELSE error('Configured metadata schema was not used') END;");
+		             "AND schema_name = 'OpenIVM Internal' AND table_name = 'openivm_delta_6d61696e_source') = 1 "
+		             "AND (SELECT count(*) FROM duckdb_tables() WHERE database_name = 'configured' "
+		             "AND schema_name = 'main' AND starts_with(table_name, 'openivm_')) = 0 "
+		             "THEN true ELSE error('Configured metadata and internal schemas were not used') END;");
 		std::cout << "READY" << std::endl;
 		string line;
 		std::getline(std::cin, line);
@@ -74,7 +78,7 @@ int main(int argc, char **argv) {
 		// unrelated DuckLake catalog is locked. A global information_schema scan
 		// can fail and silently skip that synchronization.
 		Execute(con, "ALTER TABLE source ADD COLUMN extra INTEGER DEFAULT 7;");
-		Execute(con, "SELECT extra FROM openivm_delta_source LIMIT 0;");
+		Execute(con, "SELECT extra FROM configured.\"OpenIVM Internal\".openivm_delta_6d61696e_source LIMIT 0;");
 		std::cout << "PASS" << std::endl;
 	} catch (const std::exception &e) {
 		std::cerr << e.what() << std::endl;

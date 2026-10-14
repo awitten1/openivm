@@ -53,28 +53,53 @@ first materialized view in the transaction creates the configured schema, and
 
 ## Internal maintenance objects
 
-Internal objects never move with the metadata schema:
+Internal objects never move with the metadata schema, and never cross catalogs.
+`openivm_internal_schema` selects a dedicated schema for them inside each data
+catalog:
 
-| Object | Location |
-|---|---|
-| User-facing materialized view | The requested catalog and schema |
-| Backing table `openivm_data_<key>` | The MV's catalog and schema |
-| Publication table `openivm_visible_<key>` and its delta | The MV's catalog and schema |
-| MV delta table `openivm_delta_<key>` | The MV's catalog and schema; for DuckLake MVs, the DuckLake schema |
-| Auxiliary state (DISTINCT counts, semi/anti match counts) | The MV's catalog and schema |
-| Unique index on grouped backing tables | The backing table |
-| Native source delta `openivm_delta_<table>` | The source table's catalog and schema |
-| DuckLake source changes | DuckLake snapshots; no delta table |
+```sql
+SET openivm_internal_schema = 'openivm_internal';
+CREATE MATERIALIZED VIEW sales.product_totals AS
+    SELECT product, SUM(amount) AS total FROM sales.orders GROUP BY product;
+-- sales.product_totals stays in schema sales; its tables go to openivm_internal.
+```
+
+| Object | Unset (default) | `openivm_internal_schema = 'I'` |
+|---|---|---|
+| User-facing materialized view | The requested catalog and schema | Unchanged |
+| Backing table `openivm_data_<key>` | The MV's catalog and schema | `I` in the MV's catalog |
+| Publication table `openivm_visible_<key>` and its delta | The MV's catalog and schema | `I` in the MV's catalog |
+| MV delta table `openivm_delta_<key>` | The MV's catalog and schema | `I` in the MV's catalog |
+| Auxiliary state (DISTINCT counts, semi/anti match counts) | The MV's catalog and schema | `I` in the MV's catalog |
+| Unique index on grouped backing tables | The backing table | The backing table |
+| Native source delta | `openivm_delta_<table>` beside the source | `openivm_delta_<hex(schema)>_<table>` in `I` of the source's catalog |
+| DuckLake source changes | DuckLake snapshots; no delta table | Unchanged |
+
+For a DuckLake MV, `I` is a schema of the DuckLake catalog, created in the lake's
+own transaction. Native objects are created in the native catalog's transaction,
+so an explicit transaction's `ROLLBACK` removes them and a newly created `I`.
+
+`<key>` is an internal view key derived from the view's catalog, schema and name,
+so same-named views in different schemas or catalogs have separate internal
+objects. A source delta in an internal schema encodes its source schema in hex,
+so same-named sources of different schemas never collide there.
+`openivm_delta_tables` records each source's catalog and schema and, for moved
+deltas, the internal schema (`delta_schema`). `openivm_views.internal_schema`
+records where a view's internal tables live.
+
+**Existing objects.** The setting applies to objects created while it is set.
+OpenIVM finds existing tables where they are, through `openivm_views.internal_schema`
+and `openivm_delta_tables.delta_schema` (empty means beside the view or source), so
+nothing has to be moved by hand:
+
+- A source delta is shared by every view over that source. A new view reuses the
+  existing delta wherever it lives; one source never gets a second delta.
+- `CREATE OR REPLACE` keeps the replaced view's internal location, so views built
+  on it keep reading the same tables. Drop and recreate a view to move it.
+- Deltas of OpenIVM's own tables (a parent MV's publication) stay beside them.
 
 An MV in an external catalog other than DuckLake keeps its internal objects in the
-`main` schema of the native frontend database, beside its control metadata's catalog
-but never in the metadata schema.
-
-`<key>` is an internal view key derived from the view's catalog, schema and name.
-Same-named views in different schemas or catalogs therefore have separate internal
-objects, and `openivm_delta_tables` records each source's catalog and schema.
-Source deltas are named after their source table and stay beside it, so
-same-named sources in different schemas keep separate deltas.
+`main` schema of the native frontend database, never in the metadata schema.
 
 Inspect actual locations with:
 

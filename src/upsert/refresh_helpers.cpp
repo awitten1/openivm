@@ -2,6 +2,7 @@
 #include "duckdb/main/database_manager.hpp"
 
 #include "core/openivm_constants.hpp"
+#include "core/published_view.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
@@ -21,6 +22,56 @@
 #include <set>
 
 namespace duckdb {
+
+string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
+                               const vector<string> &delta_table_names) {
+	vector<string> candidates;
+	candidates.push_back(PublishedViewName(SqlUtils::LastIdentifierPart(table_name)));
+	candidates.push_back(SqlUtils::DeltaName(PublishedViewName(SqlUtils::LastIdentifierPart(table_name))));
+	candidates.push_back(table_name);
+	candidates.push_back(SqlUtils::LastIdentifierPart(table_name));
+	// DuckLake records a chained MV source under its physical backing table.
+	candidates.push_back(IncrementalTableNames::DataTableName(SqlUtils::LastIdentifierPart(table_name)));
+	candidates.push_back(SqlUtils::DeltaName(table_name));
+	candidates.push_back(SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name)));
+	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
+	for (auto &dt : delta_table_names) {
+		auto loc = metadata.GetSourceLocation(view_name, dt);
+		bool matches = false;
+		for (const auto &candidate : candidates) {
+			matches = matches || StringUtil::CIEquals(loc.table_name, candidate);
+		}
+		if (!matches) {
+			// Auxiliary definitions retain public SQL names; chained sources store
+			// the parent's internal key in their physical delta/visible-table name.
+			auto owner = PublishedSourceViewName(loc.table_name);
+			matches = StringUtil::CIEquals(metadata.GetViewSQLName(owner), parts.back());
+			if (matches) {
+				// The public name is qualified by the MV's schema, while its publication
+				// can live in a separate internal schema.
+				auto public_location = metadata.GetStoredViewLocation(owner, loc.catalog_name, loc.schema_name);
+				loc.catalog_name = public_location.catalog_name;
+				loc.schema_name = public_location.schema_name;
+			}
+		}
+		if (!matches) {
+			continue;
+		}
+		if (parts.size() > 1) {
+			if (parts.size() == 3 && (!StringUtil::CIEquals(loc.catalog_name, parts[0]) ||
+			                          !StringUtil::CIEquals(loc.schema_name, parts[1]))) {
+				continue;
+			}
+			if (parts.size() == 2 && !StringUtil::CIEquals(loc.schema_name, parts[0]) &&
+			    !(StringUtil::CIEquals(loc.catalog_name, parts[0]) && loc.schema_name == DEFAULT_SCHEMA)) {
+				continue;
+			}
+		}
+		OPENIVM_DEBUG_PRINT("[UPSERT] Source '%s' resolves to delta metadata '%s'\n", table_name.c_str(), dt.c_str());
+		return dt;
+	}
+	return SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name));
+}
 
 struct FojJoinInfo {
 	string left_table, left_col, right_table, right_col;
@@ -777,8 +828,12 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
 			continue;
 		}
 		string resolved = metadata.ResolveDeltaQualifiedName(view_name, dt, attached_catalog, attached_schema);
+		// Consumers are keyed by the source; the physical delta may sit in an internal schema.
+		auto source = metadata.GetSourceLocation(view_name, dt, attached_catalog, attached_schema);
+		auto source_schema = source.schema_name.empty() ? string(DEFAULT_SCHEMA) : source.schema_name;
 		delta_cleanup += RefreshMetadata::BuildDeltaCleanupSQL(resolved, dt, delta_metadata_table, deferred_cleanup,
-		                                                       delta_metadata_tables);
+		                                                       delta_metadata_tables, source.catalog_name,
+		                                                       source.catalog_name.empty() ? string() : source_schema);
 	}
 
 	return query + update_ts + "\n" + delta_cleanup;
@@ -1340,8 +1395,9 @@ DuckLakeSourceLocation ResolveDuckLakeSourceLocation(Connection &con, const stri
 	loc.table_name = source_location.table_name;
 
 	if (StringUtil::StartsWith(table_name, openivm::DATA_TABLE_PREFIX)) {
+		// A parent MV's backing table lives in its internal location.
 		string source_view = table_name.substr(strlen(openivm::DATA_TABLE_PREFIX));
-		auto source_view_location = ResolveViewLocation(con, source_view, loc.catalog_name, loc.schema_name);
+		auto source_view_location = metadata.GetInternalLocation(source_view, loc.catalog_name, loc.schema_name);
 		loc.catalog_name = source_view_location.catalog_name;
 		loc.schema_name = source_view_location.schema_name;
 	}

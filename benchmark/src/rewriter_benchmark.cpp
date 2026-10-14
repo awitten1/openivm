@@ -187,8 +187,7 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 // cancel rows that exist only on one side.
 static string BuildBagMismatchCountQuery(const string &left, const string &right) {
 	return "SELECT (SELECT COUNT(*) FROM ((" + left + ") EXCEPT ALL (" + right +
-	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left +
-	       ")) __right_diff)";
+	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left + ")) __right_diff)";
 }
 
 static string LowerASCII(string s) {
@@ -635,8 +634,8 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 			// match their SQL names as well as legacy keys equal to the SQL name.
 			string orphan_views = "SELECT view_name FROM " + metadata_table("openivm_views") +
 			                      " WHERE COALESCE(view_sql_name, view_name) LIKE 'mv_q%' OR view_name LIKE 'mv_q%'";
-			con.Query("DELETE FROM " + metadata_table("openivm_delta_tables") + " WHERE view_name IN (" +
-			          orphan_views + ")");
+			con.Query("DELETE FROM " + metadata_table("openivm_delta_tables") + " WHERE view_name IN (" + orphan_views +
+			          ")");
 			con.Query("DELETE FROM " + metadata_table("openivm_views") + " WHERE view_name IN (" + orphan_views + ")");
 		}
 
@@ -761,11 +760,12 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 						// file-based DB names that catalog after the file. Rows are keyed internally, so
 						// match the SQL name and the MV's catalog.
 						string mv_catalog = is_ducklake_query ? string("dl") : native_catalog;
-						auto check_result = con.Query(
-						    "SELECT type FROM " + metadata_table("openivm_views") +
-						    " WHERE lower(COALESCE(view_sql_name, view_name)) = " + duckdb::Value(mv_name).ToSQLString() +
-						    " AND COALESCE(view_catalog, " + duckdb::Value(native_catalog).ToSQLString() +
-						    ") = " + duckdb::Value(mv_catalog).ToSQLString());
+						auto check_result =
+						    con.Query("SELECT type FROM " + metadata_table("openivm_views") +
+						              " WHERE lower(COALESCE(view_sql_name, view_name)) = " +
+						              duckdb::Value(mv_name).ToSQLString() + " AND COALESCE(view_catalog, " +
+						              duckdb::Value(native_catalog).ToSQLString() +
+						              ") = " + duckdb::Value(mv_catalog).ToSQLString());
 						if (check_result && !check_result->HasError() && check_result->RowCount() > 0) {
 							int64_t refresh_type = check_result->GetValue(0, 0).GetValue<int64_t>();
 							is_incremental = (refresh_type != 3) ? 1 : 0;

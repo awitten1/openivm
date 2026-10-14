@@ -143,48 +143,6 @@ ApplyGroupRecomputeSourceOccurrences(vector<GroupRecomputeDeltaSpec> &delta_spec
 	}
 }
 
-static string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
-                                      const vector<string> &delta_table_names) {
-	vector<string> candidates;
-	candidates.push_back(PublishedViewName(SqlUtils::LastIdentifierPart(table_name)));
-	candidates.push_back(SqlUtils::DeltaName(PublishedViewName(SqlUtils::LastIdentifierPart(table_name))));
-	candidates.push_back(table_name);
-	candidates.push_back(SqlUtils::LastIdentifierPart(table_name));
-	// DuckLake records a chained MV source under its physical backing table.
-	candidates.push_back(IncrementalTableNames::DataTableName(SqlUtils::LastIdentifierPart(table_name)));
-	candidates.push_back(SqlUtils::DeltaName(table_name));
-	candidates.push_back(SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name)));
-	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
-	for (auto &dt : delta_table_names) {
-		auto loc = metadata.GetSourceLocation(view_name, dt);
-		bool matches = false;
-		for (const auto &candidate : candidates) {
-			matches = matches || StringUtil::CIEquals(loc.table_name, candidate);
-		}
-		if (!matches) {
-			// Auxiliary definitions retain public SQL names; chained sources store
-			// the parent's internal key in their physical delta/visible-table name.
-			matches = StringUtil::CIEquals(metadata.GetViewSQLName(PublishedSourceViewName(dt)), parts.back());
-		}
-		if (!matches) {
-			continue;
-		}
-		if (parts.size() > 1) {
-			if (parts.size() == 3 && (!StringUtil::CIEquals(loc.catalog_name, parts[0]) ||
-			                          !StringUtil::CIEquals(loc.schema_name, parts[1]))) {
-				continue;
-			}
-			if (parts.size() == 2 && !StringUtil::CIEquals(loc.schema_name, parts[0]) &&
-			    !(StringUtil::CIEquals(loc.catalog_name, parts[0]) && loc.schema_name == DEFAULT_SCHEMA)) {
-				continue;
-			}
-		}
-		OPENIVM_DEBUG_PRINT("[UPSERT] Source '%s' resolves to delta metadata '%s'\n", table_name.c_str(), dt.c_str());
-		return dt;
-	}
-	return SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name));
-}
-
 static string ResolveSourceTableSQL(RefreshMetadata &metadata, const string &view_name, const string &metadata_key,
                                     const string &table_name, const string &view_catalog_name,
                                     const string &view_schema_name, const string &attached_db_catalog_name,
@@ -198,7 +156,7 @@ static string ResolveSourceTableSQL(RefreshMetadata &metadata, const string &vie
 	if (loc.schema_name.empty()) {
 		loc.schema_name = "main";
 	}
-	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, SqlUtils::LastIdentifierPart(table_name));
+	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, BaseTableNameFromDeltaKey(loc.table_name));
 }
 
 static string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
@@ -486,6 +444,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		internal_catalog_name = default_db;
 		internal_schema_name = DEFAULT_SCHEMA;
 		internal_catalog_prefix = SqlUtils::QualifiedPrefix(default_db, DEFAULT_SCHEMA);
+	} else if (!view_catalog_name.empty()) {
+		// openivm_internal_schema may have placed the MV's tables in its catalog's internal schema.
+		auto internal_schema = metadata.GetInternalSchema(view_name);
+		if (!internal_schema.empty()) {
+			internal_schema_name = internal_schema;
+			internal_catalog_prefix = SqlUtils::QualifiedPrefix(internal_catalog_name, internal_schema_name);
+		}
 	}
 	string data_table_bare = IncrementalTableNames::DataTableName(view_name);
 	string data_table = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table_bare);
@@ -978,9 +943,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 					}
 					string qkey = SqlUtils::QuoteIdentifier(key_col);
 					optional_ptr<RefreshMetadata::DeltaSource> source;
+					auto metadata_key = ResolveDeltaMetadataKey(metadata, view_name, base_table, delta_table_names);
 					for (auto &candidate : lj_sources) {
-						if (StringUtil::CIEquals(candidate.table_name, base_table) ||
-						    StringUtil::CIEquals(candidate.table_name, SqlUtils::DeltaName(base_table))) {
+						if (StringUtil::CIEquals(candidate.table_name, metadata_key)) {
 							source = &candidate;
 							break;
 						}
@@ -1758,9 +1723,13 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		if (schema_name.empty()) {
 			schema_name = DEFAULT_SCHEMA;
 		}
-		string physical_name = RefreshMetadata::SourceTableName(dt, source.catalog_name, source.schema_name);
+		// The physical delta may sit in an internal schema under a schema-qualified name.
+		string physical_name = source.delta_table_name.empty()
+		                           ? RefreshMetadata::SourceTableName(dt, source.catalog_name, source.schema_name)
+		                           : source.delta_table_name;
+		string delta_schema_name = source.delta_schema_name.empty() ? schema_name : source.delta_schema_name;
 		string resolved = catalog_name.empty() ? SqlUtils::QuoteIdentifier(physical_name)
-		                                       : SqlUtils::FullName(catalog_name, schema_name, physical_name);
+		                                       : SqlUtils::FullName(catalog_name, delta_schema_name, physical_name);
 		update_timestamp_query += "UPDATE " + delta_metadata_table +
 		                          " SET last_update = COALESCE("
 		                          "(SELECT MAX(" +
@@ -1771,7 +1740,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                          SqlUtils::EscapeValue(dt) + "';\n";
 		if (!cross_system) {
 			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(
-			    resolved, dt, delta_metadata_table, deferred_cleanup, delta_metadata_tables);
+			    resolved, dt, delta_metadata_table, deferred_cleanup, delta_metadata_tables, catalog_name, schema_name);
 		}
 	}
 	string set_in_progress = "UPDATE " + views_metadata_table + " SET refresh_in_progress = true WHERE view_name = '" +
