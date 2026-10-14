@@ -412,6 +412,9 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan,
 		                       /*write_query_file=*/true, cross_system && !split_native ? nullptr : &deferred_cleanup);
 		string fallback_sql;
+		// The fallback defers the same cleanup as the primary program, so it never writes
+		// outside the data catalog either.
+		vector<string> fallback_deferred_cleanup;
 		if (delete_retry_plan.IsActive()) {
 			// Compile the ranked rowid program before setting refresh_in_progress. It is only
 			// executed when DuckLake reports that the exhaustive tuple delete removed more
@@ -421,7 +424,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr,
 			    cross_system ? &meta_post_sql : nullptr, /*compile_profile=*/nullptr, precomputed_delta_activity,
 			    /*out_adaptive_estimate=*/nullptr, /*facts=*/nullptr, /*metadata_connection=*/nullptr,
-			    /*delete_retry_plan=*/nullptr, /*write_query_file=*/false);
+			    /*delete_retry_plan=*/nullptr, /*write_query_file=*/false,
+			    cross_system && !split_native ? nullptr : &fallback_deferred_cleanup);
 		}
 		// The archived program is exactly what this refresh executes, in order: after a
 		// delete retry, the fallback that replaced the rolled-back attempt, and for
@@ -624,6 +628,12 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			                    static_cast<long long>(expected_delete_count));
 			exec_con.BeginTransaction();
 			tx_open = true;
+			if (!split_native) {
+				// The rollback discarded the cleanup handed to the first data transaction.
+				// post_watermark_cleanup survives it and already holds the same statements.
+				TransactionalMVLockState::Get(*exec_con.context)
+				    .DeferDeltaCleanup(std::move(fallback_deferred_cleanup));
+			}
 			executed_program = &fallback_sql;
 			set_archived_program();
 			result = execute_program(fallback_sql, nullptr);

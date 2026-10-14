@@ -144,10 +144,14 @@ public:
 	// Build SQL to delete old delta rows that all dependent views have already consumed.
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
+	// With deferred_cleanup, a cleanup of a table outside the metadata catalog or outside
+	// data_catalog (the database the refresh's data transaction writes) is appended to
+	// deferred_cleanup instead of returned.
 	static string BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
 	                                   const string &delta_metadata_table = "",
 	                                   vector<string> *deferred_cleanup = nullptr,
-	                                   const vector<MetadataLocation> &metadata_locations = {});
+	                                   const vector<MetadataLocation> &metadata_locations = {},
+	                                   const string &data_catalog = "");
 
 	// Get GROUP BY column names for a view. Returns empty vector if not stored.
 	vector<string> GetGroupColumns(const string &view_name);

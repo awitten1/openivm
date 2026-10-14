@@ -134,7 +134,9 @@ catalogs, delete by key plus insert on PostgreSQL. If that restore itself fails,
    `refresh_in_progress`.
 4. **Cleanup.** Consumed source-delta rows are deleted after step 3. This only removes rows
    every consumer's committed watermark has passed, so a failure here retains rows that
-   later refreshes ignore.
+   later refreshes ignore. Step 2 only reads source delta tables, so it writes one
+   database even when a source is stored in the metadata catalog (for example a host view
+   over `control.main.<source>` with `control.openivm` metadata).
 
 Crash and retry semantics:
 
@@ -303,6 +305,7 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 |---|---|
 | Placement of metadata vs backing/delta tables, marker | `test/sql/metadata_location.test` |
 | Batched DML refresh, delta cleanup, profiles, history | `test/sql/metadata_location.test` |
+| Host view over a source in the metadata catalog: incremental and full refresh, source delta cleaned after the watermarks | `test/sql/metadata_location.test` |
 | Explicit-transaction rejection (including RENAME COLUMN); atomic same-database schema | `test/sql/metadata_location.test` |
 | RENAME COLUMN restore after a failed ALTER; autocommit rename | `test/sql/metadata_location.test` |
 | Crash after intent, inside data transaction, after data commit; full recompute | `test/sql/metadata_location.test` (`openivm_test_fail_point`) |

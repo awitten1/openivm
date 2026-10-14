@@ -497,6 +497,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// physical default database.
 	bool target_is_native = !view_catalog_name.empty() && metadata.IsNativeCatalog(view_catalog_name);
 	bool split_native_metadata = cross_system && target_is_native;
+	// The database the split protocol's data transaction writes: source-delta cleanup of any
+	// other database, including a source stored in the metadata catalog, runs after step 3.
+	const string split_data_catalog = split_native_metadata ? view_catalog_name : string();
 	auto physical_default_db = MetadataLocator::PhysicalDefaultCatalog(*context.db);
 	if (!target_is_ducklake && !target_is_native && cross_system && !physical_default_db.empty() &&
 	    physical_default_db != "memory" && view_catalog_name != physical_default_db) {
@@ -646,7 +649,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto recovery_query =
 			    BuildRecomputeQuery(metadata, view_name, recovery_source_sql, cross_system, attached_db_catalog_name,
 			                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta,
-			                        deferred_cleanup, metadata_locations);
+			                        deferred_cleanup, metadata_locations, split_data_catalog);
 			recovery_query += rebuild_distinct_aux();
 			string flag_update = "UPDATE " + views_metadata_table + " SET refresh_in_progress = ";
 			string flag_predicate = " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
@@ -764,9 +767,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			recompute_source_sql = RenderStoredViewQueryForDialect(con, view_query_sql, vector<string>(),
 			                                                       active_facts.target_dialect, view_time_travel_pins);
 		}
-		auto recompute_query = BuildRecomputeQuery(
-		    metadata, view_name, recompute_source_sql, cross_system, attached_db_catalog_name, attached_db_schema_name,
-		    internal_catalog_prefix, metadata_prefix, out_post_meta, deferred_cleanup, metadata_locations);
+		auto recompute_query =
+		    BuildRecomputeQuery(metadata, view_name, recompute_source_sql, cross_system, attached_db_catalog_name,
+		                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta,
+		                        deferred_cleanup, metadata_locations, split_data_catalog);
 		recompute_query += rebuild_distinct_aux();
 		if (cross_system && out_pre_meta && out_post_meta) {
 			// A recomputed MV committed without its new watermarks would replay the old
@@ -1809,11 +1813,12 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                          "), last_refresh_ts = " + string(openivm::UTC_NOW_SQL) + " WHERE view_name = '" +
 		                          SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 		                          SqlUtils::EscapeValue(dt) + "';\n";
-		// Cleanup only reads committed consumer watermarks, so a native data transaction may
-		// run it even when the watermarks themselves live in another metadata database.
+		// Under the split protocol every cleanup outside the data catalog is deferred until
+		// after the watermarks commit, and so is one inside it while the watermarks live in
+		// another metadata database.
 		if (!cross_system || split_native_metadata) {
 			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(
-			    resolved, dt, delta_metadata_table, deferred_cleanup, metadata_locations);
+			    resolved, dt, delta_metadata_table, deferred_cleanup, metadata_locations, split_data_catalog);
 		}
 	}
 	string set_in_progress = "UPDATE " + views_metadata_table + " SET refresh_in_progress = true WHERE view_name = '" +
