@@ -1523,7 +1523,8 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
 		auto owner = PublishedSourceViewName(base_name);
 		if (owner != base_name && !metadata.GetViewQuery(owner).empty()) {
 			auto public_name = metadata.GetViewSQLName(owner);
-			add_location(public_name, metadata.GetStoredViewLocation(owner, catalog_name, schema_name));
+			auto public_location = metadata.GetStoredViewLocation(owner, catalog_name, schema_name);
+			add_location(public_name, {public_location.catalog_name, public_location.schema_name});
 		}
 	}
 	Parser parser(con.context->GetParserOptions());
