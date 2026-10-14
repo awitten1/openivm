@@ -1947,7 +1947,8 @@ string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionPara
 			TransactionalMVLockState::Get(context).AcquireMutationLock();
 		}
 		if (!context.transaction.IsAutoCommit()) {
-			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters, view_key);
+			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters, view_key,
+			                                                    metadata_catalog, metadata_schema);
 		}
 		return RenderTransactionalDDL(context, plan_result.parameters, metadata_catalog, metadata_schema);
 	}
@@ -2099,10 +2100,18 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 
 	Connection con(*context.db);
 	RefreshMetadata::UseCatalog(context, con, drop_info.catalog);
-	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
-		metadata_state->Apply(con);
-	}
 	auto catalogs = RefreshMetadata::MetadataCatalogs(con);
+	// A first CREATE in this transaction may own metadata not yet discoverable
+	// by a helper. Include its selected catalog when replay supplies the registry.
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		auto location = RefreshMetadata::CurrentLocation(con);
+		if (std::find(catalogs.begin(), catalogs.end(), location.catalog_name) == catalogs.end()) {
+			metadata_state->Apply(con);
+			if (con.TableInfo(openivm::DELTA_TABLES_TABLE)) {
+				catalogs.push_back(location.catalog_name);
+			}
+		}
+	}
 	vector<string> dependent_views;
 	vector<RefreshMetadata::DeltaSource> sources;
 	string program;
@@ -2110,6 +2119,9 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	bool staged_drop = false;
 	for (auto &catalog : catalogs) {
 		RefreshMetadata::UseCatalog(context, con, catalog);
+		if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+			metadata_state->Apply(con);
+		}
 		auto dependent_rows = con.Query(
 		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 		    RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(drop_info.name), drop_info.catalog, drop_info.schema) +
@@ -2316,9 +2328,9 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		return "SELECT true AS Success";
 	}
 	if (!context.transaction.IsAutoCommit()) {
-		// Helper replay shadows unqualified metadata tables; register the unqualified form.
+		// Replay retains this location before redirecting it to helper-local shadows.
 		auto &state = TransactionalMVMetadataState::Get(context);
-		state.RegisterSQL(program, drop.info->name);
+		state.RegisterSQL(QualifyDropMetadata(program, metadata_location), drop.info->name);
 		for (auto &view_name : drop_views) {
 			state.IncludeView(view_name);
 		}

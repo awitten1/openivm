@@ -2,6 +2,7 @@
 #include "core/parser.hpp"
 #include "core/parser_ddl.hpp"
 #include "core/refresh_locks.hpp"
+#include "core/refresh_metadata.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #include <chrono>
@@ -182,8 +183,62 @@ static void TestDropDuringPublication(bool explicit_transaction, bool staged_dro
 	                  "THEN error('CREATE versus DROP MV bag mismatch') ELSE true END;");
 }
 
+// Replay on a reused helper must follow catalog/schema identity, including when
+// CREATE and CASCADE have both contributed mutations to the same transaction.
+static void TestMetadataReplayLocations() {
+	DuckDB db(nullptr);
+	Connection owner(db), helper(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; "
+	               "SET openivm_metadata_schema='Control.Space'; "
+	               "SET openivm_internal_schema='Internal Space'; "
+	               "CREATE TABLE a(i INTEGER); CREATE TABLE b(i INTEGER); "
+	               "INSERT INTO a VALUES (1),(1),(2); INSERT INTO b VALUES (1),(1),(2); "
+	               "CREATE MATERIALIZED VIEW mv1 AS SELECT a.i FROM a JOIN b USING(i); "
+	               "CREATE MATERIALIZED VIEW mv2 AS SELECT * FROM b; "
+	               "ATTACH ':memory:' AS peer; CREATE TABLE peer.main.b(i INTEGER); "
+	               "INSERT INTO peer.main.b VALUES (1),(1),(2); "
+	               "CREATE MATERIALIZED VIEW peer.main.mv2 AS SELECT * FROM peer.main.b;");
+	Execute(owner, "BEGIN; CREATE MATERIALIZED VIEW local_mv AS SELECT * FROM b; DROP TABLE a CASCADE;");
+	auto &state = TransactionalMVMetadataState::Get(*owner.context);
+	RefreshMetadata::UseCatalog(*owner.context, helper);
+	auto primary = RefreshMetadata::CurrentLocation(helper).catalog_name;
+	state.Apply(helper);
+	Execute(helper, "SELECT CASE WHEN (SELECT count(*) FROM openivm_views WHERE view_sql_name='mv1')=0 "
+	                "AND (SELECT count(*) FROM openivm_views WHERE view_sql_name='local_mv')=1 "
+	                "AND (SELECT count(*) FROM openivm_views WHERE view_sql_name='mv2')=1 "
+	                "THEN true ELSE error('Primary metadata replay lost CREATE or CASCADE ownership') END;");
+	RefreshMetadata::UseCatalog(*owner.context, helper, "peer");
+	state.Apply(helper);
+	Execute(helper, "SELECT CASE WHEN count(*)=1 AND min(view_catalog)='peer' "
+	                "THEN true ELSE error('Metadata replay leaked across catalogs') END FROM openivm_views;");
+	RefreshMetadata::UseCatalog(*owner.context, helper, primary);
+	state.Apply(helper);
+	Execute(helper, "SELECT CASE WHEN (SELECT count(*) FROM openivm_views WHERE view_sql_name='mv1')=0 "
+	                "AND (SELECT count(*) FROM openivm_views WHERE view_sql_name='local_mv')=1 "
+	                "THEN true ELSE error('Metadata replay retained the previous catalog shadow') END;");
+	Execute(owner, "ROLLBACK;");
+	// Both catalogs' surviving views must still capture conflicting batches.
+	for (const auto &source : vector<string> {"a", "b", "peer.main.b"}) {
+		Execute(owner, "INSERT INTO " + source + " VALUES (1),(2),(3),(3); DELETE FROM " + source +
+		                   " WHERE i=1; UPDATE " + source + " SET i=4 WHERE i=2; INSERT INTO " + source +
+		                   " VALUES (1),(4),(5); DELETE FROM " + source + " WHERE i=5;");
+	}
+	const vector<pair<string, string>> views = {
+	    {"mv1", "SELECT a.i FROM a JOIN b USING(i)"},
+	    {"mv2", "SELECT * FROM b"},
+	    {"peer.main.mv2", "SELECT * FROM peer.main.b"},
+	};
+	for (const auto &view : views) {
+		Execute(owner, "PRAGMA refresh('" + view.first + "');");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view.first + " EXCEPT ALL " + view.second +
+		                   ") OR EXISTS (" + view.second + " EXCEPT ALL SELECT * FROM " + view.first +
+		                   ") THEN error('Catalog replay rollback MV bag mismatch') ELSE true END;");
+	}
+}
+
 int main() {
 	try {
+		TestMetadataReplayLocations();
 		TestPublication(false);
 		TestPublication(true);
 		TestDropDuringPublication(false, false);

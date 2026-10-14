@@ -29,3 +29,11 @@ views sharing a source within an explicit transaction. With separate metadata an
 maintenance schemas, both commit and rollback must preserve the sibling's delta
 and capture batched conflicting writes. Dropping the final owners in one
 transaction must then remove that delta.
+
+The namespace lifecycle fixtures also cover a qualified source-table CASCADE
+followed by final-consumer DROP or replacement in the same transaction. Commit
+must remove the physical source delta; rollback and independent siblings must
+retain ownership and refresh correctly after conflicting batches. The native
+integration executable reuses one replay helper across two metadata catalogs and
+back, checking that CREATE/CASCADE mutations and temporary shadows retain their
+catalog/schema identities.

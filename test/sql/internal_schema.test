@@ -1838,3 +1838,234 @@ DROP TABLE "Ownership Sources".b;
 DROP SCHEMA "Ownership Sources";
 DROP SCHEMA "Ownership Internal";
 SET openivm_internal_schema = 'Quoted Internal';
+
+# Qualified CASCADE deletions must participate in later helper replay. Metadata
+# and maintenance use different quoted schemas; the source and MV names include
+# quotes and a statement separator to exercise SQL-aware registration.
+statement ok
+SET openivm_disable_daemon=true;
+SET openivm_cascade_refresh='off';
+SET openivm_metadata_schema='Control Space';
+SET openivm_internal_schema='Cascade Internal';
+CREATE SCHEMA "Cascade Sources";
+CREATE TABLE "Cascade Sources"."a;quoted"(i INTEGER);
+CREATE TABLE "Cascade Sources"."b.with""quote"(i INTEGER);
+CREATE TABLE "Cascade Sources".c(i INTEGER);
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(1),(2);
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(1),(2);
+INSERT INTO "Cascade Sources".c VALUES (3),(3),(4);
+
+# Direct DROP after CASCADE must roll back ownership and physical cleanup.
+statement ok
+CREATE MATERIALIZED VIEW s1."cascade;mv1" AS SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i);
+CREATE MATERIALIZED VIEW s1."cascade""mv2" AS SELECT * FROM "Cascade Sources"."b.with""quote";
+
+statement ok
+BEGIN;
+DROP TABLE "Cascade Sources"."a;quoted" CASCADE;
+DROP VIEW s1."cascade""mv2";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal';
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_delta_tables d
+ON t.database_name=d.source_catalog AND t.schema_name=d.delta_schema AND t.table_name=d.delta_table_name
+WHERE d.source_schema='Cascade Sources';
+----
+3
+
+statement ok
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Cascade Sources"."a;quoted" WHERE i=1;
+UPDATE "Cascade Sources"."a;quoted" SET i=9 WHERE i=2;
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(9),(9);
+DELETE FROM "Cascade Sources"."a;quoted" WHERE i=8;
+UPDATE "Cascade Sources"."a;quoted" SET i=2 WHERE i=9;
+
+statement ok
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=1;
+UPDATE "Cascade Sources"."b.with""quote" SET i=9 WHERE i=2;
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(9),(9);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=8;
+UPDATE "Cascade Sources"."b.with""quote" SET i=2 WHERE i=9;
+
+statement ok
+PRAGMA refresh('s1."cascade;mv1"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1."cascade;mv1" EXCEPT ALL SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i))
+UNION ALL (SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i) EXCEPT ALL SELECT * FROM s1."cascade;mv1"));
+----
+0
+
+statement ok
+PRAGMA refresh('s1."cascade""mv2"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1."cascade""mv2" EXCEPT ALL SELECT * FROM "Cascade Sources"."b.with""quote")
+UNION ALL (SELECT * FROM "Cascade Sources"."b.with""quote" EXCEPT ALL SELECT * FROM s1."cascade""mv2"));
+----
+0
+
+# Commit removes the final consumer and both physical source deltas.
+statement ok
+BEGIN;
+DROP TABLE "Cascade Sources"."a;quoted" CASCADE;
+DROP VIEW s1."cascade""mv2";
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal';
+----
+0
+
+query I
+SELECT count(*) FROM "Control Space".openivm_delta_tables WHERE source_schema='Cascade Sources';
+----
+0
+
+statement ok
+CREATE TABLE "Cascade Sources"."a;quoted"(i INTEGER);
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(1),(2);
+
+# Replacement after CASCADE must roll back ownership and physical cleanup.
+statement ok
+CREATE MATERIALIZED VIEW s1."cascade;mv1" AS SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i);
+CREATE MATERIALIZED VIEW s1."cascade""mv2" AS SELECT * FROM "Cascade Sources"."b.with""quote";
+
+statement ok
+BEGIN;
+DROP TABLE "Cascade Sources"."a;quoted" CASCADE;
+CREATE OR REPLACE MATERIALIZED VIEW s1."cascade""mv2" AS SELECT * FROM "Cascade Sources".c;
+DROP VIEW s1."cascade""mv2";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal';
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_delta_tables d
+ON t.database_name=d.source_catalog AND t.schema_name=d.delta_schema AND t.table_name=d.delta_table_name
+WHERE d.source_schema='Cascade Sources';
+----
+3
+
+statement ok
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Cascade Sources"."a;quoted" WHERE i=1;
+UPDATE "Cascade Sources"."a;quoted" SET i=9 WHERE i=2;
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(9),(9);
+DELETE FROM "Cascade Sources"."a;quoted" WHERE i=8;
+UPDATE "Cascade Sources"."a;quoted" SET i=2 WHERE i=9;
+
+statement ok
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=1;
+UPDATE "Cascade Sources"."b.with""quote" SET i=9 WHERE i=2;
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(9),(9);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=8;
+UPDATE "Cascade Sources"."b.with""quote" SET i=2 WHERE i=9;
+
+statement ok
+PRAGMA refresh('s1."cascade;mv1"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1."cascade;mv1" EXCEPT ALL SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i))
+UNION ALL (SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i) EXCEPT ALL SELECT * FROM s1."cascade;mv1"));
+----
+0
+
+statement ok
+PRAGMA refresh('s1."cascade""mv2"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1."cascade""mv2" EXCEPT ALL SELECT * FROM "Cascade Sources"."b.with""quote")
+UNION ALL (SELECT * FROM "Cascade Sources"."b.with""quote" EXCEPT ALL SELECT * FROM s1."cascade""mv2"));
+----
+0
+
+# Commit removes the final consumer and both physical source deltas.
+statement ok
+BEGIN;
+DROP TABLE "Cascade Sources"."a;quoted" CASCADE;
+CREATE OR REPLACE MATERIALIZED VIEW s1."cascade""mv2" AS SELECT * FROM "Cascade Sources".c;
+DROP VIEW s1."cascade""mv2";
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal';
+----
+0
+
+query I
+SELECT count(*) FROM "Control Space".openivm_delta_tables WHERE source_schema='Cascade Sources';
+----
+0
+
+statement ok
+CREATE TABLE "Cascade Sources"."a;quoted"(i INTEGER);
+INSERT INTO "Cascade Sources"."a;quoted" VALUES (1),(1),(2);
+
+# An independent committed sibling is still a consumer after the same replay.
+statement ok
+CREATE MATERIALIZED VIEW s1."cascade;mv1" AS SELECT a.i FROM "Cascade Sources"."a;quoted" a JOIN "Cascade Sources"."b.with""quote" b USING(i);
+CREATE MATERIALIZED VIEW s1."cascade""mv2" AS SELECT * FROM "Cascade Sources"."b.with""quote";
+CREATE MATERIALIZED VIEW s1.cascade_survivor AS SELECT * FROM "Cascade Sources"."b.with""quote";
+
+statement ok
+BEGIN;
+DROP TABLE "Cascade Sources"."a;quoted" CASCADE;
+DROP VIEW s1."cascade""mv2";
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_delta_tables d
+ON t.database_name=d.source_catalog AND t.schema_name=d.delta_schema AND t.table_name=d.delta_table_name
+WHERE d.source_schema='Cascade Sources';
+----
+1
+
+statement ok
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=1;
+UPDATE "Cascade Sources"."b.with""quote" SET i=9 WHERE i=2;
+INSERT INTO "Cascade Sources"."b.with""quote" VALUES (1),(9),(9);
+DELETE FROM "Cascade Sources"."b.with""quote" WHERE i=8;
+UPDATE "Cascade Sources"."b.with""quote" SET i=2 WHERE i=9;
+
+statement ok
+PRAGMA refresh('s1.cascade_survivor');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.cascade_survivor EXCEPT ALL SELECT * FROM "Cascade Sources"."b.with""quote")
+UNION ALL (SELECT * FROM "Cascade Sources"."b.with""quote" EXCEPT ALL SELECT * FROM s1.cascade_survivor));
+----
+0
+
+statement ok
+BEGIN;
+DROP VIEW s1.cascade_survivor;
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Cascade Internal';
+----
+0
+
+statement ok
+DROP TABLE "Cascade Sources"."b.with""quote";
+DROP TABLE "Cascade Sources".c;
+DROP SCHEMA "Cascade Sources";
+DROP SCHEMA "Cascade Internal";
+SET openivm_internal_schema='Quoted Internal';

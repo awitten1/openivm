@@ -101,6 +101,11 @@ DROP's transaction-local metadata replay retains complete ownership, including
 committed siblings outside the affected view's dependency closure. Cleanup checks
 this replayed state before deleting a shared source delta, so transaction-local
 ownership additions and removals are considered alongside committed consumers.
+Replay retains the fully qualified metadata targets of CREATE, replacement,
+view DROP, and source-table CASCADE. A helper redirects only mutations for its
+selected metadata catalog and schema to temporary shadows, rebuilding those
+shadows when it inspects another location. Qualified CASCADE deletions therefore
+remain visible to a later final-consumer DROP in the same transaction.
 `openivm_delta_tables` records each source's catalog and schema, the physical delta
 name (`delta_table_name`), and, for moved deltas, the internal schema (`delta_schema`).
 Older rows without a stored physical name retain their original naming rule.

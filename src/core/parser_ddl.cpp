@@ -43,15 +43,22 @@ static const vector<string> &MetadataStatementPrefixes() {
 	return prefixes;
 }
 
-static bool HasMetadataTarget(const string &statement, const string &prefix, const string &table) {
-	if (!StringUtil::StartsWith(statement, prefix)) {
-		return false;
+// Read only the mutation target, never a metadata name in a query or literal.
+static string MetadataTargetReference(const string &statement, const string &prefix, const string &table) {
+	if (!StringUtil::CIStartsWith(statement, prefix)) {
+		return "";
 	}
 	auto target = statement.substr(prefix.size());
-	auto table_name = StringUtil::Lower(table);
-	return StringUtil::StartsWith(target, table_name) &&
-	       (target.size() == table_name.size() || std::isspace(static_cast<unsigned char>(target[table_name.size()])) ||
-	        target[table_name.size()] == '(');
+	auto reference = SqlUtils::FindTableReference("FROM " + target, table);
+	if (reference.empty() || !StringUtil::StartsWith(target, reference) ||
+	    !StringUtil::CIEquals(SqlUtils::ParseQualifiedIdentifier(reference).back(), table)) {
+		return "";
+	}
+	return reference;
+}
+
+static bool HasMetadataTarget(const string &statement, const string &prefix, const string &table) {
+	return !MetadataTargetReference(statement, prefix, table).empty();
 }
 
 static bool TargetsMetadataTable(const string &statement, const string &table) {
@@ -105,10 +112,10 @@ static string QualifyMetadataStatement(const string &statement, const string &ca
 		auto target = SqlUtils::FullName(catalog, schema, table);
 		auto trimmed = qualified;
 		StringUtil::Trim(trimmed);
-		auto lower = StringUtil::Lower(trimmed);
 		for (const string prefix : {"create table if not exists ", "alter table "}) {
-			if (HasMetadataTarget(lower, prefix, table)) {
-				trimmed = trimmed.substr(0, prefix.size()) + target + trimmed.substr(prefix.size() + table.size());
+			auto reference = MetadataTargetReference(trimmed, prefix, table);
+			if (!reference.empty() && SqlUtils::ParseQualifiedIdentifier(reference).size() == 1) {
+				trimmed = trimmed.substr(0, prefix.size()) + target + trimmed.substr(prefix.size() + reference.size());
 				qualified = trimmed;
 				break;
 			}
@@ -128,6 +135,39 @@ static string QualifyMetadataStatement(const string &statement, const string &ca
 		}
 	}
 	return qualified;
+}
+
+// Retained SQL keeps its physical metadata identity. Only the selected location
+// may be redirected to helper-local shadows; other catalogs remain qualified.
+static string LocalizeMetadataStatement(const string &statement, const string &catalog, const string &schema) {
+	auto local = statement;
+	for (auto &table : TransactionalMetadataTables()) {
+		for (auto &prefix : MetadataStatementPrefixes()) {
+			auto reference = MetadataTargetReference(statement, prefix, table);
+			if (reference.empty()) {
+				continue;
+			}
+			auto parts = SqlUtils::ParseQualifiedIdentifier(reference);
+			if (parts.size() != 3 || !StringUtil::CIEquals(parts[0], catalog) ||
+			    !StringUtil::CIEquals(parts[1], schema)) {
+				return "";
+			}
+			local.replace(prefix.size(), reference.size(), table);
+		}
+		for (idx_t occurrence = 0;; occurrence++) {
+			auto reference = SqlUtils::FindTableReferenceOccurrence(local, table, occurrence);
+			if (reference.empty()) {
+				break;
+			}
+			auto parts = SqlUtils::ParseQualifiedIdentifier(reference);
+			if (parts.size() == 3 && StringUtil::CIEquals(parts[0], catalog) &&
+			    StringUtil::CIEquals(parts[1], schema)) {
+				bool replaced = false;
+				local = SqlUtils::ReplaceTableReferenceOccurrence(local, table, occurrence, table, replaced);
+			}
+		}
+	}
+	return local;
 }
 
 static bool IsMetadataSchemaStatement(const string &statement) {
@@ -649,7 +689,8 @@ optional_ptr<TransactionalMVMetadataState> TransactionalMVMetadataState::TryGet(
 }
 
 void TransactionalMVMetadataState::Register(ClientContext &context, const vector<Value> &parameters,
-                                            const string &view_name) {
+                                            const string &view_name, const string &metadata_catalog,
+                                            const string &metadata_schema) {
 	view_names.insert(view_name);
 	auto transaction_timestamp = context.transaction.ActiveTransaction().GetCurrentTransactionStartTimestamp();
 	// Delta-table DEFAULT now() is transaction-stable. Compile from one
@@ -661,14 +702,16 @@ void TransactionalMVMetadataState::Register(ClientContext &context, const vector
 	for (auto &parameter : parameters) {
 		auto statement = parameter.GetValue<string>();
 		if (IsReplayableMetadataStatement(statement)) {
-			statements.push_back(StabilizeTransactionalMetadata(statement, timestamp_sql));
+			statements.push_back(QualifyMetadataStatement(StabilizeTransactionalMetadata(statement, timestamp_sql),
+			                                              metadata_catalog, metadata_schema));
 		}
 	}
 }
 
 void TransactionalMVMetadataState::RegisterSQL(const string &sql, const string &view_name) {
 	view_names.insert(view_name);
-	for (auto &statement : StringUtil::Split(sql, ";\n")) {
+	for (auto &statement : SqlUtils::SplitSQLStatements(sql)) {
+		StringUtil::Trim(statement);
 		if (IsReplayableMetadataStatement(statement)) {
 			statements.push_back(std::move(statement));
 		}
@@ -685,12 +728,36 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	}
 	// Seed from the durable tables in the connection's metadata schema.
 	auto metadata_location = RefreshMetadata::CurrentLocation(connection);
+	vector<string> local_statements;
+	for (auto &statement : statements) {
+		auto local =
+		    LocalizeMetadataStatement(statement, metadata_location.catalog_name, metadata_location.schema_name);
+		if (!local.empty()) {
+			local_statements.push_back(std::move(local));
+		}
+	}
+	// A source CASCADE can inspect several metadata catalogs on this connection.
+	// Temporary names shadow every search path, so discard the prior location.
+	connection.context->RunFunctionInTransaction([&]() {
+		for (auto &table : TransactionalMetadataTables()) {
+			DropInfo drop;
+			drop.type = CatalogType::TABLE_ENTRY;
+			drop.catalog = "temp";
+			drop.schema = DEFAULT_SCHEMA;
+			drop.name = table;
+			drop.if_not_found = OnEntryNotFound::RETURN_NULL;
+			Catalog::GetCatalog(*connection.context, drop.catalog).DropEntry(*connection.context, drop);
+		}
+	});
+	OPENIVM_DEBUG_PRINT("[TRANSACTIONAL METADATA] Replay catalog='%s', schema='%s', statements=%zu\n",
+	                    metadata_location.catalog_name.c_str(), metadata_location.schema_name.c_str(),
+	                    local_statements.size());
 	auto durable_table = [&](const string &table) {
 		return SqlUtils::FullName(metadata_location.catalog_name, metadata_location.schema_name, table);
 	};
 	// Build constrained TEMP schemas first. CREATE TABLE AS would discard the
 	// primary keys required by INSERT OR REPLACE metadata operations.
-	for (auto &statement : statements) {
+	for (auto &statement : local_statements) {
 		if (!IsMetadataSchemaStatement(statement)) {
 			continue;
 		}
@@ -702,7 +769,7 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	}
 	auto seed_table = [&](const string &table, const string &filter) {
 		bool has_constrained_schema = false;
-		for (auto &statement : statements) {
+		for (auto &statement : local_statements) {
 			auto lower = StringUtil::Lower(statement);
 			if (StringUtil::StartsWith(lower, "create table") && lower.find(StringUtil::Lower(table)) != string::npos) {
 				has_constrained_schema = true;
@@ -741,7 +808,7 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	for (auto &table : dependency_tables) {
 		seed_table(table, "");
 	}
-	for (auto &statement : statements) {
+	for (auto &statement : local_statements) {
 		if (IsMetadataSchemaStatement(statement)) {
 			continue;
 		}
@@ -827,7 +894,7 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		string filter = view_filter.empty() ? string() : " WHERE view_name IN (" + view_filter + ")";
 		seed_table(table, filter);
 	}
-	for (auto &statement : statements) {
+	for (auto &statement : local_statements) {
 		if (IsMetadataSchemaStatement(statement)) {
 			continue;
 		}

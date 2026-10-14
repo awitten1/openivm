@@ -32,7 +32,8 @@ public:
 	static TransactionalMVMetadataState &Get(ClientContext &context);
 	static optional_ptr<TransactionalMVMetadataState> TryGet(ClientContext &context);
 
-	void Register(ClientContext &context, const vector<Value> &parameters, const string &view_name);
+	void Register(ClientContext &context, const vector<Value> &parameters, const string &view_name,
+	              const string &metadata_catalog, const string &metadata_schema);
 	void RegisterSQL(const string &sql, const string &view_name);
 	void IncludeView(const string &view_name);
 	void Apply(Connection &connection) const;
