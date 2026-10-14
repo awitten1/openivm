@@ -622,7 +622,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		string group_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.group_col);
 		string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);
 		filtered_group_count_aux_candidate = {
-		    {aux_table, SqlUtils::LastIdentifierPart(filtered_group_count_extract.source),
+		    {aux_table,
+		     QualifyCreateSourceTable(context, filtered_group_count_extract.source, facts, current_catalog,
+		                              current_schema, default_db, default_schema),
 		     filtered_group_count_extract.group_col, filtered_group_count_extract.sum_col, group_q, sum_q,
 		     filtered_group_count_extract.output_col, filtered_group_count_extract.comparison_op,
 		     filtered_group_count_extract.threshold_sql},
@@ -849,11 +851,16 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			}
 			CountDistinctExtract cd_extract;
 			if (ExtractCountDistinctAggregate(local_view_query, candidate_group_columns, output_names, cd_extract)) {
-				count_distinct_aux_candidate = {
-				    "openivm_aux_" + view_name, SqlUtils::LastIdentifierPart(cd_extract.source),
-				    candidate_group_columns,    cd_extract.group_exprs,
-				    cd_extract.distinct_col,    cd_extract.distinct_expr,
-				    cd_extract.output_col,      cd_extract.filter};
+				count_distinct_aux_candidate = {"openivm_aux_" + view_name,
+				                                QualifyCreateSourceTable(context, cd_extract.source, facts,
+				                                                         current_catalog, current_schema, default_db,
+				                                                         default_schema),
+				                                candidate_group_columns,
+				                                cd_extract.group_exprs,
+				                                cd_extract.distinct_col,
+				                                cd_extract.distinct_expr,
+				                                cd_extract.output_col,
+				                                cd_extract.filter};
 				model_input.count_distinct_aux_candidate = &count_distinct_aux_candidate;
 			} else {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] COUNT_DISTINCT_INCREMENTAL extractor failed — demoting to "

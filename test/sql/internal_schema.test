@@ -1016,3 +1016,432 @@ query I
 SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Transaction Internal';
 ----
 0
+
+# Quoted auxiliary sources retain SQL identities through CREATE, repair and reopen.
+# Metadata, internal tables and public views use three separate schemas.
+statement ok
+SET openivm_metadata_schema = 'Control Space';
+
+statement ok
+SET openivm_internal_schema = 'Quoted Internal';
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+statement ok
+SET search_path = 's1,main';
+
+statement ok
+CREATE TABLE main."Mixed.Items" (g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,10),(1,10),(1,20),(2,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.quoted_counted AS SELECT g, COUNT(DISTINCT x) AS n FROM main."Mixed.Items" GROUP BY g;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+CREATE TABLE main."Items(""Archive"")" (g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,10),(1,10),(1,20),(2,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.paren_counted AS SELECT g, COUNT(DISTINCT x) AS n FROM "Items(""Archive"")" GROUP BY g;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+query TITT
+SELECT v.view_sql_name, v.type, v.internal_schema, t.schema_name FROM "Control Space".openivm_views v JOIN duckdb_tables() t ON t.table_name = 'openivm_aux_' || v.view_name WHERE v.view_sql_name IN ('quoted_counted', 'paren_counted') ORDER BY v.view_sql_name;
+----
+paren_counted	11	Quoted Internal	Quoted Internal
+quoted_counted	11	Quoted Internal	Quoted Internal
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+# With no pending changes, missing auxiliary tables are repaired from quoted sources.
+
+statement ok
+DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_;
+
+statement ok
+DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_;
+
+statement ok
+SET openivm_internal_schema = '';
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+# Reopen discovers both stored locations without restoring either schema setting.
+restart
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+statement ok
+DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+# Replacement rollback restores auxiliary state and its qualified source metadata.
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.quoted_counted AS SELECT g, COUNT(*) AS n FROM main."Mixed.Items" GROUP BY g;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_';
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.quoted_counted AS SELECT g, COUNT(DISTINCT x) AS n FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g;
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP VIEW s1.quoted_counted;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_';
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.quoted_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+----
+0
+
+statement ok
+DROP VIEW s1.quoted_counted;
+
+query I
+SELECT count(*) FROM "Control Space".openivm_views WHERE view_sql_name = 'quoted_counted';
+----
+0
+
+# Replacement rollback restores auxiliary state and its qualified source metadata.
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.paren_counted AS SELECT g, COUNT(*) AS n FROM main."Items(""Archive"")" GROUP BY g;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_';
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW s1.paren_counted AS SELECT g, COUNT(DISTINCT x) AS n FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g;
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+statement ok
+BEGIN TRANSACTION;
+
+statement ok
+DROP VIEW s1.paren_counted;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_';
+----
+0
+
+statement ok
+ROLLBACK;
+
+statement ok
+INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+
+statement ok
+DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+
+statement ok
+UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.paren_counted');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+----
+0
+
+statement ok
+DROP VIEW s1.paren_counted;
+
+query I
+SELECT count(*) FROM "Control Space".openivm_views WHERE view_sql_name = 'paren_counted';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Quoted Internal';
+----
+0
+
+# Filtered-group auxiliary metadata must also preserve punctuation and quoting.
+statement ok
+SET openivm_internal_schema = 'Quoted Internal';
+
+statement ok
+CREATE TABLE main."Grouped.Items" (g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO main."Grouped.Items" VALUES (1,10),(1,-5),(2,-10),(3,0);
+
+statement ok
+CREATE MATERIALIZED VIEW s1.quoted_filtered AS
+SELECT COUNT(*) AS n FROM (SELECT g, SUM(x) AS total FROM main."Grouped.Items" GROUP BY g) q WHERE total > 0;
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_views v
+ON t.table_name = 'openivm_filtered_group_count_' || v.view_name
+WHERE v.view_sql_name = 'quoted_filtered' AND t.schema_name = 'Quoted Internal';
+----
+1
+
+statement ok
+INSERT INTO main."Grouped.Items" VALUES (1,-20),(2,30),(4,10),(4,10);
+
+statement ok
+DELETE FROM main."Grouped.Items" WHERE g = 4 OR x = -5;
+
+statement ok
+UPDATE main."Grouped.Items" SET x = x + 1 WHERE g = 2;
+
+statement ok
+PRAGMA refresh('s1.quoted_filtered');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.quoted_filtered EXCEPT ALL
+     SELECT COUNT(*) FROM (SELECT g, SUM(x) AS total FROM main."Grouped.Items" GROUP BY g) q WHERE total > 0)
+    UNION ALL
+    (SELECT COUNT(*) FROM (SELECT g, SUM(x) AS total FROM main."Grouped.Items" GROUP BY g) q WHERE total > 0
+     EXCEPT ALL SELECT * FROM s1.quoted_filtered)
+);
+----
+0
+
+statement ok
+DROP TABLE "Quoted Internal".openivm_filtered_group_count___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f66696c7465726564_;
+
+statement ok
+PRAGMA refresh('s1.quoted_filtered');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM s1.quoted_filtered EXCEPT ALL
+     SELECT COUNT(*) FROM (SELECT g, SUM(x) AS total FROM main."Grouped.Items" GROUP BY g) q WHERE total > 0)
+    UNION ALL
+    (SELECT COUNT(*) FROM (SELECT g, SUM(x) AS total FROM main."Grouped.Items" GROUP BY g) q WHERE total > 0
+     EXCEPT ALL SELECT * FROM s1.quoted_filtered)
+);
+----
+0
+
+statement ok
+DROP VIEW s1.quoted_filtered;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Quoted Internal';
+----
+0

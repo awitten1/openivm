@@ -201,16 +201,14 @@ PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, uni
 string QualifyCreateSourceTable(ClientContext &context, const string &table_name, const CreateMVPlanFacts &facts,
                                 const string &current_catalog, const string &current_schema, const string &default_db,
                                 const string &default_schema) {
-	if (table_name.find('.') != string::npos || table_name.find('(') != string::npos) {
-		return table_name;
-	}
 	// The staged executor builds auxiliary state with the metadata schema selected. Name the
 	// relation the view actually bound, which can come from any schema on the search path.
 	const SourceTableInfo *bound = nullptr;
 	bool bound_in_current_schema = false;
 	for (auto &entry : facts.source_table_info) {
 		auto &source = entry.second;
-		if (!StringUtil::CIEquals(source.table_name, table_name)) {
+		if (!StringUtil::CIEquals(source.table_name, table_name) &&
+		    !StringUtil::CIEquals(SqlUtils::QuoteIdentifier(source.table_name), table_name)) {
 			continue;
 		}
 		bool in_current_schema = StringUtil::CIEquals(source.catalog_name, current_catalog) &&
@@ -225,7 +223,14 @@ string QualifyCreateSourceTable(ClientContext &context, const string &table_name
 		}
 	}
 	if (bound) {
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Auxiliary source '%s' bound to %s\n", table_name.c_str(),
+		                    SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name).c_str());
 		return SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name);
+	}
+	// A bare table name can itself contain dots or parentheses. Only interpret SQL
+	// qualification/functions after checking the identities collected from the bound plan.
+	if (table_name.find('.') != string::npos || table_name.find('(') != string::npos) {
+		return table_name;
 	}
 	// Sources such as another MV bind through a view; resolve the name as the caller's
 	// search path did when the view was planned.
