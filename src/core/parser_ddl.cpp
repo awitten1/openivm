@@ -935,7 +935,16 @@ void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChun
 	auto &bind_data = input.bind_data->Cast<DropViewBindData>();
 	auto &catalog = Catalog::GetCatalog(context, bind_data.info.catalog);
 	DropInfo info(bind_data.info);
+	bool source_delta_drop =
+	    info.type == CatalogType::TABLE_ENTRY && SqlUtils::IsDelta(info.name) &&
+	    Catalog::GetEntry(context, info.catalog, info.schema, EntryLookupInfo(CatalogType::TABLE_ENTRY, info.name),
+	                      OnEntryNotFound::RETURN_NULL);
 	catalog.DropEntry(context, info);
+	if (source_delta_drop) {
+		TransactionalMVLockState::Get(context).RecordSourceDeltaDrop(info.catalog, info.schema, info.name);
+		OPENIVM_DEBUG_PRINT("[DROP] Recorded transaction-local source delta removal %s\n",
+		                    SqlUtils::FullName(info.catalog, info.schema, info.name).c_str());
+	}
 	output.SetValue(0, 0, Value::BOOLEAN(true));
 	output.SetCardinality(1);
 	state.finished = true;

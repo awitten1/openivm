@@ -92,6 +92,11 @@ a fresh committed read, so an explicit transaction with an older metadata snapsh
 reuses the shared delta. If that identity conflicts with its local ownership or is
 not visible in its catalog snapshot, the transaction must be retried rather than
 allocating a second delta.
+Successful source-delta drops are recorded for the caller transaction. A later
+replacement or DROP followed by CREATE can therefore allocate a new delta (even
+in another internal schema) without mistaking its own cleanup for a stale
+snapshot. Commit and rollback both clear that record; concurrent allocation
+still requires reconciliation with committed ownership.
 `openivm_delta_tables` records each source's catalog and schema, the physical delta
 name (`delta_table_name`), and, for moved deltas, the internal schema (`delta_schema`).
 Older rows without a stored physical name retain their original naming rule.

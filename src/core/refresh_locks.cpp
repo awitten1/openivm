@@ -141,6 +141,16 @@ void TransactionalMVLockState::DeferUnusedSourceDeltaCleanup(const RefreshMetada
 	deferred_source_delta_cleanup.push_back(source);
 }
 
+void TransactionalMVLockState::RecordSourceDeltaDrop(const string &catalog, const string &schema, const string &table) {
+	lock_guard<mutex> guard(state_lock);
+	dropped_source_deltas.insert(StringUtil::Lower(SqlUtils::FullName(catalog, schema, table)));
+}
+
+bool TransactionalMVLockState::HasDroppedSourceDelta(const string &catalog, const string &schema, const string &table) {
+	lock_guard<mutex> guard(state_lock);
+	return dropped_source_deltas.count(StringUtil::Lower(SqlUtils::FullName(catalog, schema, table))) != 0;
+}
+
 optional_ptr<TableCatalogEntry>
 TransactionalMVLockState::FindDeferredSourceDelta(const string &catalog, const string &schema, const string &table) {
 	lock_guard<mutex> guard(state_lock);
@@ -166,6 +176,7 @@ void TransactionalMVLockState::Release() {
 	OPENIVM_DEBUG_PRINT("[LOCK] release database mutation lock owner=%p\n", static_cast<void *>(&owner));
 	deferred_delta_cleanup.clear();
 	deferred_source_delta_cleanup.clear();
+	dropped_source_deltas.clear();
 	mutation_guard.reset();
 }
 

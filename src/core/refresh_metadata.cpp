@@ -713,6 +713,16 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForCreate(Client
 		if (!existing) {
 			return;
 		}
+		// A prior DROP/REPLACE in this transaction may have removed the last
+		// consumer and its delta. The helper still sees that committed identity;
+		// keep the caller's new ownership (or allocate anew) only when its own
+		// successful DROP explains the difference, never for a stale snapshot.
+		if (TransactionalMVLockState::Get(context).HasDroppedSourceDelta(catalog, existing->schema.name,
+		                                                                 existing->name)) {
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Ignoring locally removed committed source delta %s\n",
+			                    SqlUtils::FullName(catalog, existing->schema.name, existing->name).c_str());
+			return;
+		}
 		if (local && (!StringUtil::CIEquals(local->schema.name, existing->schema.name) ||
 		              !StringUtil::CIEquals(local->name, existing->name))) {
 			throw TransactionException("OpenIVM source delta ownership changed for '%s'; retry the transaction",

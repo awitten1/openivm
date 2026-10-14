@@ -44,6 +44,144 @@ UNION ALL (SELECT * FROM "Replacement Sources".a EXCEPT ALL SELECT * FROM replac
 ----
 0
 
+# Repeated replacement and DROP -> CREATE must distinguish the caller's own
+# physical cleanup from invisible committed deltas. Exercise both colocated and
+# dedicated placement, retaining and changing physical identities, and both
+# transaction outcomes. Each case starts with a committed sole consumer.
+statement ok
+CREATE SCHEMA namespace_lifecycle;
+CREATE TABLE namespace_lifecycle.a(i INTEGER);
+CREATE TABLE namespace_lifecycle.b(i INTEGER);
+INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2);
+INSERT INTO namespace_lifecycle.b VALUES (3),(3),(4);
+
+foreach placement namespace_lifecycle NamespaceInternal
+foreach recreated namespace_lifecycle NamespaceInternal
+foreach outcome COMMIT ROLLBACK
+
+statement ok
+SET openivm_internal_schema = '${placement}';
+CREATE MATERIALIZED VIEW "Lifecycle View" AS SELECT * FROM namespace_lifecycle.a;
+
+statement ok
+BEGIN;
+CREATE OR REPLACE MATERIALIZED VIEW "Lifecycle View" AS SELECT * FROM namespace_lifecycle.b;
+SET openivm_internal_schema = '${recreated}';
+CREATE OR REPLACE MATERIALIZED VIEW "Lifecycle View" AS SELECT * FROM namespace_lifecycle.a;
+CREATE MATERIALIZED VIEW lifecycle_sibling AS SELECT * FROM namespace_lifecycle.a;
+DROP VIEW lifecycle_sibling;
+${outcome};
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Lifecycle View" EXCEPT ALL SELECT * FROM namespace_lifecycle.a)
+UNION ALL (SELECT * FROM namespace_lifecycle.a EXCEPT ALL SELECT * FROM "Lifecycle View"));
+----
+0
+
+query I
+SELECT count(DISTINCT coalesce(delta_schema, source_schema) || '.' || delta_table_name)
+FROM main.openivm_delta_tables WHERE source_schema = 'namespace_lifecycle' AND table_name = 'openivm_delta_a';
+----
+1
+
+# Batched conflicting writes must be captured by the surviving/recreated delta.
+statement ok
+INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2),(8);
+DELETE FROM namespace_lifecycle.a WHERE i=1;
+UPDATE namespace_lifecycle.a SET i=9 WHERE i=2;
+INSERT INTO namespace_lifecycle.a VALUES (9),(9);
+DELETE FROM namespace_lifecycle.a WHERE i=8;
+
+statement ok
+PRAGMA refresh('"Lifecycle View"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Lifecycle View" EXCEPT ALL SELECT * FROM namespace_lifecycle.a)
+UNION ALL (SELECT * FROM namespace_lifecycle.a EXCEPT ALL SELECT * FROM "Lifecycle View"));
+----
+0
+
+statement ok
+DROP VIEW "Lifecycle View";
+
+# No delta from a removed source or an earlier placement may leak.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name IN ('namespace_lifecycle', 'NamespaceInternal')
+AND starts_with(table_name, 'openivm_');
+----
+0
+
+statement ok
+DELETE FROM namespace_lifecycle.a;
+INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2);
+
+statement ok
+SET openivm_internal_schema = '${placement}';
+CREATE MATERIALIZED VIEW "Lifecycle View" AS SELECT * FROM namespace_lifecycle.a;
+
+statement ok
+BEGIN;
+DROP VIEW "Lifecycle View";
+SET openivm_internal_schema = '${recreated}';
+CREATE MATERIALIZED VIEW "Lifecycle View" AS SELECT * FROM namespace_lifecycle.a;
+CREATE MATERIALIZED VIEW lifecycle_sibling AS SELECT * FROM namespace_lifecycle.a;
+DROP VIEW lifecycle_sibling;
+${outcome};
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Lifecycle View" EXCEPT ALL SELECT * FROM namespace_lifecycle.a)
+UNION ALL (SELECT * FROM namespace_lifecycle.a EXCEPT ALL SELECT * FROM "Lifecycle View"));
+----
+0
+
+query I
+SELECT count(DISTINCT coalesce(delta_schema, source_schema) || '.' || delta_table_name)
+FROM main.openivm_delta_tables WHERE source_schema = 'namespace_lifecycle' AND table_name = 'openivm_delta_a';
+----
+1
+
+# Batched conflicting writes must be captured by the surviving/recreated delta.
+statement ok
+INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2),(8);
+DELETE FROM namespace_lifecycle.a WHERE i=1;
+UPDATE namespace_lifecycle.a SET i=9 WHERE i=2;
+INSERT INTO namespace_lifecycle.a VALUES (9),(9);
+DELETE FROM namespace_lifecycle.a WHERE i=8;
+
+statement ok
+PRAGMA refresh('"Lifecycle View"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM "Lifecycle View" EXCEPT ALL SELECT * FROM namespace_lifecycle.a)
+UNION ALL (SELECT * FROM namespace_lifecycle.a EXCEPT ALL SELECT * FROM "Lifecycle View"));
+----
+0
+
+statement ok
+DROP VIEW "Lifecycle View";
+
+# No delta from a removed source or an earlier placement may leak.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name IN ('namespace_lifecycle', 'NamespaceInternal')
+AND starts_with(table_name, 'openivm_');
+----
+0
+
+statement ok
+DELETE FROM namespace_lifecycle.a;
+INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2);
+
+endloop
+endloop
+endloop
+
+statement ok
+DROP TABLE namespace_lifecycle.a;
+DROP TABLE namespace_lifecycle.b;
+DROP SCHEMA namespace_lifecycle;
+DROP SCHEMA NamespaceInternal;
+SET openivm_internal_schema = 'Replacement Internal';
+
 # Ownership added earlier in this transaction must be visible to cleanup checks.
 statement ok
 BEGIN;

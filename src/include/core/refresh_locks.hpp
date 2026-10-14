@@ -8,6 +8,7 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -72,6 +73,8 @@ public:
 	void AcquireMutationLock();
 	void DeferDeltaCleanup(vector<string> statements);
 	void DeferUnusedSourceDeltaCleanup(const RefreshMetadata::DeltaSource &source);
+	void RecordSourceDeltaDrop(const string &catalog, const string &schema, const string &table);
+	bool HasDroppedSourceDelta(const string &catalog, const string &schema, const string &table);
 	optional_ptr<TableCatalogEntry> FindDeferredSourceDelta(const string &catalog, const string &schema,
 	                                                        const string &table);
 	void SetMutationOwner(const void *owner_token);
@@ -89,6 +92,7 @@ private:
 	const void *mutation_owner;
 	vector<string> deferred_delta_cleanup;
 	vector<RefreshMetadata::DeltaSource> deferred_source_delta_cleanup;
+	unordered_set<string> dropped_source_deltas;
 };
 
 } // namespace duckdb
