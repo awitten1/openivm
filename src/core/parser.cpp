@@ -1861,6 +1861,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	// Pass DDL via result.parameters — the bind function receives them as input.inputs.
 	// This replaces the fragile thread-local pending-DDL mechanism.
+	result.parameters.push_back(Value(string(OPENIVM_DDL_PROFILE_TABLE_PREFIX) +
+	                                  SqlUtils::FullName(default_db, default_schema, openivm::PROFILE_TABLE)));
 	for (auto &q : ddl) {
 		result.parameters.push_back(Value(q));
 	}

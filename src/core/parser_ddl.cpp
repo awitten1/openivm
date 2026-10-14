@@ -220,6 +220,10 @@ public:
 		return enabled;
 	}
 
+	void SetProfileTable(const string &profile_table_p) {
+		profile_table = profile_table_p;
+	}
+
 	void SetViewName(const string &view_name_p) {
 		if (view_name.empty()) {
 			view_name = view_name_p;
@@ -249,20 +253,17 @@ public:
 	}
 
 	void Flush(DatabaseInstance &db) {
-		if (!enabled || flushed || view_name.empty() || steps.empty()) {
+		if (!enabled || flushed || view_name.empty() || profile_table.empty() || steps.empty()) {
 			return;
 		}
 		flushed = true;
 		Connection profile_con(db);
-		try {
-			RefreshMetadata::UseCatalog(context, profile_con);
-		} catch (std::exception &ex) {
-			OPENIVM_DEBUG_PRINT("[PROFILE] Cannot locate CREATE MV profile metadata: %s\n", ex.what());
-			return;
-		}
+		// The CREATE planner resolved the metadata owner before staged execution.
+		// The caller's active catalog may instead be an unrelated attached database.
+		OPENIVM_DEBUG_PRINT("[PROFILE] Recording CREATE MV profile in %s\n", profile_table.c_str());
 		// Retention and the new profile share one durable metadata commit.
 		profile_con.BeginTransaction();
-		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
+		profile_con.Query("DELETE FROM " + profile_table +
 		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
 		                  to_string(retention_days) + " days'");
 		// Statement profiles should not add a metadata commit for every DDL operation.
@@ -276,7 +277,7 @@ public:
 			          to_string(step.duration_ms) + ", '" + SqlUtils::EscapeValue(step.detail) + "')";
 		}
 		auto result =
-		    profile_con.Query("INSERT OR REPLACE INTO " + string(openivm::PROFILE_TABLE) +
+		    profile_con.Query("INSERT OR REPLACE INTO " + profile_table +
 		                      " (refresh_id, view_name, step_order, step_name, duration_ms, detail) VALUES " + values);
 		if (result->HasError()) {
 			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV profile: %s\n", result->GetError().c_str());
@@ -294,6 +295,7 @@ private:
 	bool flushed = false;
 	int64_t retention_days;
 	string view_name;
+	string profile_table;
 	string refresh_id;
 	int32_t next_step;
 	std::chrono::steady_clock::time_point total_start;
@@ -522,6 +524,10 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		pending_ddl.clear();
 	};
 	for (auto &q : ddl) {
+		if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_TABLE_PREFIX)) {
+			profiler.SetProfileTable(q.substr(strlen(OPENIVM_DDL_PROFILE_TABLE_PREFIX)));
+			continue;
+		}
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX)) {
 			flush_pending();
 			auto payload = q.substr(strlen(OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX));
@@ -986,7 +992,8 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 	};
 	for (auto &parameter : parameters) {
 		auto statement = parameter.GetValue<string>();
-		if (statement.empty() || StringUtil::StartsWith(statement, OPENIVM_DDL_CLEANUP_PREFIX)) {
+		if (statement.empty() || StringUtil::StartsWith(statement, OPENIVM_DDL_CLEANUP_PREFIX) ||
+		    StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_TABLE_PREFIX)) {
 			continue;
 		}
 		if (StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {

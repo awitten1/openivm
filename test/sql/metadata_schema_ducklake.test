@@ -27,9 +27,54 @@ CREATE TABLE dl.obs.readings (sensor INTEGER, val INTEGER);
 statement ok
 INSERT INTO dl.obs.readings VALUES (1, 10), (1, 20), (2, 5), (3, NULL);
 
+# An unrelated active native catalog has its own registry. Staged DuckLake
+# CREATE must profile beside the frontend-owned MV metadata, including retention.
+statement ok
+ATTACH ':memory:' AS "Other Native";
+
+statement ok
+CREATE TABLE "Other Native".main.source (id INTEGER);
+
+statement ok
+CREATE MATERIALIZED VIEW "Other Native".main.native_mv AS SELECT * FROM "Other Native".main.source;
+
+statement ok
+INSERT INTO "Other Native".openivm.openivm_refresh_profile
+    (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail)
+VALUES ('keep_other_catalog', 'native_mv', TIMESTAMP '2000-01-01', 0, 'sentinel', 0, '');
+
+statement ok
+USE "Other Native".main;
+
+statement ok
+SET openivm_profile_refresh = true;
+
 statement ok
 CREATE MATERIALIZED VIEW dl.obs.sensor_totals AS
 SELECT sensor, SUM(val) AS total, COUNT(*) AS cnt FROM dl.obs.readings GROUP BY sensor;
+
+statement ok
+SET openivm_profile_refresh = false;
+
+query III
+SELECT
+    (SELECT count(*) > 0 FROM memory.openivm.openivm_refresh_profile p
+     JOIN memory.openivm.openivm_views v USING (view_name)
+     WHERE v.view_sql_name = 'sensor_totals' AND v.view_catalog = 'dl'
+       AND p.step_name = 'create_mv_total'),
+    (SELECT count(*) FROM "Other Native".openivm.openivm_views WHERE view_catalog = 'dl'),
+    (SELECT count(*) FROM "Other Native".openivm.openivm_refresh_profile);
+----
+1	0	1
+
+query I
+SELECT count(*) FROM "Other Native".openivm.openivm_refresh_profile
+WHERE refresh_id = 'keep_other_catalog' AND profile_timestamp = TIMESTAMP '2000-01-01';
+----
+1
+
+statement ok
+USE memory.main;
 
 # Control metadata lives in the native frontend, in the configured schema only.
 query IIII
