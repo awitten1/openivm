@@ -1372,8 +1372,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			// for other sources in this CREATE program, whose tables do not exist yet.
 			auto preferred = placement.table_name;
 			idx_t suffix = 0;
-			while (Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, source.catalog_name, placement.schema_name,
-			                         placement.table_name, OnEntryNotFound::RETURN_NULL) ||
+			while (Catalog::GetEntry(context, source.catalog_name, placement.schema_name,
+			                         EntryLookupInfo(CatalogType::TABLE_ENTRY, placement.table_name),
+			                         OnEntryNotFound::RETURN_NULL) ||
 			       allocated_source_deltas.count(StringUtil::Lower(
 			           SqlUtils::FullName(source.catalog_name, placement.schema_name, placement.table_name)))) {
 				placement.table_name = preferred + "__openivm_" + to_string(++suffix);
