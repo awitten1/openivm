@@ -722,6 +722,29 @@ void TransactionalMVMetadataState::IncludeView(const string &view_name) {
 	view_names.insert(view_name);
 }
 
+vector<pair<string, string>> TransactionalMVMetadataState::MetadataLocations() const {
+	vector<pair<string, string>> locations;
+	for (auto &statement : statements) {
+		for (auto &table : TransactionalMetadataTables()) {
+			for (auto &prefix : MetadataStatementPrefixes()) {
+				auto reference = MetadataTargetReference(statement, prefix, table);
+				if (reference.empty()) {
+					continue;
+				}
+				auto parts = SqlUtils::ParseQualifiedIdentifier(reference);
+				if (parts.size() != 3) {
+					throw InternalException("Transaction-local OpenIVM metadata target must be qualified");
+				}
+				pair<string, string> location {parts[0], parts[1]};
+				if (std::find(locations.begin(), locations.end(), location) == locations.end()) {
+					locations.push_back(std::move(location));
+				}
+			}
+		}
+	}
+	return locations;
+}
+
 void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	if (statements.empty()) {
 		return;

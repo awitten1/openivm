@@ -37,6 +37,8 @@ public:
 	void RegisterSQL(const string &sql, const string &view_name);
 	void IncludeView(const string &view_name);
 	void Apply(Connection &connection) const;
+	// Include locations created in this transaction, which durable discovery cannot see.
+	vector<pair<string, string>> MetadataLocations() const;
 
 	void TransactionCommit(MetaTransaction &transaction, ClientContext &context) override;
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;

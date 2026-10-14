@@ -3,6 +3,7 @@
 #include "core/parser_ddl.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/refresh_metadata.hpp"
+#include "core/sql_utils.hpp"
 #include "duckdb/main/client_context.hpp"
 
 #include <chrono>
@@ -236,9 +237,147 @@ static void TestMetadataReplayLocations() {
 	}
 }
 
+// Keep an unrelated, later-sorted metadata catalog selected at the end of source
+// enumeration. Ownership in memory must include every earlier local mutation,
+// regardless of which location Apply() last shadowed on the compiler helper.
+static void TestSourceCascadeConsumerLocations(const string &mutation, bool commit) {
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Source.Space\"; CREATE TABLE \"Source.Space\".a(i INTEGER); "
+	               "CREATE TABLE \"Source.Space\".b(i INTEGER); CREATE TABLE \"Source.Space\".c(i INTEGER); "
+	               "INSERT INTO \"Source.Space\".a VALUES (1),(1),(2); "
+	               "INSERT INTO \"Source.Space\".b VALUES (1),(1),(2); "
+	               "INSERT INTO \"Source.Space\".c VALUES (1),(1),(2); "
+	               "CREATE MATERIALIZED VIEW mv1 AS SELECT a.i FROM \"Source.Space\".a a "
+	               "JOIN \"Source.Space\".b b USING(i); "
+	               "ATTACH ':memory:' AS \"zz Replay Peer\"; "
+	               "CREATE TABLE \"zz Replay Peer\".main.b(i INTEGER); "
+	               "INSERT INTO \"zz Replay Peer\".main.b VALUES (1),(1),(2); "
+	               "CREATE MATERIALIZED VIEW \"zz Replay Peer\".main.mv1 "
+	               "AS SELECT * FROM \"zz Replay Peer\".main.b;");
+	bool added = mutation == "create";
+	bool removed = mutation == "drop";
+	if (!added) {
+		Execute(owner, "CREATE MATERIALIZED VIEW mv2 AS SELECT * FROM \"Source.Space\".b;");
+	}
+	Execute(owner, "BEGIN;");
+	if (added) {
+		Execute(owner, "CREATE MATERIALIZED VIEW mv2 AS SELECT * FROM \"Source.Space\".b;");
+	} else if (removed) {
+		Execute(owner, "DROP VIEW mv2;");
+	} else {
+		Execute(owner, "CREATE OR REPLACE MATERIALIZED VIEW mv2 AS SELECT * FROM \"Source.Space\".c;");
+		if (mutation == "recreate") {
+			Execute(owner, "DROP VIEW mv2; CREATE MATERIALIZED VIEW mv2 AS SELECT * FROM \"Source.Space\".b;");
+		}
+	}
+	Execute(owner, "DROP TABLE \"Source.Space\".a CASCADE;");
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	bool owns_b = !commit || added || mutation == "recreate";
+	Execute(owner, "SELECT CASE WHEN count(*)=" + string(owns_b ? "1" : "0") +
+	                   " THEN true ELSE error('Source CASCADE lost local ownership or leaked a removed delta') END "
+	                   "FROM duckdb_tables() WHERE database_name='memory' AND schema_name='Internal Space' "
+	                   "AND table_name='" +
+	                   RefreshMetadata::InternalSourceDeltaName("Source.Space", "b") + "';");
+	vector<pair<string, string>> surviving = {
+	    {"\"zz Replay Peer\".main.mv1", "SELECT * FROM \"zz Replay Peer\".main.b"},
+	};
+	if (!commit) {
+		surviving.push_back({"mv1", "SELECT a.i FROM \"Source.Space\".a a JOIN \"Source.Space\".b b USING(i)"});
+	}
+	if ((!commit && !added) || (commit && !removed)) {
+		surviving.push_back({"mv2", commit && mutation == "replace" ? "SELECT * FROM \"Source.Space\".c"
+		                                                            : "SELECT * FROM \"Source.Space\".b"});
+	}
+	vector<string> sources = {"\"Source.Space\".b", "\"Source.Space\".c", "\"zz Replay Peer\".main.b"};
+	if (!commit) {
+		sources.push_back("\"Source.Space\".a");
+	}
+	for (auto &source : sources) {
+		Execute(owner, "INSERT INTO " + source + " VALUES (1),(2),(3),(3); DELETE FROM " + source +
+		                   " WHERE i=1; UPDATE " + source + " SET i=4 WHERE i=2; INSERT INTO " + source +
+		                   " VALUES (1),(4),(5); DELETE FROM " + source + " WHERE i=5; UPDATE " + source +
+		                   " SET i=2 WHERE i=4;");
+	}
+	for (auto &view : surviving) {
+		Execute(owner, "PRAGMA refresh('" + view.first + "');");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view.first + " EXCEPT ALL " + view.second +
+		                   ") OR EXISTS (" + view.second + " EXCEPT ALL SELECT * FROM " + view.first +
+		                   ") THEN error('Cross-location source CASCADE survivor bag mismatch') ELSE true END;");
+	}
+	if (commit && !removed) {
+		Execute(owner, "DROP VIEW mv2;");
+	}
+	if (!commit) {
+		Execute(owner, "DROP VIEW mv1;");
+		if (!added) {
+			Execute(owner, "DROP VIEW mv2;");
+		}
+	}
+	Execute(owner, "DROP VIEW \"zz Replay Peer\".main.mv1;");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Final consumer delta cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
+// Legacy view keys may repeat across metadata locations. Exclusions must name
+// their metadata table even when the excluded key also appears elsewhere.
+static void TestStagedCascadeConsumerIdentity() {
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE TABLE a(i INTEGER); CREATE TABLE b(i INTEGER); INSERT INTO a VALUES (1),(1),(2); "
+	               "INSERT INTO b VALUES (1),(1),(2); "
+	               "CREATE MATERIALIZED VIEW mv1 AS SELECT a.i FROM a JOIN b USING(i); "
+	               "ATTACH ':memory:' AS peer; CREATE MATERIALIZED VIEW peer.main.mv1 AS SELECT * FROM memory.main.b;");
+	Connection helper(db);
+	RefreshMetadata::UseCatalog(*owner.context, helper, "memory");
+	auto primary_table = RefreshMetadata::MetadataTable(helper, openivm::DELTA_TABLES_TABLE);
+	auto primary_key = RefreshMetadata(helper).FindViewKey("memory", "main", "mv1");
+	auto sources = RefreshMetadata(helper).GetDeltaSources(primary_key, "memory", "main");
+	RefreshMetadata::UseCatalog(*owner.context, helper, "peer");
+	auto peer_key = RefreshMetadata(helper).FindViewKey("peer", "main", "mv1");
+	// Include the peer key in the primary exclusion list: it must not exclude
+	// the peer row. This also exercises legacy short-key collisions without
+	// changing persisted physical identities to manufacture a legacy database.
+	bool checked_b = false;
+	for (auto &source : sources) {
+		if (RefreshMetadata::SourceTableName(source.table_name, source.catalog_name, source.schema_name) !=
+		    SqlUtils::DeltaName("b")) {
+			continue;
+		}
+		checked_b = true;
+		if (!RefreshMetadata::HasSourceDeltaConsumers(
+		        helper, source, nullptr,
+		        {{primary_table, Value(primary_key).ToSQLString() + "," + Value(peer_key).ToSQLString()}})) {
+			throw InvalidInputException("Source ownership exclusions leaked into another metadata catalog");
+		}
+	}
+	if (!checked_b) {
+		throw InvalidInputException("Cross-catalog consumer fixture is missing source b ownership");
+	}
+	Execute(owner, "DROP TABLE a CASCADE; "
+	               "INSERT INTO b VALUES (1),(2),(3),(3); DELETE FROM b WHERE i=1; UPDATE b SET i=4 WHERE i=2; "
+	               "INSERT INTO b VALUES (1),(4),(5); DELETE FROM b WHERE i=5; UPDATE b SET i=2 WHERE i=4;");
+	Execute(owner, "PRAGMA refresh('peer.main.mv1');");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM peer.main.mv1 EXCEPT ALL SELECT * FROM b) "
+	               "OR EXISTS (SELECT * FROM b EXCEPT ALL SELECT * FROM peer.main.mv1) "
+	               "THEN error('Staged CASCADE excluded another catalog consumer') ELSE true END;");
+	Execute(owner, "DROP VIEW peer.main.mv1;");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Staged final consumer delta cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
 int main() {
 	try {
 		TestMetadataReplayLocations();
+		for (const auto &mutation : vector<string> {"create", "drop", "replace", "recreate"}) {
+			TestSourceCascadeConsumerLocations(mutation, false);
+			TestSourceCascadeConsumerLocations(mutation, true);
+		}
+		TestStagedCascadeConsumerIdentity();
 		TestPublication(false);
 		TestPublication(true);
 		TestDropDuringPublication(false, false);

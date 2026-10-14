@@ -37,3 +37,12 @@ retain ownership and refresh correctly after conflicting batches. The native
 integration executable reuses one replay helper across two metadata catalogs and
 back, checking that CREATE/CASCADE mutations and temporary shadows retain their
 catalog/schema identities.
+
+The same native executable places an unrelated metadata catalog after the source
+catalog in enumeration order. It checks transaction-local CREATE, DROP,
+replacement, and DROP/recreate before source CASCADE, with both commit and
+rollback. Each surviving MV receives conflicting batched INSERT/DELETE/UPDATE
+and a bidirectional `EXCEPT ALL` comparison; final-consumer cleanup must remove
+all maintenance tables. A cross-catalog source consumer and an exclusion list containing its key
+also verify that direct CASCADE exclusions and staged final DROP retain the
+consumer's catalog/schema identity.

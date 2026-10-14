@@ -3,6 +3,7 @@
 
 #include "core/openivm_debug.hpp"
 #include "core/parser_create_mv_helpers.hpp"
+#include "core/parser_ddl.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "core/published_view.hpp"
@@ -171,6 +172,10 @@ void RefreshMetadata::UseSameLocation(ClientContext &context, Connection &con) {
 	auto catalog = state->catalog_name;
 	auto schema = state->schema_name;
 	SelectMetadataLocation(con, catalog, schema);
+}
+
+void RefreshMetadata::UseLocation(Connection &con, const MetadataLocation &location) {
+	SelectMetadataLocation(con, location.catalog_name, location.schema_name);
 }
 
 RefreshMetadata::MetadataLocation RefreshMetadata::CurrentLocation(Connection &con) {
@@ -882,33 +887,60 @@ vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const stri
 	return sources;
 }
 
-bool RefreshMetadata::HasSourceDeltaConsumers(Connection &con, const DeltaSource &source, const string &excluded_views,
-                                              const string &excluded_metadata_table) {
-	auto location = CurrentLocation(con);
-	auto current_table = SqlUtils::FullName(location.catalog_name, location.schema_name, openivm::DELTA_TABLES_TABLE);
-	auto tables = MetadataTables(con, openivm::DELTA_TABLES_TABLE);
-	if (std::find(tables.begin(), tables.end(), current_table) == tables.end() &&
-	    con.TableInfo(openivm::DELTA_TABLES_TABLE)) {
-		// A metadata schema first created in the caller transaction is not yet
-		// discoverable through another connection, but its shadow is available.
-		tables.push_back(current_table);
+bool RefreshMetadata::HasSourceDeltaConsumers(Connection &con, const DeltaSource &source,
+                                              optional_ptr<TransactionalMVMetadataState> transaction_state,
+                                              const unordered_map<string, string> &excluded_consumers) {
+	auto current = CurrentLocation(con);
+	auto current_table = SqlUtils::FullName(current.catalog_name, current.schema_name, openivm::DELTA_TABLES_TABLE);
+	auto locations = MetadataLocations(con, openivm::DELTA_TABLES_TABLE);
+	auto include_location = [&](const MetadataLocation &candidate) {
+		for (auto &location : locations) {
+			if (StringUtil::CIEquals(location.catalog_name, candidate.catalog_name) &&
+			    StringUtil::CIEquals(location.schema_name, candidate.schema_name)) {
+				return;
+			}
+		}
+		locations.push_back(candidate);
+	};
+	if (transaction_state) {
+		for (auto &location : transaction_state->MetadataLocations()) {
+			include_location({location.first, location.second});
+		}
+	} else if (con.TableInfo(openivm::DELTA_TABLES_TABLE)) {
+		include_location(current);
 	}
-	for (auto &table : tables) {
-		// The selected location may be shadowed with the caller's uncommitted
-		// ownership rows. Other metadata catalogs must retain explicit identities.
-		auto target =
-		    StringUtil::CIEquals(table, current_table) ? SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE) : table;
+	// Replaying another location drops the helper's prior TEMP shadows. Keep
+	// ownership inspection on its own connection so compiling DROP/REPLACE does
+	// not change the caller's metadata location or its transaction snapshot.
+	unique_ptr<Connection> replay;
+	if (transaction_state) {
+		replay = make_uniq<Connection>(*con.context->db);
+	}
+	for (auto &location : locations) {
+		auto table = SqlUtils::FullName(location.catalog_name, location.schema_name, openivm::DELTA_TABLES_TABLE);
+		auto target = table;
+		auto reader = &con;
+		if (replay) {
+			UseLocation(*replay, location);
+			transaction_state->Apply(*replay);
+			reader = replay.get();
+			target = SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
+		} else if (StringUtil::CIEquals(table, current_table)) {
+			target = SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
+		}
 		auto query = "SELECT count(*) FROM " + target + " WHERE " +
 		             SourcePredicate(source.table_name, source.catalog_name, source.schema_name);
-		if (!excluded_views.empty() &&
-		    (excluded_metadata_table.empty() || StringUtil::CIEquals(table, excluded_metadata_table))) {
-			query += " AND view_name NOT IN (" + excluded_views + ")";
+		auto consumers = excluded_consumers.find(table);
+		if (consumers != excluded_consumers.end() && !consumers->second.empty()) {
+			query += " AND view_name NOT IN (" + consumers->second + ")";
 		}
-		auto remaining = con.Query(query);
+		auto remaining = reader->Query(query);
 		if (remaining->HasError()) {
 			throw CatalogException("OpenIVM could not verify delta-table consumers for '%s': %s", source.table_name,
 			                       remaining->GetError());
 		}
+		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Checked %s with transaction replay=%d\n", table.c_str(),
+		                    transaction_state ? 1 : 0);
 		if (remaining->GetValue(0, 0).GetValue<int64_t>() != 0) {
 			return true;
 		}

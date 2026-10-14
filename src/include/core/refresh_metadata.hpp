@@ -9,6 +9,7 @@
 namespace duckdb {
 
 class TableCatalogEntry;
+class TransactionalMVMetadataState;
 
 // Centralized access to IVM metadata stored in system tables.
 // Wraps all raw SQL queries to openivm_views and openivm_delta_tables
@@ -34,6 +35,8 @@ public:
 	static void UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
 	// Select the location already resolved for a helper context; resolve it for any other context.
 	static void UseSameLocation(ClientContext &context, Connection &con);
+	// Select an already resolved catalog/schema identity without rediscovering it.
+	static void UseLocation(Connection &con, const MetadataLocation &location);
 	// The metadata location selected for a helper connection.
 	static MetadataLocation CurrentLocation(Connection &con);
 	static string MetadataTable(Connection &con, const string &table);
@@ -113,8 +116,12 @@ public:
 		string delta_schema_name;
 		string delta_table_name;
 	};
-	static bool HasSourceDeltaConsumers(Connection &con, const DeltaSource &source, const string &excluded_views = "",
-	                                    const string &excluded_metadata_table = "");
+	// Call under the mutation gate. Replay every location for caller-transaction cleanup;
+	// after commit, omit transaction_state and inspect durable ownership. Exclusions are
+	// keyed by the fully qualified metadata table because view keys are location-local.
+	static bool HasSourceDeltaConsumers(Connection &con, const DeltaSource &source,
+	                                    optional_ptr<TransactionalMVMetadataState> transaction_state = nullptr,
+	                                    const unordered_map<string, string> &excluded_consumers = {});
 
 	// Physical source-delta naming. Internal-schema deltas encode the source schema so that
 	// same-named sources of different schemas have different preferred names. CREATE allocates

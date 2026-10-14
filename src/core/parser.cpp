@@ -164,9 +164,9 @@ static bool RelationExists(ClientContext &context, const string &catalog_name, c
 	return false;
 }
 
-static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshMetadata::DeltaSource> &sources,
-                                          const string &excluded_views, string &program,
-                                          const string &excluded_metadata_table = "");
+static void AppendUnusedSourceDropProgram(ClientContext &context, Connection &con,
+                                          const vector<RefreshMetadata::DeltaSource> &sources, string &program,
+                                          const unordered_map<string, string> &excluded_consumers);
 
 static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
                                                       unique_ptr<ParserExtensionParseData> parse_data, string &view_key,
@@ -1828,8 +1828,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			continue;
 		}
 		string cleanup;
-		AppendUnusedSourceDropProgram(con, {old_source}, "'" + SqlUtils::EscapeValue(view_name) + "'", cleanup,
-		                              SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE));
+		AppendUnusedSourceDropProgram(context, con, {old_source}, cleanup,
+		                              {{SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE),
+		                                "'" + SqlUtils::EscapeValue(view_name) + "'"}});
 		if (cleanup.empty()) {
 			continue;
 		}
@@ -2027,9 +2028,9 @@ static string QualifyDropMetadata(const string &program, const RefreshMetadata::
 	return qualified;
 }
 
-static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshMetadata::DeltaSource> &sources,
-                                          const string &excluded_views, string &program,
-                                          const string &excluded_metadata_table) {
+static void AppendUnusedSourceDropProgram(ClientContext &context, Connection &con,
+                                          const vector<RefreshMetadata::DeltaSource> &sources, string &program,
+                                          const unordered_map<string, string> &excluded_consumers) {
 	unordered_set<string> checked_sources;
 	for (auto &source : sources) {
 		if (source.catalog_type == "ducklake" || RefreshMetadata(con).IsMaterializedViewDelta(source)) {
@@ -2039,7 +2040,8 @@ static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshM
 		if (!checked_sources.insert(identity).second) {
 			continue;
 		}
-		if (!RefreshMetadata::HasSourceDeltaConsumers(con, source, excluded_views, excluded_metadata_table)) {
+		if (!RefreshMetadata::HasSourceDeltaConsumers(con, source, TransactionalMVMetadataState::TryGet(context),
+		                                              excluded_consumers)) {
 			// The physical delta may sit in an internal schema under a schema-qualified name.
 			program += "DROP TABLE IF EXISTS " +
 			           SqlUtils::FullName(source.catalog_name, source.delta_schema_name, source.delta_table_name) +
@@ -2115,7 +2117,7 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	vector<string> dependent_views;
 	vector<RefreshMetadata::DeltaSource> sources;
 	string program;
-	string excluded_views;
+	unordered_map<string, string> excluded_consumers;
 	bool staged_drop = false;
 	for (auto &catalog : catalogs) {
 		RefreshMetadata::UseCatalog(context, con, catalog);
@@ -2157,15 +2159,17 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 			}
 		}
 		string local_program;
+		string local_excluded_views;
 		for (auto &view_name : local_views) {
 			auto location = metadata.GetStoredViewLocation(view_name);
 			AppendTrackedViewDropProgram(context, metadata, view_name, location, local_program, sources, true,
 			                             OnEntryNotFound::RETURN_NULL);
-			if (!excluded_views.empty()) {
-				excluded_views += ", ";
+			if (!local_excluded_views.empty()) {
+				local_excluded_views += ", ";
 			}
-			excluded_views += "'" + SqlUtils::EscapeValue(view_name) + "'";
+			local_excluded_views += "'" + SqlUtils::EscapeValue(view_name) + "'";
 		}
+		excluded_consumers[RefreshMetadata::MetadataTable(con, openivm::DELTA_TABLES_TABLE)] = local_excluded_views;
 		program += QualifyDropMetadata(local_program, RefreshMetadata::CurrentLocation(con));
 		dependent_views.insert(dependent_views.end(), local_views.begin(), local_views.end());
 		staged_drop |= !StringUtil::CIEquals(catalog, drop_info.catalog);
@@ -2173,7 +2177,7 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	if (dependent_views.empty()) {
 		return BuildDropTableStatement(drop_info) + ";\n";
 	}
-	AppendUnusedSourceDropProgram(con, sources, excluded_views, program);
+	AppendUnusedSourceDropProgram(context, con, sources, program, excluded_consumers);
 	for (auto &source : sources) {
 		staged_drop |= !StringUtil::CIEquals(source.catalog_name, drop_info.catalog);
 	}
@@ -2313,7 +2317,8 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		}
 		excluded_views += "'" + SqlUtils::EscapeValue(view_name) + "'";
 	}
-	AppendUnusedSourceDropProgram(con, delta_sources, excluded_views, program);
+	AppendUnusedSourceDropProgram(context, con, delta_sources, program,
+	                              {{RefreshMetadata::MetadataTable(con, openivm::DELTA_TABLES_TABLE), excluded_views}});
 	for (auto &source : delta_sources) {
 		staged_drop |= !StringUtil::CIEquals(source.catalog_name, catalog_name);
 	}
