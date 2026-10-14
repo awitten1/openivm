@@ -815,14 +815,11 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		}
 		view_filter += "'" + SqlUtils::EscapeValue(view_name) + "'";
 	}
-	if (!view_filter.empty()) {
-		connection.Query("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name NOT IN (" + view_filter +
-		                 ")");
-		connection.Query("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name NOT IN (" +
-		                 view_filter + ")");
-		connection.Query("DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE parent_view NOT IN (" + view_filter +
-		                 ") OR child_view NOT IN (" + view_filter + ")");
-	}
+	// Keep the complete replayed ownership relations. Independent committed views
+	// can share a source delta without belonging to this dependency closure. DROP
+	// must see those consumers as well as ownership added or removed by this
+	// transaction before deciding whether to delete the physical delta.
+	// Only the per-view bookkeeping below is restricted to the closure.
 	for (auto &table : TransactionalMetadataTables()) {
 		if (std::find(dependency_tables.begin(), dependency_tables.end(), table) != dependency_tables.end()) {
 			continue;

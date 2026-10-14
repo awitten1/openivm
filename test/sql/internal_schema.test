@@ -1754,3 +1754,87 @@ query I
 SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Quoted Internal';
 ----
 0
+
+# A transaction-local replacement makes DROP use replayed metadata. A committed
+# sibling sharing the source is independent of the replaced view's dependency
+# closure, but still owns its physical delta. Check retained and removed sources,
+# commit and rollback, with control metadata and maintenance in separate schemas.
+statement ok
+SET openivm_metadata_schema = 'Control Space';
+SET openivm_internal_schema = 'Ownership Internal';
+CREATE SCHEMA "Ownership Sources";
+CREATE TABLE "Ownership Sources".a(i INTEGER);
+CREATE TABLE "Ownership Sources".b(i INTEGER);
+INSERT INTO "Ownership Sources".a VALUES (1),(1),(2);
+INSERT INTO "Ownership Sources".b VALUES (3),(3),(4);
+
+foreach replacement a b
+foreach outcome COMMIT ROLLBACK
+
+statement ok
+CREATE MATERIALIZED VIEW s1.ownership_mv1 AS SELECT * FROM "Ownership Sources".a;
+CREATE MATERIALIZED VIEW s1.ownership_mv2 AS SELECT * FROM "Ownership Sources".a;
+
+statement ok
+BEGIN;
+CREATE OR REPLACE MATERIALIZED VIEW s1.ownership_mv1 AS SELECT * FROM "Ownership Sources".${replacement};
+DROP VIEW s1.ownership_mv1;
+
+# The shared delta must survive even before the transaction ends.
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_delta_tables d
+ON t.database_name = d.source_catalog AND t.schema_name = d.delta_schema AND t.table_name = d.delta_table_name
+JOIN "Control Space".openivm_views v ON v.view_name = d.view_name
+WHERE v.view_sql_name = 'ownership_mv2' AND d.source_schema = 'Ownership Sources';
+----
+1
+
+statement ok
+${outcome};
+
+query I
+SELECT count(*) FROM duckdb_tables() t JOIN "Control Space".openivm_delta_tables d
+ON t.database_name = d.source_catalog AND t.schema_name = d.delta_schema AND t.table_name = d.delta_table_name
+JOIN "Control Space".openivm_views v ON v.view_name = d.view_name
+WHERE v.view_sql_name = 'ownership_mv2' AND d.source_schema = 'Ownership Sources';
+----
+1
+
+statement ok
+INSERT INTO "Ownership Sources".a VALUES (1),(1),(2),(8),(8);
+DELETE FROM "Ownership Sources".a WHERE i = 1;
+UPDATE "Ownership Sources".a SET i = 9 WHERE i = 2;
+INSERT INTO "Ownership Sources".a VALUES (1),(9),(9);
+DELETE FROM "Ownership Sources".a WHERE i = 8;
+UPDATE "Ownership Sources".a SET i = 2 WHERE i = 9;
+
+statement ok
+PRAGMA refresh('s1.ownership_mv2');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM s1.ownership_mv2 EXCEPT ALL SELECT * FROM "Ownership Sources".a)
+UNION ALL (SELECT * FROM "Ownership Sources".a EXCEPT ALL SELECT * FROM s1.ownership_mv2));
+----
+0
+
+statement ok
+BEGIN;
+DROP VIEW IF EXISTS s1.ownership_mv1;
+DROP VIEW s1.ownership_mv2;
+COMMIT;
+
+# After the final owner is removed, no source or MV maintenance tables may leak.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Ownership Internal';
+----
+0
+
+endloop
+endloop
+
+statement ok
+DROP TABLE "Ownership Sources".a;
+DROP TABLE "Ownership Sources".b;
+DROP SCHEMA "Ownership Sources";
+DROP SCHEMA "Ownership Internal";
+SET openivm_internal_schema = 'Quoted Internal';

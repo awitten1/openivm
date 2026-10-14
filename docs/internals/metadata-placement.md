@@ -97,6 +97,10 @@ replacement or DROP followed by CREATE can therefore allocate a new delta (even
 in another internal schema) without mistaking its own cleanup for a stale
 snapshot. Commit and rollback both clear that record; concurrent allocation
 still requires reconciliation with committed ownership.
+DROP's transaction-local metadata replay retains complete ownership, including
+committed siblings outside the affected view's dependency closure. Cleanup checks
+this replayed state before deleting a shared source delta, so transaction-local
+ownership additions and removals are considered alongside committed consumers.
 `openivm_delta_tables` records each source's catalog and schema, the physical delta
 name (`delta_table_name`), and, for moved deltas, the internal schema (`delta_schema`).
 Older rows without a stored physical name retain their original naming rule.

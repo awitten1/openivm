@@ -101,8 +101,10 @@ The IVM compatibility checker validates the entire plan tree, flagging unsupport
 The parser produces a sequence of DDL statements, but does not mutate the catalog
 during bind. Native-catalog lifecycle statements are rendered as a SQL program and
 execute in the caller transaction. A later lifecycle or refresh statement in that
-same transaction replays only the affected view's uncommitted metadata into
-constrained temporary shadow tables for compilation. DuckLake and other
+same transaction uses temporary metadata shadows for compilation. Lifecycle replay
+retains all committed ownership rows and applies transaction-local changes, so
+independent views sharing a source delta remain visible to cleanup. Only per-view
+bookkeeping is restricted to the affected dependency closure. DuckLake and other
 cross-catalog lifecycles use staged execution because DuckDB cannot commit writes to
 two attached catalogs in one transaction.
 

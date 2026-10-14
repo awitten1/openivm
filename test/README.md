@@ -23,3 +23,9 @@ competing DROP actually blocks on the mutation gate, then publishes the new view
 before allowing DROP to proceed. Native autocommit, explicit-transaction, and
 cross-catalog staged cleanup must preserve the surviving delta, capture batched
 INSERT/DELETE/UPDATE operations, and refresh to full bag equality in both directions.
+
+`internal_schema.test` also replaces and drops one of two committed, independent
+views sharing a source within an explicit transaction. With separate metadata and
+maintenance schemas, both commit and rollback must preserve the sibling's delta
+and capture batched conflicting writes. Dropping the final owners in one
+transaction must then remove that delta.
