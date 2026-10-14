@@ -26,6 +26,77 @@ SET openivm_internal_schema = 'Lake Internal';
 statement ok
 SET openivm_cascade_refresh = 'off';
 
+# A DuckLake MV can consume native sources. Replacement must clean the removed
+# native physical delta without moving either metadata or lake backing objects.
+statement ok
+CREATE TABLE main.replace_a(i INTEGER);
+CREATE TABLE main.replace_b(i INTEGER);
+INSERT INTO main.replace_a VALUES (1),(1),(2);
+INSERT INTO main.replace_b VALUES (3),(3),(4);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main.replaced_native_source AS SELECT * FROM main.replace_a;
+
+statement ok
+CREATE MATERIALIZED VIEW native_source_consumer AS SELECT * FROM main.replace_a;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW dl.main.replaced_native_source AS SELECT * FROM main.replace_b;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='internal_schema_host'
+AND schema_name='Lake Internal' AND table_name='openivm_delta_6d61696e_replace_a';
+----
+1
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW native_source_consumer AS SELECT * FROM main.replace_b;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='internal_schema_host'
+AND schema_name='Lake Internal' AND table_name='openivm_delta_6d61696e_replace_a';
+----
+0
+
+statement ok
+INSERT INTO main.replace_b VALUES (5),(5),(6);
+DELETE FROM main.replace_b WHERE i=3;
+UPDATE main.replace_b SET i=7 WHERE i=4;
+
+statement ok
+PRAGMA refresh('dl.main.replaced_native_source');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.main.replaced_native_source EXCEPT ALL SELECT * FROM main.replace_b)
+UNION ALL (SELECT * FROM main.replace_b EXCEPT ALL SELECT * FROM dl.main.replaced_native_source));
+----
+0
+
+statement ok
+PRAGMA refresh('native_source_consumer');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM native_source_consumer EXCEPT ALL SELECT * FROM main.replace_b)
+UNION ALL (SELECT * FROM main.replace_b EXCEPT ALL SELECT * FROM native_source_consumer));
+----
+0
+
+statement ok
+DROP VIEW native_source_consumer;
+CREATE OR REPLACE MATERIALIZED VIEW dl.main.replaced_native_source AS SELECT * FROM main.replace_a;
+
+# The staged lake replacement removes the last owner of the native b delta.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='internal_schema_host'
+AND schema_name='Lake Internal' AND table_name='openivm_delta_6d61696e_replace_b';
+----
+0
+
+statement ok
+DROP VIEW dl.main.replaced_native_source;
+DROP TABLE main.replace_a;
+DROP TABLE main.replace_b;
+
 statement ok
 CREATE SCHEMA dl.s1;
 

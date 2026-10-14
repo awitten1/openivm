@@ -1,5 +1,8 @@
 #include "core/refresh_locks.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/sql_utils.hpp"
+#include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
 
@@ -35,6 +38,16 @@ void MutationGate::Unlock(const void *owner) {
 		active_owner = nullptr;
 		condition.notify_one();
 	}
+}
+
+bool MutationGate::TryLock(const void *owner) {
+	std::lock_guard<mutex> guard(lock);
+	if (active_owner && active_owner != owner) {
+		return false;
+	}
+	active_owner = owner;
+	depth++;
+	return true;
 }
 
 shared_ptr<MutationGate> RefreshLocks::AcquireGate(DatabaseInstance &db) {
@@ -87,28 +100,61 @@ void TransactionalMVLockState::DeferDeltaCleanup(vector<string> statements) {
 
 void TransactionalMVLockState::TransactionCommit(MetaTransaction &transaction, ClientContext &context) {
 	vector<string> cleanup;
+	vector<RefreshMetadata::DeltaSource> source_cleanup;
 	{
 		lock_guard<mutex> guard(state_lock);
 		cleanup.swap(deferred_delta_cleanup);
+		source_cleanup.swap(deferred_source_delta_cleanup);
 	}
-	if (!cleanup.empty()) {
+	if (!cleanup.empty() || !source_cleanup.empty()) {
 		// The caller is already committed. Housekeeping failures must never report
 		// a failed commit or roll back a successfully refreshed MV. Retained deltas
 		// are excluded by the committed watermark and retried on a later refresh.
 		try {
 			Connection con(*context.db);
 			Get(*con.context).SetMutationOwner(GetMutationOwner());
+			// A later CREATE in the same transaction may have reused a delta that
+			// replacement scheduled for cleanup. Check committed ownership again.
+			for (auto &source : source_cleanup) {
+				if (!RefreshMetadata::HasSourceDeltaConsumers(con, source)) {
+					cleanup.push_back("DROP TABLE IF EXISTS " + SqlUtils::FullName(source.catalog_name,
+					                                                               source.delta_schema_name,
+					                                                               source.delta_table_name));
+				}
+			}
 			for (auto &sql : cleanup) {
 				auto result = con.Query(sql);
 				if (result->HasError()) {
-					Printer::Print("OpenIVM refresh committed; external delta cleanup deferred: " + result->GetError());
+					Printer::Print("OpenIVM transaction committed; external delta cleanup deferred: " +
+					               result->GetError());
 				}
 			}
 		} catch (const std::exception &ex) {
-			Printer::Print(string("OpenIVM refresh committed; external delta cleanup deferred: ") + ex.what());
+			Printer::Print(string("OpenIVM transaction committed; external delta cleanup deferred: ") + ex.what());
 		}
 	}
 	Release();
+}
+
+void TransactionalMVLockState::DeferUnusedSourceDeltaCleanup(const RefreshMetadata::DeltaSource &source) {
+	lock_guard<mutex> guard(state_lock);
+	deferred_source_delta_cleanup.push_back(source);
+}
+
+optional_ptr<TableCatalogEntry>
+TransactionalMVLockState::FindDeferredSourceDelta(const string &catalog, const string &schema, const string &table) {
+	lock_guard<mutex> guard(state_lock);
+	for (auto &source : deferred_source_delta_cleanup) {
+		if (StringUtil::CIEquals(catalog, source.catalog_name) && StringUtil::CIEquals(schema, source.schema_name) &&
+		    StringUtil::CIEquals(RefreshMetadata::SourceTableName(source.table_name, catalog, schema),
+		                         SqlUtils::DeltaName(table))) {
+			// Ownership was removed by an earlier replacement, but this transaction
+			// still reserves the physical delta until its post-commit cleanup check.
+			return Catalog::GetEntry<TableCatalogEntry>(owner, catalog, source.delta_schema_name,
+			                                            source.delta_table_name, OnEntryNotFound::RETURN_NULL);
+		}
+	}
+	return nullptr;
 }
 
 void TransactionalMVLockState::TransactionRollback(MetaTransaction &transaction, ClientContext &context) {
@@ -119,6 +165,7 @@ void TransactionalMVLockState::Release() {
 	lock_guard<mutex> guard(state_lock);
 	OPENIVM_DEBUG_PRINT("[LOCK] release database mutation lock owner=%p\n", static_cast<void *>(&owner));
 	deferred_delta_cleanup.clear();
+	deferred_source_delta_cleanup.clear();
 	mutation_guard.reset();
 }
 

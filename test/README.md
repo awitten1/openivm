@@ -9,3 +9,9 @@ or
 ```bash
 make test_debug
 ```
+
+The native `source_delta_publication_test` integration executable pauses CREATE
+after source-delta allocation and before ownership publication, then checks a
+competing connection, shared placement, and refresh bag equality. Run it from a
+fresh pinned build alongside `test/sql/internal_schema.test` and
+`test/sql/internal_schema_ducklake.test` for namespace lifecycle regression coverage.

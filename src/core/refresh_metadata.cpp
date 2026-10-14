@@ -693,6 +693,9 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDelta(ClientContext &
 			                       SqlUtils::FullName(catalog, schema, table));
 		}
 	}
+	if (!delta) {
+		delta = TransactionalMVLockState::Get(context).FindDeferredSourceDelta(catalog, schema, table);
+	}
 	return delta;
 }
 
@@ -835,6 +838,40 @@ vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const stri
 		sources.push_back(std::move(source));
 	}
 	return sources;
+}
+
+bool RefreshMetadata::HasSourceDeltaConsumers(Connection &con, const DeltaSource &source, const string &excluded_views,
+                                              const string &excluded_metadata_table) {
+	auto location = CurrentLocation(con);
+	auto current_table = SqlUtils::FullName(location.catalog_name, location.schema_name, openivm::DELTA_TABLES_TABLE);
+	auto tables = MetadataTables(con, openivm::DELTA_TABLES_TABLE);
+	if (std::find(tables.begin(), tables.end(), current_table) == tables.end() &&
+	    con.TableInfo(openivm::DELTA_TABLES_TABLE)) {
+		// A metadata schema first created in the caller transaction is not yet
+		// discoverable through another connection, but its shadow is available.
+		tables.push_back(current_table);
+	}
+	for (auto &table : tables) {
+		// The selected location may be shadowed with the caller's uncommitted
+		// ownership rows. Other metadata catalogs must retain explicit identities.
+		auto target =
+		    StringUtil::CIEquals(table, current_table) ? SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE) : table;
+		auto query = "SELECT count(*) FROM " + target + " WHERE " +
+		             SourcePredicate(source.table_name, source.catalog_name, source.schema_name);
+		if (!excluded_views.empty() &&
+		    (excluded_metadata_table.empty() || StringUtil::CIEquals(table, excluded_metadata_table))) {
+			query += " AND view_name NOT IN (" + excluded_views + ")";
+		}
+		auto remaining = con.Query(query);
+		if (remaining->HasError()) {
+			throw CatalogException("OpenIVM could not verify delta-table consumers for '%s': %s", source.table_name,
+			                       remaining->GetError());
+		}
+		if (remaining->GetValue(0, 0).GetValue<int64_t>() != 0) {
+			return true;
+		}
+	}
+	return false;
 }
 
 string RefreshMetadata::ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,

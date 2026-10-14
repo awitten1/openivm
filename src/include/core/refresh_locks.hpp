@@ -2,6 +2,7 @@
 #define REFRESH_LOCKS_HPP
 
 #include "duckdb.hpp"
+#include "core/refresh_metadata.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/storage/object_cache.hpp"
 
@@ -25,6 +26,7 @@ public:
 	}
 
 	void Lock(const void *owner);
+	bool TryLock(const void *owner);
 	void Unlock(const void *owner);
 
 private:
@@ -69,6 +71,9 @@ public:
 
 	void AcquireMutationLock();
 	void DeferDeltaCleanup(vector<string> statements);
+	void DeferUnusedSourceDeltaCleanup(const RefreshMetadata::DeltaSource &source);
+	optional_ptr<TableCatalogEntry> FindDeferredSourceDelta(const string &catalog, const string &schema,
+	                                                        const string &table);
 	void SetMutationOwner(const void *owner_token);
 	const void *GetMutationOwner();
 
@@ -83,6 +88,7 @@ private:
 	ClientContext &owner;
 	const void *mutation_owner;
 	vector<string> deferred_delta_cleanup;
+	vector<RefreshMetadata::DeltaSource> deferred_source_delta_cleanup;
 };
 
 } // namespace duckdb

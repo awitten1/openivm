@@ -109,6 +109,12 @@ nothing has to be moved by hand:
   existing delta wherever it lives; one source never gets a second delta.
 - `CREATE OR REPLACE` keeps the replaced view's internal location, so views built
   on it keep reading the same tables. Drop and recreate a view to move it.
+- Source-delta allocation and ownership publication share the mutation gate, so
+  concurrent CREATEs cannot allocate separate deltas for the same source.
+- Replacement removes deltas of sources no longer used when no view in any
+  metadata catalog consumes them. Native cleanup in the caller's catalog rolls
+  back with replacement. Cleanup in another native catalog runs after commit,
+  re-checks committed ownership, and is discarded on rollback.
 - Deltas of OpenIVM's own tables (a parent MV's publication) stay beside them.
 
 An MV in an external catalog other than DuckLake keeps its internal objects in the

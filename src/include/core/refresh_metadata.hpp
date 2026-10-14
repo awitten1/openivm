@@ -113,6 +113,8 @@ public:
 		string delta_schema_name;
 		string delta_table_name;
 	};
+	static bool HasSourceDeltaConsumers(Connection &con, const DeltaSource &source, const string &excluded_views = "",
+	                                    const string &excluded_metadata_table = "");
 
 	// Physical source-delta naming. Internal-schema deltas encode the source schema so that
 	// same-named sources of different schemas have different preferred names. CREATE allocates

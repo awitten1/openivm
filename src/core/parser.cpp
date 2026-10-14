@@ -164,10 +164,19 @@ static bool RelationExists(ClientContext &context, const string &catalog_name, c
 	return false;
 }
 
+static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshMetadata::DeltaSource> &sources,
+                                          const string &excluded_views, string &program,
+                                          const string &excluded_metadata_table = "");
+
 static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
                                                       unique_ptr<ParserExtensionParseData> parse_data, string &view_key,
                                                       string *metadata_catalog = nullptr,
                                                       string *metadata_schema = nullptr) {
+	// Allocation commits shared source deltas before the lifecycle program publishes
+	// ownership. Keep other CREATEs out of that interval, including explicit transactions.
+	// Native programs retain this gate until commit/rollback; the staged executor acquires
+	// its re-entrant guard before suspending the caller transaction.
+	TransactionalMVLockState::Get(context).AcquireMutationLock();
 	// CREATE MATERIALIZED VIEW stores a relation. Physical insertion order is not
 	// semantically observable unless users query with ORDER BY, so keep OpenIVM's
 	// whole execution path on DuckDB's lower-memory unordered mode.
@@ -183,6 +192,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// metadata there, or create it for a catalog's first materialized view.
 	RefreshMetadata::PrepareMetadataSchema(context, metadata_catalog_name, parse_data_ref.alter_sql.empty());
 	Connection con(*context.db.get());
+	TransactionalMVLockState::Get(*con.context)
+	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	RefreshMetadata::UseCatalog(context, con, metadata_catalog_name);
 	struct CreateMVPreProfileStep {
 		string step_name;
@@ -333,6 +344,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	bool staged_cross_catalog_replace = target_is_ducklake && parse_data_ref.is_replace;
 	auto replaced_auxiliary_tables =
 	    parse_data_ref.is_replace ? metadata.GetAuxiliaryTables(view_name) : vector<string>();
+	auto replaced_sources = parse_data_ref.is_replace
+	                            ? metadata.GetDeltaSources(view_name, view_target_catalog, view_target_schema)
+	                            : vector<RefreshMetadata::DeltaSource>();
 	if (staged_cross_catalog_replace &&
 	    IsSnapshotPublication(context, internal_target_catalog, internal_target_schema, view_name)) {
 		throw NotImplementedException("CREATE OR REPLACE is not supported for "
@@ -1796,6 +1810,40 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	                   "rows=" + to_string(metadata_ddl.size() + aux_metadata_ddl.size()));
 	ddl.insert(ddl.end(), metadata_ddl.begin(), metadata_ddl.end());
 	ddl.insert(ddl.end(), aux_metadata_ddl.begin(), aux_metadata_ddl.end());
+	// Snapshot physical placements before deleting old ownership. Retained sources
+	// still use the same delta; removed sources can be dropped only when no other
+	// view in any metadata catalog owns them. The mutation gate protects this check.
+	for (auto &old_source : replaced_sources) {
+		bool retained = false;
+		for (auto &source_entry : source_table_info) {
+			auto &source = source_entry.second;
+			retained |=
+			    StringUtil::CIEquals(old_source.catalog_name, source.catalog_name) &&
+			    StringUtil::CIEquals(old_source.schema_name, source.schema_name) &&
+			    StringUtil::CIEquals(RefreshMetadata::SourceTableName(old_source.table_name, old_source.catalog_name,
+			                                                          old_source.schema_name),
+			                         SqlUtils::DeltaName(source.table_name));
+		}
+		if (retained) {
+			continue;
+		}
+		string cleanup;
+		AppendUnusedSourceDropProgram(con, {old_source}, "'" + SqlUtils::EscapeValue(view_name) + "'", cleanup,
+		                              SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE));
+		if (cleanup.empty()) {
+			continue;
+		}
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Cleaning removed source delta %s after replacement of %s\n",
+		                    old_source.delta_table_name.c_str(), view_name.c_str());
+		if (!target_is_ducklake && StringUtil::CIEquals(view_target_catalog, default_db) &&
+		    !StringUtil::CIEquals(old_source.catalog_name, default_db)) {
+			// DuckDB cannot write two native catalogs in one transaction. Delete an
+			// external orphan only after publication commits; rollback discards it.
+			TransactionalMVLockState::Get(context).DeferUnusedSourceDeltaCleanup(old_source);
+		} else {
+			ddl.push_back(cleanup);
+		}
+	}
 	if (batch_ducklake_creation) {
 		add_profile_marker("create_mv_metadata_commit");
 		ddl.push_back("COMMIT");
@@ -1979,9 +2027,9 @@ static string QualifyDropMetadata(const string &program, const RefreshMetadata::
 }
 
 static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshMetadata::DeltaSource> &sources,
-                                          const string &excluded_views, string &program) {
+                                          const string &excluded_views, string &program,
+                                          const string &excluded_metadata_table) {
 	unordered_set<string> checked_sources;
-	auto delta_metadata_tables = RefreshMetadata::MetadataTables(con, openivm::DELTA_TABLES_TABLE);
 	for (auto &source : sources) {
 		if (source.catalog_type == "ducklake" || RefreshMetadata(con).IsMaterializedViewDelta(source)) {
 			continue;
@@ -1990,19 +2038,7 @@ static void AppendUnusedSourceDropProgram(Connection &con, const vector<RefreshM
 		if (!checked_sources.insert(identity).second) {
 			continue;
 		}
-		bool has_consumers = false;
-		for (auto &delta_metadata_table : delta_metadata_tables) {
-			auto remaining =
-			    con.Query("SELECT count(*) FROM " + delta_metadata_table + " WHERE " +
-			              RefreshMetadata::SourcePredicate(source.table_name, source.catalog_name, source.schema_name) +
-			              " AND view_name NOT IN (" + excluded_views + ")");
-			if (remaining->HasError()) {
-				throw CatalogException("OpenIVM could not verify delta-table consumers for '%s': %s", source.table_name,
-				                       remaining->GetError());
-			}
-			has_consumers |= remaining->GetValue(0, 0).GetValue<int64_t>() != 0;
-		}
-		if (!has_consumers) {
+		if (!RefreshMetadata::HasSourceDeltaConsumers(con, source, excluded_views, excluded_metadata_table)) {
 			// The physical delta may sit in an internal schema under a schema-qualified name.
 			program += "DROP TABLE IF EXISTS " +
 			           SqlUtils::FullName(source.catalog_name, source.delta_schema_name, source.delta_table_name) +

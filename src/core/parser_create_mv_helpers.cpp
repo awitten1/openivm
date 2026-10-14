@@ -251,7 +251,7 @@ static void InitializeSharedDDL(ClientContext &context, Connection &con, const s
 	if (initialized()) {
 		return;
 	}
-	// Only shared-table initialization is serialized, not MV planning or loading.
+	// Re-entrant when lifecycle planning already owns the publication gate.
 	MutationLockGuard guard(context);
 	if (initialized()) {
 		return;

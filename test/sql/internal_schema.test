@@ -6,6 +6,177 @@ require openivm
 
 load __TEST_DIR__/openivm_internal_schema.db
 
+# Replacement must retire removed-source deltas, preserve shared ownership even
+# in another metadata catalog, and roll back both ownership and physical cleanup.
+statement ok
+SET openivm_internal_schema = 'Replacement Internal';
+
+statement ok
+CREATE SCHEMA "Replacement Sources";
+CREATE TABLE "Replacement Sources".a(i INTEGER);
+CREATE TABLE "Replacement Sources".b(i INTEGER);
+INSERT INTO "Replacement Sources".a VALUES (1),(1),(2);
+INSERT INTO "Replacement Sources".b VALUES (3),(3),(4);
+
+statement ok
+CREATE MATERIALIZED VIEW replaced_source AS SELECT * FROM "Replacement Sources".a;
+
+statement ok
+BEGIN;
+CREATE OR REPLACE MATERIALIZED VIEW replaced_source AS SELECT * FROM "Replacement Sources".b;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Replacement Internal' AND table_name LIKE '%_a';
+----
+0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Replacement Internal' AND table_name LIKE '%_a';
+----
+1
+
+query I
+SELECT count(*) FROM ((SELECT * FROM replaced_source EXCEPT ALL SELECT * FROM "Replacement Sources".a)
+UNION ALL (SELECT * FROM "Replacement Sources".a EXCEPT ALL SELECT * FROM replaced_source));
+----
+0
+
+# Ownership added earlier in this transaction must be visible to cleanup checks.
+statement ok
+BEGIN;
+CREATE MATERIALIZED VIEW replacement_sibling AS SELECT * FROM "Replacement Sources".a;
+CREATE OR REPLACE MATERIALIZED VIEW replaced_source AS SELECT * FROM "Replacement Sources".b;
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Replacement Internal' AND table_name LIKE '%_a';
+----
+1
+
+statement ok
+DROP VIEW replacement_sibling;
+CREATE OR REPLACE MATERIALIZED VIEW replaced_source AS SELECT * FROM "Replacement Sources".a;
+
+statement ok
+ATTACH ':memory:' AS replacement_consumer;
+CREATE MATERIALIZED VIEW replacement_consumer.main.shared_source AS SELECT * FROM "Replacement Sources".a;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW replaced_source AS SELECT * FROM "Replacement Sources".b;
+
+# Another catalog still consumes a's existing physical delta.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema'
+AND schema_name='Replacement Internal' AND table_name LIKE '%_a';
+----
+1
+
+statement ok
+INSERT INTO "Replacement Sources".a VALUES (5),(5);
+DELETE FROM "Replacement Sources".a WHERE i=1;
+UPDATE "Replacement Sources".a SET i=6 WHERE i=2;
+INSERT INTO "Replacement Sources".b VALUES (5),(5);
+DELETE FROM "Replacement Sources".b WHERE i=3;
+UPDATE "Replacement Sources".b SET i=6 WHERE i=4;
+
+statement ok
+PRAGMA refresh('replacement_consumer.main.shared_source');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM replacement_consumer.main.shared_source EXCEPT ALL SELECT * FROM "Replacement Sources".a)
+UNION ALL (SELECT * FROM "Replacement Sources".a EXCEPT ALL SELECT * FROM replacement_consumer.main.shared_source));
+----
+0
+
+statement ok
+PRAGMA refresh('replaced_source');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM replaced_source EXCEPT ALL SELECT * FROM "Replacement Sources".b)
+UNION ALL (SELECT * FROM "Replacement Sources".b EXCEPT ALL SELECT * FROM replaced_source));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW replacement_consumer.main.shared_source AS SELECT * FROM "Replacement Sources".b;
+
+# Last consumer of a was replaced. Its external delta is cleaned after commit.
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema'
+AND schema_name='Replacement Internal' AND table_name LIKE '%_a';
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW replacement_sentinel AS SELECT * FROM "Replacement Sources".a;
+DROP VIEW replaced_source;
+
+statement ok
+BEGIN;
+CREATE OR REPLACE MATERIALIZED VIEW replacement_consumer.main.shared_source AS SELECT * FROM "Replacement Sources".a;
+ROLLBACK;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM replacement_consumer.main.shared_source EXCEPT ALL SELECT * FROM "Replacement Sources".b)
+UNION ALL (SELECT * FROM "Replacement Sources".b EXCEPT ALL SELECT * FROM replacement_consumer.main.shared_source));
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema'
+AND schema_name='Replacement Internal' AND table_name LIKE '%_b';
+----
+1
+
+# A later CREATE can reuse a delta scheduled for external cleanup in the same
+# transaction. Commit must re-check actual ownership before deleting that delta.
+statement ok
+BEGIN;
+CREATE OR REPLACE MATERIALIZED VIEW replacement_consumer.main.shared_source AS SELECT * FROM "Replacement Sources".a;
+CREATE MATERIALIZED VIEW replacement_consumer.main.reused_delta AS SELECT * FROM "Replacement Sources".b;
+COMMIT;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema'
+AND schema_name='Replacement Internal' AND table_name LIKE '%_b';
+----
+1
+
+statement ok
+INSERT INTO "Replacement Sources".b VALUES (8),(8),(9);
+DELETE FROM "Replacement Sources".b WHERE i=5;
+UPDATE "Replacement Sources".b SET i=10 WHERE i=6;
+
+statement ok
+PRAGMA refresh('replacement_consumer.main.reused_delta');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM replacement_consumer.main.reused_delta EXCEPT ALL SELECT * FROM "Replacement Sources".b)
+UNION ALL (SELECT * FROM "Replacement Sources".b EXCEPT ALL SELECT * FROM replacement_consumer.main.reused_delta));
+----
+0
+
+statement ok
+DROP VIEW replacement_consumer.main.reused_delta;
+DROP VIEW replacement_consumer.main.shared_source;
+DETACH replacement_consumer;
+DROP VIEW replacement_sentinel;
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Replacement Internal';
+----
+0
+
+statement ok
+DROP TABLE "Replacement Sources".a;
+DROP TABLE "Replacement Sources".b;
+DROP SCHEMA "Replacement Sources";
+DROP SCHEMA "Replacement Internal";
+SET openivm_internal_schema = '';
+
 # A view created before the setting keeps its tables beside it and its source.
 statement ok
 CREATE TABLE legacy_items (id INTEGER, grp VARCHAR, amount INTEGER);
