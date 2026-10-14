@@ -515,10 +515,17 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// that never reached the backing table would be emitted again by the cascading recovery.
 		bool atomic_ducklake_data =
 		    cross_system && !split_native && (split_protocol || probe_meta.HasDownstreamViews(vn));
+		// Source-delta cleanup that crosses a native write boundary. The split protocol runs it
+		// itself after the watermarks commit; any other refresh hands it to its data transaction,
+		// which runs it on commit. Only native data can produce it, and native data always runs
+		// in a transaction, so it is handed over exactly once here.
+		vector<string> post_watermark_cleanup;
 		if (!cross_system || delete_retry_plan.IsActive() || split_native || atomic_ducklake_data) {
 			exec_con.BeginTransaction();
 			tx_open = true;
-			if (!split_native) {
+			if (split_native) {
+				post_watermark_cleanup = std::move(deferred_cleanup);
+			} else {
 				TransactionalMVLockState::Get(*exec_con.context).DeferDeltaCleanup(std::move(deferred_cleanup));
 			}
 		}
@@ -791,13 +798,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 			profiler.AddStep("metadata_post_sql", meta_post_start, "bytes=" + to_string(meta_post_sql.size()));
 		}
-		if (split_native && !deferred_cleanup.empty()) {
+		if (!post_watermark_cleanup.empty()) {
 			// Housekeeping after the watermarks advanced: delete delta rows every consumer
 			// has committed. Failures only retain rows that later refreshes exclude.
 			Connection cleanup_con(*context.db.get());
 			TransactionalMVLockState::Get(*cleanup_con.context)
 			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
-			for (auto &cleanup : deferred_cleanup) {
+			for (auto &cleanup : post_watermark_cleanup) {
 				auto cleaned = cleanup_con.Query(cleanup);
 				if (cleaned->HasError()) {
 					Printer::Print("OpenIVM refresh committed; delta cleanup deferred: " + cleaned->GetError());
