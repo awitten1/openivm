@@ -257,22 +257,30 @@ def main(argv=None, connect=open_connection):
     parser.add_argument("--limit", type=int, default=0, help="Only process first N files (0 = all)")
     parser.add_argument("--dry-run", action="store_true", help="Don't update files, just report")
     parser.add_argument("--progress-every", type=int, default=50)
-    parser.add_argument("--metadata-schema", default=None,
-                        help="Schema holding openivm_views (default: auto-detect, normally main)")
+    parser.add_argument(
+        "--metadata-schema", default=None, help="Schema holding openivm_views (default: auto-detect, normally main)"
+    )
     args = parser.parse_args(argv)
 
     queries_dir = Path(args.queries_dir)
     files = sorted(queries_dir.glob("query_*.sql"))
     if args.limit:
-        files = files[:args.limit]
+        files = files[: args.limit]
 
     log(f"Validating {len(files)} query files...")
     log("Setting up in-memory DuckDB with openivm extension + TPC-C schema...")
     con = connect(args.extension_path)
     create_tpcc_schema(con)
 
-    stats = {"incremental": 0, "full_refresh": 0, "create_failed": 0, "metadata_failed": 0,
-             "was_correct": 0, "was_wrong": 0, "updated": 0}
+    stats = {
+        "incremental": 0,
+        "full_refresh": 0,
+        "create_failed": 0,
+        "metadata_failed": 0,
+        "was_correct": 0,
+        "was_wrong": 0,
+        "updated": 0,
+    }
     mismatches = []
     create_fail_reasons = {}
     metadata_fail_examples = []
@@ -296,7 +304,7 @@ def main(argv=None, connect=open_connection):
                 metadata_fail_examples.append((f.name, detail))
             continue
 
-        actual_incremental = (result == "incremental")
+        actual_incremental = result == "incremental"
         claimed_incremental = bool(metadata.get("is_incremental", False))
 
         if actual_incremental == claimed_incremental:
@@ -328,7 +336,9 @@ def main(argv=None, connect=open_connection):
             stats["updated"] += 1
 
         if idx % args.progress_every == 0 or idx == len(files):
-            log(f"  [{idx}/{len(files)}] incr={stats['incremental']} full={stats['full_refresh']} fail={stats['create_failed']} correct={stats['was_correct']} wrong={stats['was_wrong']}")
+            log(
+                f"  [{idx}/{len(files)}] incr={stats['incremental']} full={stats['full_refresh']} fail={stats['create_failed']} correct={stats['was_correct']} wrong={stats['was_wrong']}"
+            )
 
     log("")
     log("=" * 60)

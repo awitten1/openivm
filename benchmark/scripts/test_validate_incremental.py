@@ -41,8 +41,7 @@ def encoded_key(catalog: str, schema: str, name: str) -> str:
 
 
 class FakeOpenIVMConnection:
-    def __init__(self, metadata_schema="main", types=None, fail_create=(), legacy_columns=False,
-                 create_metadata=True):
+    def __init__(self, metadata_schema="main", types=None, fail_create=(), legacy_columns=False, create_metadata=True):
         self.con = duckdb.connect(":memory:")
         self.types = dict(types or {})
         self.fail_create = set(fail_create)
@@ -120,8 +119,7 @@ class ClassifyQueryTest(unittest.TestCase):
 
     def test_same_name_in_other_schema_is_not_confused(self):
         con = FakeOpenIVMConnection(types={"validate_mv": AGGREGATE_GROUP})
-        con.insert_view(encoded_key("memory", "other", "validate_mv2"), "validate_mv", FULL_REFRESH,
-                        schema="other")
+        con.insert_view(encoded_key("memory", "other", "validate_mv2"), "validate_mv", FULL_REFRESH, schema="other")
         self.assertEqual(vi.classify_query(con, "SELECT 1", "validate_mv"), ("incremental", "AGGREGATE_GROUP"))
 
     def test_ambiguous_identity_is_a_metadata_failure(self):
