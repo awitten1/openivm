@@ -121,6 +121,7 @@ static const vector<std::pair<string, string>> &MetadataTableDefinitions() {
 	                                  " source_schema varchar default null,"
 	                                  " source_table_id bigint default null,"
 	                                  " delta_schema varchar default null,"
+	                                  " delta_table_name varchar default null,"
 	                                  " primary key(view_name, table_name))"},
 	    {openivm::HISTORY_TABLE, "(view_name varchar, refresh_timestamp timestamp default "
 	                             "current_timestamp,"
@@ -221,6 +222,7 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_schema varchar default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_table_id bigint default null");
 	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "delta_schema varchar default null");
+	AddColumnIfNotExists(ddl, openivm::DELTA_TABLES_TABLE, deltas, "delta_table_name varchar default null");
 	ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) +
 	              " SET has_join = true WHERE has_join IS NULL AND (COALESCE(has_left_join, false) OR "
 	              "COALESCE(has_full_outer, false) OR view_name IN (SELECT view_name FROM " +
@@ -284,7 +286,7 @@ void InitializeMVMetadata(ClientContext &context, Connection &con, const string 
 	};
 	InitializeSharedDDL(context, con,
 	                    "SELECT v.view_sql_name, v.pending_after_hook, v.internal_schema, d.source_table_id, "
-	                    "d.delta_schema, h.mode, "
+	                    "d.delta_schema, d.delta_table_name, h.mode, "
 	                    "r.strategy, p.step_order, dep.edge_kind, m.query_hash, c.is_trusted FROM " +
 	                        table(openivm::VIEWS_TABLE) + " v, " + table(openivm::DELTA_TABLES_TABLE) + " d, " +
 	                        table(openivm::REFRESH_HOOKS_TABLE) + " h, " + table(openivm::HISTORY_TABLE) + " r, " +

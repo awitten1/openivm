@@ -115,10 +115,11 @@ public:
 	};
 
 	// Physical source-delta naming. Internal-schema deltas encode the source schema so that
-	// same-named sources of different schemas never collide.
+	// same-named sources of different schemas have different preferred names. CREATE allocates
+	// a free name if a legacy colocated delta occupies that name and persists the result.
 	static string InternalSourceDeltaName(const string &source_schema, const string &table);
 	static string SourceDeltaTableName(const string &source_schema, const string &table, const string &delta_schema);
-	// The source's delta table: beside it, or in any internal schema of its native catalog.
+	// The source's delta table, resolved through ownership metadata (including legacy rows).
 	// Requires an active transaction on `context`.
 	static optional_ptr<TableCatalogEntry> FindSourceDelta(ClientContext &context, const string &catalog,
 	                                                       const string &schema, const string &table);

@@ -332,6 +332,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	          " ADD COLUMN IF NOT EXISTS internal_schema VARCHAR DEFAULT NULL");
 	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS delta_schema VARCHAR DEFAULT NULL");
+	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
+	          " ADD COLUMN IF NOT EXISTS delta_table_name VARCHAR DEFAULT NULL");
 
 	// Migration: create refresh history table for learned cost model.
 	// Silently fails on fresh DB (core_functions not yet loaded → DEFAULT

@@ -82,10 +82,14 @@ so an explicit transaction's `ROLLBACK` removes them and a newly created `I`.
 `<key>` is an internal view key derived from the view's catalog, schema and name,
 so same-named views in different schemas or catalogs have separate internal
 objects. A source delta in an internal schema encodes its source schema in hex,
-so same-named sources of different schemas never collide there.
-`openivm_delta_tables` records each source's catalog and schema and, for moved
-deltas, the internal schema (`delta_schema`). `openivm_views.internal_schema`
-records where a view's internal tables live.
+so same-named sources of different schemas have different preferred names.
+When a preferred name is occupied (including by a legacy colocated delta),
+OpenIVM allocates a free name with an `__openivm_<number>` suffix. It checks source
+ownership before reusing an existing delta rather than adopting a table by name.
+`openivm_delta_tables` records each source's catalog and schema, the physical delta
+name (`delta_table_name`), and, for moved deltas, the internal schema (`delta_schema`).
+Older rows without a stored physical name retain their original naming rule.
+`openivm_views.internal_schema` records where a view's internal tables live.
 
 **Existing objects.** The setting applies to objects created while it is set.
 OpenIVM finds existing tables where they are, through `openivm_views.internal_schema`

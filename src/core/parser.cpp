@@ -1332,6 +1332,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		string table_name;
 	};
 	unordered_map<string, SourceDeltaPlacement> source_delta_placements;
+	unordered_set<string> allocated_source_deltas;
 	for (const auto &source_entry : source_table_info) {
 		if (dl_table_info.count(source_entry.first)) {
 			continue;
@@ -1353,7 +1354,20 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			    internal_schema_setting.empty() || internal_relation ? source.schema_name : internal_schema_setting;
 			placement.table_name =
 			    RefreshMetadata::SourceDeltaTableName(source.schema_name, source.table_name, placement.schema_name);
+			// Legacy colocated names can equal a moved source's encoded name. Never adopt
+			// an unowned relation; persist a free physical name instead. Also reserve names
+			// for other sources in this CREATE program, whose tables do not exist yet.
+			auto preferred = placement.table_name;
+			idx_t suffix = 0;
+			while (Catalog::GetEntry(context, CatalogType::TABLE_ENTRY, source.catalog_name, placement.schema_name,
+			                         placement.table_name, OnEntryNotFound::RETURN_NULL) ||
+			       allocated_source_deltas.count(StringUtil::Lower(
+			           SqlUtils::FullName(source.catalog_name, placement.schema_name, placement.table_name)))) {
+				placement.table_name = preferred + "__openivm_" + to_string(++suffix);
+			}
 		}
+		allocated_source_deltas.insert(
+		    StringUtil::Lower(SqlUtils::FullName(source.catalog_name, placement.schema_name, placement.table_name)));
 		source_delta_placements[source_entry.first] = placement;
 		OPENIVM_DEBUG_PRINT(
 		    "[CREATE MV] Source %s uses delta %s\n", source_entry.first.c_str(),
@@ -1373,7 +1387,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		string source_catalog_val = source.catalog_name;
 		string source_schema_val = source.schema_name;
 		string delta_schema_val = "null";
+		string delta_table_name_val = "null";
 		auto placement = source_delta_placements.find(source_entry.first);
+		if (placement != source_delta_placements.end()) {
+			delta_table_name_val = "'" + SqlUtils::EscapeSingleQuotes(placement->second.table_name) + "'";
+		}
 		if (placement != source_delta_placements.end() &&
 		    !StringUtil::CIEquals(placement->second.schema_name, source.schema_name)) {
 			delta_schema_val = "'" + SqlUtils::EscapeSingleQuotes(placement->second.schema_name) + "'";
@@ -1413,13 +1431,14 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		    snapshot_val + ", " + string(openivm::UTC_NOW_SQL) + ", '" +
 		    SqlUtils::EscapeSingleQuotes(source_catalog_val) + "', '" +
 		    SqlUtils::EscapeSingleQuotes(source_schema_val) + "', " + source_table_id_val + ", " + delta_schema_val +
-		    ")");
+		    ", " + delta_table_name_val + ")");
 	}
 	vector<string> source_metadata_ddl;
 	if (!source_metadata_values.empty()) {
 		source_metadata_ddl.push_back("insert or replace into " + string(openivm::DELTA_TABLES_TABLE) +
 		                              " (view_name, table_name, last_update, catalog_type, last_snapshot_id, "
-		                              "last_refresh_ts, source_catalog, source_schema, source_table_id, delta_schema) "
+		                              "last_refresh_ts, source_catalog, source_schema, source_table_id, delta_schema, "
+		                              "delta_table_name) "
 		                              "values " +
 		                              StringUtil::Join(source_metadata_values, ", "));
 	}

@@ -72,16 +72,10 @@ static unique_ptr<MaterializedQueryResult> DeltaWatermark(Connection &con, const
 	auto filter = " FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND " +
 	              RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(source.name), catalog, schema);
-	auto result = con.Query("SELECT last_update, delta_schema" + filter);
-	if (result->HasError()) {
-		result = con.Query("SELECT last_update, NULL" + filter); // Metadata without internal schemas.
-	}
-	string delta_schema;
-	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(1, 0).IsNull()) {
-		delta_schema = result->GetValue(1, 0).ToString();
-	}
-	delta_table_sql = SqlUtils::FullName(catalog, delta_schema.empty() ? schema : delta_schema,
-	                                     RefreshMetadata::SourceDeltaTableName(schema, source.name, delta_schema));
+	auto result = con.Query("SELECT last_update, table_name" + filter);
+	auto delta_key = !result->HasError() && result->RowCount() > 0 ? result->GetValue(1, 0).ToString()
+	                                                               : SqlUtils::DeltaName(source.name);
+	delta_table_sql = RefreshMetadata(con).ResolveDeltaQualifiedName(view_name, delta_key, catalog, schema);
 	return result;
 }
 
