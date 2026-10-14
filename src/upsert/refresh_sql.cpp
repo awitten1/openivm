@@ -497,9 +497,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	// physical default database.
 	bool target_is_native = !view_catalog_name.empty() && metadata.IsNativeCatalog(view_catalog_name);
 	bool split_native_metadata = cross_system && target_is_native;
-	// The database the split protocol's data transaction writes: source-delta cleanup of any
-	// other database, including a source stored in the metadata catalog, runs after step 3.
-	const string split_data_catalog = split_native_metadata ? view_catalog_name : string();
 	auto physical_default_db = MetadataLocator::PhysicalDefaultCatalog(*context.db);
 	if (!target_is_ducklake && !target_is_native && cross_system && !physical_default_db.empty() &&
 	    physical_default_db != "memory" && view_catalog_name != physical_default_db) {
@@ -507,6 +504,10 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		internal_schema_name = DEFAULT_SCHEMA;
 		internal_catalog_prefix = SqlUtils::QualifiedPrefix(physical_default_db, DEFAULT_SCHEMA);
 	}
+	// The database a cross-system data transaction writes. When the caller collects deferred
+	// cleanup, source-delta cleanup of any other database (a native source of a DuckLake view,
+	// or a source stored in the metadata catalog) is collected and runs after the watermarks.
+	const string cleanup_data_catalog = cross_system ? internal_catalog_name : string();
 	string data_table_bare = IncrementalTableNames::DataTableName(view_name);
 	string data_table = internal_catalog_prefix + KeywordHelper::WriteOptionallyQuoted(data_table_bare);
 	OPENIVM_DEBUG_PRINT("[UPSERT] Looking up delta view '%s' in catalog '%s.%s'\n",
@@ -649,7 +650,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			auto recovery_query =
 			    BuildRecomputeQuery(metadata, view_name, recovery_source_sql, cross_system, attached_db_catalog_name,
 			                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta,
-			                        deferred_cleanup, metadata_locations, split_data_catalog);
+			                        deferred_cleanup, metadata_locations, cleanup_data_catalog);
 			recovery_query += rebuild_distinct_aux();
 			string flag_update = "UPDATE " + views_metadata_table + " SET refresh_in_progress = ";
 			string flag_predicate = " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "';\n";
@@ -770,7 +771,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		auto recompute_query =
 		    BuildRecomputeQuery(metadata, view_name, recompute_source_sql, cross_system, attached_db_catalog_name,
 		                        attached_db_schema_name, internal_catalog_prefix, metadata_prefix, out_post_meta,
-		                        deferred_cleanup, metadata_locations, split_data_catalog);
+		                        deferred_cleanup, metadata_locations, cleanup_data_catalog);
 		recompute_query += rebuild_distinct_aux();
 		if (cross_system && out_pre_meta && out_post_meta) {
 			// A recomputed MV committed without its new watermarks would replay the old
@@ -1818,7 +1819,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		// another metadata database.
 		if (!cross_system || split_native_metadata) {
 			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(
-			    resolved, dt, delta_metadata_table, deferred_cleanup, metadata_locations, split_data_catalog);
+			    resolved, dt, delta_metadata_table, deferred_cleanup, metadata_locations, cleanup_data_catalog);
 		}
 	}
 	string set_in_progress = "UPDATE " + views_metadata_table + " SET refresh_in_progress = true WHERE view_name = '" +

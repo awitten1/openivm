@@ -136,7 +136,8 @@ catalogs, delete by key plus insert on PostgreSQL. If that restore itself fails,
    every consumer's committed watermark has passed, so a failure here retains rows that
    later refreshes ignore. Step 2 only reads source delta tables, so it writes one
    database even when a source is stored in the metadata catalog (for example a host view
-   over `control.main.<source>` with `control.openivm` metadata).
+   over `control.main.<source>` with `control.openivm` metadata) or a DuckLake view reads
+   a native source.
 
 Crash and retry semantics:
 
@@ -166,7 +167,8 @@ once:
   never applied.
 
 A non-native view with downstream views that read its delta table also runs its data
-statements in one transaction outside this protocol. Full recomputes take
+statements in one transaction outside this protocol, and likewise deletes consumed
+native source-delta rows only after its watermarks commit. Full recomputes take
 the same three steps, and recovery clears the marker only in step 3, together with the
 new watermarks. A view marked interrupted never uses the empty-delta shortcut.
 
@@ -306,6 +308,7 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 | Placement of metadata vs backing/delta tables, marker | `test/sql/metadata_location.test` |
 | Batched DML refresh, delta cleanup, profiles, history | `test/sql/metadata_location.test` |
 | Host view over a source in the metadata catalog: incremental and full refresh, source delta cleaned after the watermarks | `test/sql/metadata_location.test` |
+| DuckLake view over a native frontend source: crash after the data commit, recovery, forced full refresh, native source delta cleaned after the watermarks | `test/sql/metadata_location_ducklake.test` |
 | Explicit-transaction rejection (including RENAME COLUMN); atomic same-database schema | `test/sql/metadata_location.test` |
 | RENAME COLUMN restore after a failed ALTER; autocommit rename | `test/sql/metadata_location.test` |
 | Crash after intent, inside data transaction, after data commit; full recompute | `test/sql/metadata_location.test` (`openivm_test_fail_point`) |

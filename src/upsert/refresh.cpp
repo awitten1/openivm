@@ -400,7 +400,20 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// For cross_system (DuckLake or separately stored metadata) MVs, split the refresh SQL
 		// into data ops (MV catalog) and metadata ops to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
+		// Native refreshes are always transactional. DuckLake needs a data transaction for the
+		// exhaustive-delete attempt: a multiplicity mismatch rolls the attempt back before the
+		// ranked rowid program runs. Under the split protocol the data step is one transaction
+		// too, so a crash, a lost lease or a concurrent source change rolls it back instead of
+		// committing a partly refreshed backing table that downstream DuckLake views would read.
+		// Downstream views that read delta_<mv> need it as well: rows committed for a change
+		// that never reached the backing table would be emitted again by the cascading recovery.
+		bool atomic_ducklake_data =
+		    cross_system && !split_native && (split_protocol || probe_meta.HasDownstreamViews(vn));
+		// Source-delta cleanup outside the database the data transaction writes (or, for native
+		// data, outside the metadata catalog) is collected instead of inlined: one transaction
+		// cannot write two databases. Every data step that runs in a transaction collects it.
 		vector<string> deferred_cleanup;
+		bool collect_cleanup = !cross_system || split_native || atomic_ducklake_data;
 		RefreshCompileProfile compile_profile;
 		ProjectionDeleteRetryPlan delete_retry_plan;
 		auto generate_start = std::chrono::steady_clock::now();
@@ -410,7 +423,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
 		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr,
 		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan,
-		                       /*write_query_file=*/true, cross_system && !split_native ? nullptr : &deferred_cleanup);
+		                       /*write_query_file=*/true, collect_cleanup ? &deferred_cleanup : nullptr);
 		string fallback_sql;
 		// The fallback defers the same cleanup as the primary program, so it never writes
 		// outside the data catalog either.
@@ -425,7 +438,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			    cross_system ? &meta_post_sql : nullptr, /*compile_profile=*/nullptr, precomputed_delta_activity,
 			    /*out_adaptive_estimate=*/nullptr, /*facts=*/nullptr, /*metadata_connection=*/nullptr,
 			    /*delete_retry_plan=*/nullptr, /*write_query_file=*/false,
-			    cross_system && !split_native ? nullptr : &fallback_deferred_cleanup);
+			    collect_cleanup ? &fallback_deferred_cleanup : nullptr);
 		}
 		// The archived program is exactly what this refresh executes, in order: after a
 		// delete retry, the fallback that replaced the rolled-back attempt, and for
@@ -510,24 +523,15 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 			lease.Require(display_name);
 		}
-		// Native refreshes are always transactional. DuckLake needs a data transaction for the
-		// exhaustive-delete attempt: a multiplicity mismatch rolls the attempt back before the
-		// ranked rowid program runs. Under the split protocol the data step is one transaction
-		// too, so a crash, a lost lease or a concurrent source change rolls it back instead of
-		// committing a partly refreshed backing table that downstream DuckLake views would read.
-		// Downstream views that read delta_<mv> need it as well: rows committed for a change
-		// that never reached the backing table would be emitted again by the cascading recovery.
-		bool atomic_ducklake_data =
-		    cross_system && !split_native && (split_protocol || probe_meta.HasDownstreamViews(vn));
-		// Source-delta cleanup that crosses a native write boundary. The split protocol runs it
-		// itself after the watermarks commit; any other refresh hands it to its data transaction,
-		// which runs it on commit. Only native data can produce it, and native data always runs
-		// in a transaction, so it is handed over exactly once here.
+		// Collected cleanup is handed over exactly once here: every collecting refresh opens a
+		// data transaction. A cross-system refresh runs it itself after its watermarks commit,
+		// so it removes the rows this refresh consumed; a native refresh hands it to its data
+		// transaction, which runs it on commit together with the watermarks.
 		vector<string> post_watermark_cleanup;
-		if (!cross_system || delete_retry_plan.IsActive() || split_native || atomic_ducklake_data) {
+		if (collect_cleanup || delete_retry_plan.IsActive()) {
 			exec_con.BeginTransaction();
 			tx_open = true;
-			if (split_native) {
+			if (cross_system) {
 				post_watermark_cleanup = std::move(deferred_cleanup);
 			} else {
 				TransactionalMVLockState::Get(*exec_con.context).DeferDeltaCleanup(std::move(deferred_cleanup));
@@ -628,7 +632,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			                    static_cast<long long>(expected_delete_count));
 			exec_con.BeginTransaction();
 			tx_open = true;
-			if (!split_native) {
+			if (!cross_system) {
 				// The rollback discarded the cleanup handed to the first data transaction.
 				// post_watermark_cleanup survives it and already holds the same statements.
 				TransactionalMVLockState::Get(*exec_con.context)
