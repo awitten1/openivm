@@ -91,6 +91,15 @@ name (`delta_table_name`), and, for moved deltas, the internal schema (`delta_sc
 Older rows without a stored physical name retain their original naming rule.
 `openivm_views.internal_schema` records where a view's internal tables live.
 
+Stored original-SQL definitions qualify each source using the CREATE caller's
+catalog lookup and search path. This includes public parent-MV names, which differ
+from their physical publication tables, and individual same-named references in
+different schemas. Refresh and reopen therefore retain the original source
+identities even when the active schema is the native metadata schema. Legacy
+unqualified definitions use persisted source locations; if a bare name identifies
+multiple source locations, refresh reports the ambiguity and requests
+`CREATE OR REPLACE` with qualified sources instead of choosing one silently.
+
 **Existing objects.** The setting applies to objects created while it is set.
 OpenIVM finds existing tables where they are, through `openivm_views.internal_schema`
 and `openivm_delta_tables.delta_schema` (empty means beside the view or source), so

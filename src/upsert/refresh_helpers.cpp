@@ -1488,6 +1488,18 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
                                                 const string &attached_db_catalog_name,
                                                 const string &attached_db_schema_name) {
 	case_insensitive_map_t<RefreshMetadata::SourceLocation> locations;
+	case_insensitive_set_t ambiguous_names;
+	RefreshMetadata metadata(con);
+	auto add_location = [&](const string &name, const RefreshMetadata::SourceLocation &location) {
+		auto existing = locations.find(name);
+		if (existing != locations.end() &&
+		    (!StringUtil::CIEquals(existing->second.catalog_name, location.catalog_name) ||
+		     !StringUtil::CIEquals(existing->second.schema_name, location.schema_name))) {
+			ambiguous_names.insert(name);
+		} else {
+			locations[name] = location;
+		}
+	};
 	OPENIVM_DEBUG_PRINT("[UPSERT] Qualifying %zu sources for %s from one metadata snapshot\n", delta_sources.size(),
 	                    view_name.c_str());
 	for (auto &source : delta_sources) {
@@ -1505,7 +1517,14 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
 		}
 		string base_name =
 		    BaseTableNameFromDeltaKey(RefreshMetadata::SourceTableName(source.table_name, catalog_name, schema_name));
-		locations[base_name] = {catalog_name, schema_name};
+		add_location(base_name, {catalog_name, schema_name});
+		// Legacy original-SQL definitions can name a public parent MV while their delta
+		// metadata names its physical publication/backing relation in the internal schema.
+		auto owner = PublishedSourceViewName(base_name);
+		if (owner != base_name && !metadata.GetViewQuery(owner).empty()) {
+			auto public_name = metadata.GetViewSQLName(owner);
+			add_location(public_name, metadata.GetStoredViewLocation(owner, catalog_name, schema_name));
+		}
 	}
 	Parser parser(con.context->GetParserOptions());
 	parser.ParseQuery(view_query_sql);
@@ -1515,6 +1534,12 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
 		pins = openivm::TimeTravelPins::Peel(*con.context, *parser.statements.at(0), [&](BaseTableRef &ref) {
 			auto location = locations.find(ref.table_name);
 			if (location != locations.end() && ref.catalog_name.empty() && ref.schema_name.empty()) {
+				if (ambiguous_names.find(ref.table_name) != ambiguous_names.end()) {
+					throw BinderException(
+					    "OpenIVM cannot recover the schema of legacy unqualified source '%s' in '%s'; "
+					    "CREATE OR REPLACE the materialized view with qualified source names",
+					    ref.table_name, view_name);
+				}
 				ref.catalog_name = location->second.catalog_name;
 				ref.schema_name = location->second.schema_name;
 				qualified = true;

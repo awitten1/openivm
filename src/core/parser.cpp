@@ -266,12 +266,14 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	auto name_resolution_start = create_profile_now();
 	auto full_view_name = parse_data_ref.target_name;
-	// Keep the user's raw AS-query as the source of truth for original-SQL fallback.
+	// Keep the user's AS-query body as the source of truth for original-SQL fallback,
+	// qualifying its public source identities while the caller's search path is active.
 	// Do not recover this from DuckDB's parsed QueryNode::ToString(): that path is a
 	// best-effort pretty-printer and has segfaulted on set-operation query nodes with
 	// incomplete CTE/query internals. LPTS remains the normalized serializer below
 	// for supported logical plans; this string is only the safe fallback input.
-	auto original_view_query = SqlUtils::ExtractViewQuery(statement->query);
+	auto original_view_query =
+	    openivm::TimeTravelPins::QualifySources(context, SqlUtils::ExtractViewQuery(statement->query));
 
 	auto target = ResolveMaterializedViewTarget(context, full_view_name);
 	string view_catalog_prefix;

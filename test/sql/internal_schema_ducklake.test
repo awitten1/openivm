@@ -683,3 +683,224 @@ query I
 SELECT count(*) FROM internal_schema_host."Control Space".openivm_views;
 ----
 0
+
+# Original-SQL window fallback must retain each public source identity, rather than
+# reconstructing it from physical scan names while the metadata schema is selected.
+statement ok
+SET openivm_metadata_schema = 'Control Space';
+
+statement ok
+SET openivm_internal_schema = 'Lake Internal';
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+USE dl.s1;
+
+statement ok
+CREATE TABLE window_items (g INTEGER, x INTEGER);
+
+statement ok
+CREATE TABLE dl."Other Schema".window_items (g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO window_items VALUES (1,10),(1,20),(2,30);
+
+statement ok
+INSERT INTO dl."Other Schema".window_items VALUES (1,100),(2,200);
+
+statement ok
+CREATE MATERIALIZED VIEW "Window.Parent" AS SELECT g, x FROM window_items;
+
+statement ok
+CREATE MATERIALIZED VIEW window_child AS
+SELECT g, x, SUM(x) OVER (PARTITION BY g) AS total FROM "Window.Parent";
+
+# Emulate a database created before original-SQL sources were qualified. The
+# public parent name must be recovered from persisted physical-source metadata.
+statement ok
+CREATE MATERIALIZED VIEW window_legacy_child AS
+SELECT g, x, SUM(x) OVER (PARTITION BY g) AS total FROM "Window.Parent";
+
+statement ok
+UPDATE internal_schema_host."Control Space".openivm_views
+SET sql_string = 'SELECT g, x, SUM(x) OVER (PARTITION BY g) AS total FROM "Window.Parent"'
+WHERE view_sql_name = 'window_legacy_child';
+
+# A CTE reference must stay unqualified; only the two underlying table references bind.
+# Spaces/comments in qualified identifiers must not corrupt the original SQL spans.
+statement ok
+CREATE MATERIALIZED VIEW window_mixed AS
+WITH local_items AS (SELECT * FROM window_items)
+SELECT a.g, a.x, b.x AS other_x, SUM(a.x + b.x) OVER (PARTITION BY a.g) AS total
+FROM local_items a JOIN dl . "Other Schema" /* source */ . window_items b ON a.g = b.g;
+
+query I
+SELECT count(*) FROM internal_schema_host."Control Space".openivm_views WHERE view_sql_name IN ('window_child','window_legacy_child','window_mixed') AND type = 5;
+----
+3
+
+statement ok
+USE internal_schema_host."Control Space";
+
+statement ok
+INSERT INTO dl.s1.window_items VALUES (1,40),(1,40),(3,50);
+
+statement ok
+DELETE FROM dl.s1.window_items WHERE x = 20;
+
+statement ok
+UPDATE dl.s1.window_items SET x = 15 WHERE x = 10;
+
+statement ok
+INSERT INTO dl."Other Schema".window_items VALUES (1,150),(3,300);
+
+statement ok
+DELETE FROM dl."Other Schema".window_items WHERE x = 200;
+
+statement ok
+UPDATE dl."Other Schema".window_items SET x = 110 WHERE x = 100;
+
+statement ok
+PRAGMA refresh('dl.s1."Window.Parent"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1."Window.Parent" EXCEPT ALL SELECT g, x FROM dl.s1.window_items) UNION ALL (SELECT g, x FROM dl.s1.window_items EXCEPT ALL SELECT * FROM dl.s1."Window.Parent"));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.window_child');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.window_child EXCEPT ALL SELECT g, x, SUM(x) OVER (PARTITION BY g) FROM dl.s1."Window.Parent") UNION ALL (SELECT g, x, SUM(x) OVER (PARTITION BY g) FROM dl.s1."Window.Parent" EXCEPT ALL SELECT * FROM dl.s1.window_child));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.window_legacy_child');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.window_legacy_child EXCEPT ALL SELECT g, x, SUM(x) OVER (PARTITION BY g) FROM dl.s1."Window.Parent") UNION ALL (SELECT g, x, SUM(x) OVER (PARTITION BY g) FROM dl.s1."Window.Parent" EXCEPT ALL SELECT * FROM dl.s1.window_legacy_child));
+----
+0
+
+# Older metadata did not retain the CREATE search path. An ambiguous bare name
+# must fail explicitly, rather than allowing metadata row order to choose a source.
+statement ok
+CREATE TEMP TABLE saved_window_definition AS
+SELECT sql_string FROM internal_schema_host."Control Space".openivm_views WHERE view_sql_name = 'window_mixed';
+
+statement ok
+UPDATE internal_schema_host."Control Space".openivm_views
+SET sql_string = 'SELECT a.g, a.x, b.x AS other_x, SUM(a.x + b.x) OVER (PARTITION BY a.g) AS total FROM window_items a JOIN dl."Other Schema".window_items b ON a.g = b.g'
+WHERE view_sql_name = 'window_mixed';
+
+statement error
+PRAGMA refresh('dl.s1.window_mixed');
+----
+OpenIVM cannot recover the schema of legacy unqualified source 'window_items'
+
+statement ok
+UPDATE internal_schema_host."Control Space".openivm_views
+SET sql_string = (SELECT sql_string FROM saved_window_definition)
+WHERE view_sql_name = 'window_mixed';
+
+statement ok
+DROP TABLE saved_window_definition;
+
+statement ok
+PRAGMA refresh('dl.s1.window_mixed');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.window_mixed EXCEPT ALL SELECT a.g, a.x, b.x, SUM(a.x + b.x) OVER (PARTITION BY a.g) FROM dl.s1.window_items a JOIN dl."Other Schema".window_items b ON a.g = b.g) UNION ALL (SELECT a.g, a.x, b.x, SUM(a.x + b.x) OVER (PARTITION BY a.g) FROM dl.s1.window_items a JOIN dl."Other Schema".window_items b ON a.g = b.g EXCEPT ALL SELECT * FROM dl.s1.window_mixed));
+----
+0
+
+restart
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+# Settings have reset, and the caller now resolves unqualified names in a native schema.
+statement ok
+USE internal_schema_host.main;
+
+statement ok
+INSERT INTO dl.s1.window_items VALUES (2,60),(2,60),(3,70);
+
+statement ok
+DELETE FROM dl.s1.window_items WHERE x = 40;
+
+statement ok
+UPDATE dl.s1.window_items SET x = 25 WHERE x = 15;
+
+statement ok
+INSERT INTO dl."Other Schema".window_items VALUES (2,250),(3,350);
+
+statement ok
+DELETE FROM dl."Other Schema".window_items WHERE x = 150;
+
+statement ok
+UPDATE dl."Other Schema".window_items SET x = 120 WHERE x = 110;
+
+statement ok
+PRAGMA refresh('dl.s1."Window.Parent"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1."Window.Parent" EXCEPT ALL SELECT g, x FROM dl.s1.window_items) UNION ALL (SELECT g, x FROM dl.s1.window_items EXCEPT ALL SELECT * FROM dl.s1."Window.Parent"));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.window_child');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.window_child EXCEPT ALL SELECT g, x, SUM(x) OVER (PARTITION BY g) FROM dl.s1."Window.Parent") UNION ALL (SELECT g, x, SUM(x) OVER (PARTITION BY g) FROM dl.s1."Window.Parent" EXCEPT ALL SELECT * FROM dl.s1.window_child));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.window_legacy_child');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.window_legacy_child EXCEPT ALL SELECT g, x, SUM(x) OVER (PARTITION BY g) FROM dl.s1."Window.Parent") UNION ALL (SELECT g, x, SUM(x) OVER (PARTITION BY g) FROM dl.s1."Window.Parent" EXCEPT ALL SELECT * FROM dl.s1.window_legacy_child));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.window_mixed');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.window_mixed EXCEPT ALL SELECT a.g, a.x, b.x, SUM(a.x + b.x) OVER (PARTITION BY a.g) FROM dl.s1.window_items a JOIN dl."Other Schema".window_items b ON a.g = b.g) UNION ALL (SELECT a.g, a.x, b.x, SUM(a.x + b.x) OVER (PARTITION BY a.g) FROM dl.s1.window_items a JOIN dl."Other Schema".window_items b ON a.g = b.g EXCEPT ALL SELECT * FROM dl.s1.window_mixed));
+----
+0
+
+statement ok
+DROP VIEW dl.s1.window_child;
+
+statement ok
+DROP VIEW dl.s1.window_legacy_child;
+
+statement ok
+DROP VIEW dl.s1.window_mixed;
+
+statement ok
+DROP VIEW dl.s1."Window.Parent";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dl' AND schema_name = 'Lake Internal' AND starts_with(table_name, 'openivm_');
+----
+0
+
+query I
+SELECT count(*) FROM internal_schema_host."Control Space".openivm_views;
+----
+0
