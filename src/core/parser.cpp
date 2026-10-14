@@ -2198,6 +2198,9 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	if (drop.info->type != CatalogType::VIEW_ENTRY) {
 		throw InternalException("OpenIVM DROP rewrite expected DROP VIEW");
 	}
+	// Resolve ownership and shared-delta consumers under the same gate as CREATE.
+	// Retain it through native commit or the staged executor's re-entrant guard.
+	TransactionalMVLockState::Get(context).AcquireMutationLock();
 
 	string catalog_name = drop.info->catalog;
 	string schema_name = drop.info->schema;
@@ -2312,7 +2315,6 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		ExecuteStagedDDL(context, {Value(program)});
 		return "SELECT true AS Success";
 	}
-	TransactionalMVLockState::Get(context).AcquireMutationLock();
 	if (!context.transaction.IsAutoCommit()) {
 		// Helper replay shadows unqualified metadata tables; register the unqualified form.
 		auto &state = TransactionalMVMetadataState::Get(context);

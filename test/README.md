@@ -17,3 +17,9 @@ snapshot predates ownership publication, shared placement, transaction-local
 ownership reuse, and refresh bag equality. Run it from a
 fresh pinned build alongside `test/sql/internal_schema.test` and
 `test/sql/internal_schema_ducklake.test` for namespace lifecycle regression coverage.
+
+It also pauses a CREATE that reuses a committed view's source delta, waits until a
+competing DROP actually blocks on the mutation gate, then publishes the new view
+before allowing DROP to proceed. Native autocommit, explicit-transaction, and
+cross-catalog staged cleanup must preserve the surviving delta, capture batched
+INSERT/DELETE/UPDATE operations, and refresh to full bag equality in both directions.

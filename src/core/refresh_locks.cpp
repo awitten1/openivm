@@ -16,7 +16,9 @@ void MutationGate::Lock(const void *owner) {
 		depth++;
 		return;
 	}
+	waiting_owners++;
 	condition.wait(guard, [&]() { return active_owner == nullptr; });
+	waiting_owners--;
 	active_owner = owner;
 	depth = 1;
 }

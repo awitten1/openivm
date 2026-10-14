@@ -31,10 +31,13 @@ public:
 	void Unlock(const void *owner);
 
 private:
+	friend class MutationGateTestAccess;
 	mutex lock;
 	std::condition_variable condition;
 	const void *active_owner = nullptr;
 	idx_t depth = 0;
+	// Integration tests synchronize on an actual wait without timing the caller.
+	idx_t waiting_owners = 0;
 };
 
 class RefreshLocks {

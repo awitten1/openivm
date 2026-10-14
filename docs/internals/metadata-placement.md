@@ -122,6 +122,9 @@ nothing has to be moved by hand:
   on it keep reading the same tables. Drop and recreate a view to move it.
 - Source-delta allocation and ownership publication share the mutation gate, so
   concurrent CREATEs cannot allocate separate deltas for the same source.
+- DROP acquires that gate before resolving ownership or checking remaining
+  consumers and retains it through cleanup and commit, including staged cleanup.
+  A concurrent CREATE's newly published ownership therefore protects its delta.
 - Replacement removes deltas of sources no longer used when no view in any
   metadata catalog consumes them. Native cleanup in the caller's catalog rolls
   back with replacement. Cleanup in another native catalog runs after commit,
