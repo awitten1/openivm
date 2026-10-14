@@ -2,6 +2,7 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/parser/parser.hpp"
 
 #include <cctype>
 #include <cstring>
@@ -480,15 +481,20 @@ string SqlUtils::ExtractViewQuery(string &query) {
 
 string SqlUtils::SQLToLowercase(const string &sql) {
 	std::stringstream lowercase_stream;
-	bool in_string = false;
+	// Quoted identifiers carry physical catalog/schema identities. Folding them
+	// can select a different metadata catalog even though DuckDB binds the name.
+	char quote = '\0';
 	for (char c : sql) {
-		if (c == '\'') {
-			in_string = !in_string;
-		}
-		if (!in_string) {
-			lowercase_stream << (char)tolower(c);
-		} else {
+		if (quote) {
 			lowercase_stream << c;
+			if (c == quote) {
+				quote = '\0';
+			}
+		} else if (c == '\'' || c == '"') {
+			quote = c;
+			lowercase_stream << c;
+		} else {
+			lowercase_stream << StringUtil::CharacterToLower(c);
 		}
 	}
 	return lowercase_stream.str();
@@ -528,72 +534,18 @@ void SqlUtils::StripLineComments(string &query) {
 vector<string> SqlUtils::SplitSQLStatements(const string &sql) {
 	vector<string> statements;
 	idx_t start = 0;
-	bool in_single_quote = false;
-	bool in_double_quote = false;
-	bool in_line_comment = false;
-	bool in_block_comment = false;
-
-	for (idx_t i = 0; i < sql.size(); i++) {
-		auto c = sql[i];
-		auto next = i + 1 < sql.size() ? sql[i + 1] : '\0';
-
-		if (in_line_comment) {
-			if (c == '\n') {
-				in_line_comment = false;
-			}
+	// Match DuckDB's own statement splitting, including dollar-quoted strings
+	// and nested comments, rather than maintaining a second SQL lexer.
+	for (auto &token : Parser::Tokenize(sql)) {
+		if (token.type != SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR || sql[token.start] != ';') {
 			continue;
 		}
-		if (in_block_comment) {
-			if (c == '*' && next == '/') {
-				in_block_comment = false;
-				i++;
-			}
-			continue;
+		auto statement = TrimSQLFragment(sql.substr(start, token.start - start));
+		if (!statement.empty()) {
+			statements.push_back(std::move(statement));
 		}
-		if (in_single_quote) {
-			if (c == '\'' && next == '\'') {
-				i++;
-			} else if (c == '\'') {
-				in_single_quote = false;
-			}
-			continue;
-		}
-		if (in_double_quote) {
-			if (c == '"' && next == '"') {
-				i++;
-			} else if (c == '"') {
-				in_double_quote = false;
-			}
-			continue;
-		}
-
-		if (c == '-' && next == '-') {
-			in_line_comment = true;
-			i++;
-			continue;
-		}
-		if (c == '/' && next == '*') {
-			in_block_comment = true;
-			i++;
-			continue;
-		}
-		if (c == '\'') {
-			in_single_quote = true;
-			continue;
-		}
-		if (c == '"') {
-			in_double_quote = true;
-			continue;
-		}
-		if (c == ';') {
-			auto statement = TrimSQLFragment(sql.substr(start, i - start));
-			if (!statement.empty()) {
-				statements.push_back(std::move(statement));
-			}
-			start = i + 1;
-		}
+		start = token.start + 1;
 	}
-
 	auto statement = TrimSQLFragment(sql.substr(start));
 	if (!statement.empty()) {
 		statements.push_back(std::move(statement));

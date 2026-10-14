@@ -4,21 +4,16 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
-#include "core/published_view.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "rules/transactional_delta_capture.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/database_modification_type.hpp"
-#include "duckdb/main/client_data.hpp"
 #include "duckdb/main/connection.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
-#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
@@ -127,40 +122,6 @@ static void RegisterMetadataRestore(ClientContext &context, Connection &con, con
 	}
 }
 
-static void ExecuteHelperMetadataSQL(Connection &con, const string &sql) {
-	auto result = con.Query(sql);
-	if (result->HasError()) {
-		throw CatalogException("OpenIVM metadata update failed: %s", result->GetError());
-	}
-}
-
-static void DropCatalogEntry(ClientContext &context, const string &catalog_name, const string &schema_name,
-                             const string &entry_name, CatalogType type) {
-	DropInfo info;
-	info.type = type;
-	info.catalog = catalog_name;
-	info.schema = schema_name;
-	info.name = entry_name;
-	info.if_not_found = OnEntryNotFound::RETURN_NULL;
-	auto &catalog = Catalog::GetCatalog(context, catalog_name);
-	MetaTransaction::Get(context).ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::DROP_CATALOG_ENTRY);
-	catalog.DropEntry(context, info);
-}
-
-static void DropQualifiedCatalogEntry(ClientContext &context, const string &qualified_name,
-                                      const string &fallback_catalog, const string &fallback_schema, CatalogType type) {
-	auto components = SqlUtils::ParseQualifiedIdentifier(qualified_name);
-	if (components.size() == 1) {
-		DropCatalogEntry(context, fallback_catalog, fallback_schema, components[0], type);
-	} else if (components.size() == 2) {
-		DropCatalogEntry(context, fallback_catalog, components[0], components[1], type);
-	} else if (components.size() == 3) {
-		DropCatalogEntry(context, components[0], components[1], components[2], type);
-	} else {
-		throw InternalException("OpenIVM could not resolve internal relation '%s'", qualified_name);
-	}
-}
-
 static void AlterDeltaInCallerTransaction(ClientContext &context, AlterTableInfo &source_alter,
                                           const string &catalog_name, const string &schema_name,
                                           const string &delta_name) {
@@ -171,98 +132,6 @@ static void AlterDeltaInCallerTransaction(ClientContext &context, AlterTableInfo
 	auto &catalog = Catalog::GetCatalog(context, catalog_name);
 	MetaTransaction::Get(context).ModifyDatabase(catalog.GetAttached(), DatabaseModificationType::ALTER_TABLE);
 	catalog.Alter(context, *delta_alter);
-}
-
-static pair<string, string> ResolveDDLLocus(ClientContext &context, const string &catalog_name,
-                                            const string &schema_name) {
-	auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-	string default_catalog =
-	    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
-	return {
-	    catalog_name.empty() ? default_catalog : catalog_name,
-	    schema_name.empty() ? (default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema) : schema_name,
-	};
-}
-
-static bool SameRelationLocus(const string &left_catalog, const string &left_schema, const string &right_catalog,
-                              const string &right_schema) {
-	return StringUtil::CIEquals(left_catalog, right_catalog) && StringUtil::CIEquals(left_schema, right_schema);
-}
-
-static string MVInternalPrefix(ClientContext &context, const RefreshMetadata::StoredViewLocation &location,
-                               const string &view_name, const string &sql_name, const string &internal_schema) {
-	if (!internal_schema.empty()) {
-		return SqlUtils::QualifiedPrefix(location.catalog_name, internal_schema);
-	}
-	QueryErrorContext error_context;
-	auto entry = Catalog::GetEntry(context, location.catalog_name, location.schema_name,
-	                               EntryLookupInfo(CatalogType::VIEW_ENTRY, sql_name, error_context),
-	                               OnEntryNotFound::RETURN_NULL);
-	if (entry) {
-		auto data_table = IncrementalTableNames::DataTableName(view_name);
-		auto &view = dynamic_cast<ViewCatalogEntry &>(*entry);
-		auto data_ref = SqlUtils::FindTableReference(view.sql, data_table);
-		auto separator = data_ref.rfind('.');
-		if (separator != string::npos) {
-			return data_ref.substr(0, separator + 1);
-		}
-	}
-	return SqlUtils::QualifiedPrefix(location.catalog_name, location.schema_name);
-}
-
-static void DropTrackedMaterializedView(ClientContext &context, Connection &con, RefreshMetadata &metadata,
-                                        const string &view_name, bool drop_user_view) {
-	auto location = metadata.GetStoredViewLocation(view_name);
-	auto delta_sources = metadata.GetDeltaSources(view_name, location.catalog_name, location.schema_name);
-	auto sql_name = metadata.GetViewSQLName(view_name);
-	auto auxiliary_tables = metadata.GetAuxiliaryTables(view_name);
-	auto internal_prefix =
-	    MVInternalPrefix(context, location, view_name, sql_name, metadata.GetInternalSchema(view_name));
-	auto escaped_view_name = SqlUtils::EscapeValue(view_name);
-	auto view_predicate = "view_name = '" + escaped_view_name + "'";
-	RegisterMetadataRestore(context, con, openivm::VIEWS_TABLE, view_predicate);
-	RegisterMetadataRestore(context, con, openivm::DELTA_TABLES_TABLE, view_predicate);
-	auto dependency_predicate = "parent_view = '" + escaped_view_name + "' OR child_view = '" + escaped_view_name + "'";
-	RegisterMetadataRestore(context, con, openivm::MV_DEPS_TABLE, dependency_predicate);
-	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                                  escaped_view_name + "'");
-	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	                                  escaped_view_name + "'");
-	ExecuteHelperMetadataSQL(con, "DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE " + dependency_predicate);
-	if (drop_user_view) {
-		DropCatalogEntry(context, location.catalog_name, location.schema_name, sql_name, CatalogType::VIEW_ENTRY);
-	}
-	DropQualifiedCatalogEntry(context,
-	                          internal_prefix + KeywordHelper::WriteOptionallyQuoted(SqlUtils::DeltaName(view_name)),
-	                          location.catalog_name, location.schema_name, CatalogType::TABLE_ENTRY);
-	DropQualifiedCatalogEntry(context,
-	                          internal_prefix +
-	                              KeywordHelper::WriteOptionallyQuoted(IncrementalTableNames::DataTableName(view_name)),
-	                          location.catalog_name, location.schema_name, CatalogType::TABLE_ENTRY);
-
-	for (auto &name : {PublishedViewName(view_name), SqlUtils::DeltaName(PublishedViewName(view_name))}) {
-		DropQualifiedCatalogEntry(context, internal_prefix + SqlUtils::QuoteIdentifier(name), location.catalog_name,
-		                          location.schema_name, CatalogType::TABLE_ENTRY);
-	}
-
-	for (auto &aux_table : auxiliary_tables) {
-		DropQualifiedCatalogEntry(context, internal_prefix + SqlUtils::QuoteIdentifier(aux_table),
-		                          location.catalog_name, location.schema_name, CatalogType::TABLE_ENTRY);
-	}
-
-	for (auto &source : delta_sources) {
-		// DuckLake entries store the base table name — never drop it.
-		if (source.catalog_type == "ducklake" || metadata.IsMaterializedViewDelta(source)) {
-			continue;
-		}
-		auto remaining =
-		    con.Query("SELECT count(*) FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-		              RefreshMetadata::SourcePredicate(source.table_name, source.catalog_name, source.schema_name));
-		if (!remaining->HasError() && remaining->RowCount() > 0 && remaining->GetValue(0, 0).GetValue<int64_t>() == 0) {
-			DropCatalogEntry(context, source.catalog_name, source.delta_schema_name, source.delta_table_name,
-			                 CatalogType::TABLE_ENTRY);
-		}
-	}
 }
 
 static optional_ptr<TableCatalogEntry> TryGetTrackedDeltaTable(ClientContext &context, TableCatalogEntry &table) {
@@ -379,69 +248,6 @@ RefreshInsertRule::RefreshInsertRule() {
 void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input,
                                                   duckdb::unique_ptr<LogicalOperator> &plan) {
 	auto root = plan.get();
-
-	// Handle DROP TABLE/VIEW: clean up IVM metadata if the dropped object is an IVM view
-	if (root->type == LogicalOperatorType::LOGICAL_DROP) {
-		auto *simple = dynamic_cast<LogicalSimple *>(root);
-		if (!simple) {
-			return;
-		}
-		auto *drop_info = dynamic_cast<DropInfo *>(simple->info.get());
-		if (!drop_info || (drop_info->type != CatalogType::TABLE_ENTRY && drop_info->type != CatalogType::VIEW_ENTRY)) {
-			return;
-		}
-
-		auto table_name = drop_info->name;
-		auto target_locus = ResolveDDLLocus(input.context, drop_info->catalog, drop_info->schema);
-		Connection con(*input.context.db);
-		RefreshMetadata::UseCatalog(input.context, con, target_locus.first);
-
-		auto view_check = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-		                            SqlUtils::EscapeValue(table_name) + "'");
-		if (!view_check->HasError() && view_check->RowCount() > 0) {
-			RefreshMetadata metadata(con);
-			auto location = metadata.GetStoredViewLocation(table_name);
-			if (SameRelationLocus(location.catalog_name, location.schema_name, target_locus.first,
-			                      target_locus.second)) {
-				TransactionalMVLockState::Get(input.context).AcquireMutationLock();
-				OPENIVM_DEBUG_PRINT("[INSERT RULE] DROP TABLE '%s' — cleaning up IVM metadata\n", table_name.c_str());
-				bool drop_user_view = drop_info->type == CatalogType::VIEW_ENTRY;
-				DropTrackedMaterializedView(input.context, con, metadata, table_name, drop_user_view);
-				if (drop_user_view) {
-					// The original logical DROP remains as an idempotent no-op.
-					drop_info->if_not_found = OnEntryNotFound::RETURN_NULL;
-				}
-			}
-		}
-
-		// Handle CASCADE: drop dependent MVs
-		auto dep_check = con.Query(
-		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-		    RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(table_name), target_locus.first, target_locus.second));
-		if (!dep_check->HasError() && dep_check->RowCount() > 0 && drop_info->cascade) {
-			TransactionalMVLockState::Get(input.context).AcquireMutationLock();
-			RefreshMetadata cascade_metadata(con);
-			vector<string> dependent_views;
-			unordered_set<string> seen_dependents;
-			for (size_t i = 0; i < dep_check->RowCount(); i++) {
-				auto direct_view = dep_check->GetValue(0, i).ToString();
-				auto downstream = cascade_metadata.GetDownstreamViews(direct_view);
-				for (auto it = downstream.rbegin(); it != downstream.rend(); ++it) {
-					if (seen_dependents.insert(*it).second) {
-						dependent_views.push_back(*it);
-					}
-				}
-				if (seen_dependents.insert(direct_view).second) {
-					dependent_views.push_back(std::move(direct_view));
-				}
-			}
-			for (auto &dep_view : dependent_views) {
-				DropTrackedMaterializedView(input.context, con, cascade_metadata, dep_view, true);
-			}
-		}
-
-		return;
-	}
 
 	// Handle ALTER TABLE: sync delta table schema or block if referenced column is affected
 	if (root->type == LogicalOperatorType::LOGICAL_ALTER) {

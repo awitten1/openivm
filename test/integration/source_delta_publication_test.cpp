@@ -1,10 +1,18 @@
 #include "duckdb.hpp"
 #include "core/parser.hpp"
+#include "core/parser_create_mv_helpers.hpp"
 #include "core/parser_ddl.hpp"
+#include "core/published_view.hpp"
+#include "compile_facts.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/parser/statement/logical_plan_statement.hpp"
+#include "duckdb/planner/binder.hpp"
+#include "rules/column_hider.hpp"
 
 #include <chrono>
 #include <future>
@@ -37,13 +45,28 @@ public:
 using namespace duckdb;
 
 static void Execute(Connection &con, const string &sql) {
+	// Flush before execution so a coordinator timeout identifies the blocked
+	// operation even when the query never returns an error or result.
+	std::cerr << "START " << SqlUtils::SQLStatementPreview(sql) << std::endl;
 	auto result = con.Query(sql);
 	if (result->HasError()) {
-		throw InvalidInputException(result->GetError());
+		throw InvalidInputException("Lifecycle SQL failed: %s\nSQL: %s", result->GetError(), sql);
+	}
+	std::cerr << "DONE " << SqlUtils::SQLStatementPreview(sql) << std::endl;
+}
+
+static void TestQuotedNamespaceNormalization() {
+	const string sql = "CREATE MATERIALIZED VIEW \"Peer'Catalog\".\"Schema\"\"Name\".\"View.Name\" "
+	                   "AS SELECT 'String''Value' AS \"Column'Name\";";
+	const string expected = "create materialized view \"Peer'Catalog\".\"Schema\"\"Name\".\"View.Name\" "
+	                        "as select 'String''Value' as \"Column'Name\";";
+	if (SqlUtils::SQLToLowercase(sql) != expected) {
+		throw InvalidInputException("CREATE normalization changed a quoted namespace or literal");
 	}
 }
 
 static void TestPublication(bool explicit_transaction) {
+	std::cerr << "CASE publication explicit_transaction=" << explicit_transaction << std::endl;
 	DuckDB db(nullptr);
 	Connection first(db), second(db), observer(db);
 	Execute(first, "LOAD openivm; SET openivm_disable_daemon=true; "
@@ -117,6 +140,8 @@ static void TestPublication(bool explicit_transaction) {
 }
 
 static void TestDropDuringPublication(bool explicit_transaction, bool staged_drop) {
+	std::cerr << "CASE drop during publication explicit_transaction=" << explicit_transaction
+	          << " staged_drop=" << staged_drop << std::endl;
 	DuckDB db(nullptr);
 	Connection creator(db), dropper(db), observer(db);
 	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; "
@@ -184,9 +209,204 @@ static void TestDropDuringPublication(bool explicit_transaction, bool staged_dro
 	                  "THEN error('CREATE versus DROP MV bag mismatch') ELSE true END;");
 }
 
+// Lookup must finish after schema enumeration releases its lock, and preserve
+// source identity when metadata, source and physical delta have different schemas.
+static void TestSourceDeltaLookup() {
+	std::cerr << "CASE source delta lookup across schemas" << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Source.Space\"; CREATE TABLE main.items(i INTEGER); "
+	               "CREATE TABLE \"Source.Space\".items(i INTEGER);");
+	Execute(owner, "CREATE MATERIALIZED VIEW main_mv AS SELECT * FROM main.items;");
+	Execute(owner, "CREATE MATERIALIZED VIEW quoted_mv AS SELECT * FROM \"Source.Space\".items;");
+	owner.context->RunFunctionInTransaction([&]() {
+		for (const auto &schema : vector<string> {"main", "Source.Space"}) {
+			auto delta = RefreshMetadata::FindSourceDelta(*owner.context, "memory", schema, "items");
+			if (!delta || delta->schema.name != "Internal Space" ||
+			    delta->name != RefreshMetadata::InternalSourceDeltaName(schema, "items")) {
+				throw InvalidInputException("Source delta lookup lost its qualified physical identity");
+			}
+		}
+		if (RefreshMetadata::FindSourceDelta(*owner.context, "memory", "Control.Space", "items")) {
+			throw InvalidInputException("Source delta lookup reused another schema's same-named source");
+		}
+	});
+	const vector<pair<string, string>> views = {{"main_mv", "main.items"}, {"quoted_mv", "\"Source.Space\".items"}};
+	for (auto &view : views) {
+		Execute(owner, "INSERT INTO " + view.second + " VALUES (1),(1),(2),(3); DELETE FROM " + view.second +
+		                   " WHERE i=1; UPDATE " + view.second + " SET i=4 WHERE i=2; INSERT INTO " + view.second +
+		                   " VALUES (1),(4),(5); DELETE FROM " + view.second + " WHERE i=5;");
+		Execute(owner, "PRAGMA refresh('" + view.first + "');");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view.first + " EXCEPT ALL SELECT * FROM " +
+		                   view.second + ") OR EXISTS (SELECT * FROM " + view.second + " EXCEPT ALL SELECT * FROM " +
+		                   view.first + ") THEN error('Source delta lookup MV bag mismatch') ELSE true END;");
+	}
+}
+
+// Exercise initialization as well as discovery: upgrading a committed registry
+// must not pin the caller's catalog snapshot before the helper's DDL commits.
+// Explicit transactions instead own the upgrade and new schemas until commit.
+static void TestSharedMetadataUpgrade(bool explicit_transaction, bool commit) {
+	std::cerr << "CASE shared metadata upgrade explicit_transaction=" << explicit_transaction << " commit=" << commit
+	          << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Control.Space\"; CREATE TABLE source(i INTEGER); "
+	               "INSERT INTO source VALUES (1),(1),(2);");
+	auto registry = SqlUtils::FullName("memory", "Control.Space", openivm::VIEWS_TABLE);
+	Execute(owner, CreateMetadataTableSQL(openivm::VIEWS_TABLE, registry) + "; ALTER TABLE " + registry +
+	                   " DROP COLUMN internal_schema;");
+	if (explicit_transaction) {
+		Execute(owner, "BEGIN;");
+	}
+	Execute(owner, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	if (explicit_transaction) {
+		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	}
+	if (!commit) {
+		Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true "
+		               "ELSE error('Rolled-back initialization retained its schema or column') END FROM ("
+		               "SELECT 1 FROM duckdb_schemas() WHERE schema_name='Internal Space' UNION ALL "
+		               "SELECT 1 FROM information_schema.columns WHERE table_schema='Control.Space' "
+		               "AND table_name='openivm_views' AND column_name='internal_schema');");
+		// The same old registry must also upgrade after rollback, without manual repair.
+		Execute(owner, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	}
+	Execute(owner, "INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
+	               "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (1),(4),(5); "
+	               "DELETE FROM source WHERE i=5;");
+	Execute(owner, "PRAGMA refresh('mv');");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM mv EXCEPT ALL SELECT * FROM source) "
+	               "OR EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM mv) "
+	               "THEN error('Upgraded registry MV bag mismatch') ELSE true END;");
+	Execute(owner, "DROP VIEW mv;");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Upgraded registry cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
+// Source planning changes the helper's search path without changing its selected
+// metadata location. Probe both durable ownership and transaction-local shadows.
+static void TestDeltaOwnershipSearchPath(bool replay) {
+	std::cerr << "CASE delta ownership search path replay=" << replay << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db), helper(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Source.Space\"; CREATE TABLE \"Source.Space\".source(i INTEGER); "
+	               "INSERT INTO \"Source.Space\".source VALUES (1),(1),(2); "
+	               "CREATE MATERIALIZED VIEW mv AS SELECT * FROM \"Source.Space\".source; "
+	               "ATTACH ':memory:' AS \"Probe.Peer\"; CREATE SCHEMA \"Probe.Peer\".\"Source.Space\";");
+	RefreshMetadata::UseCatalog(*owner.context, helper, "memory");
+	auto key = RefreshMetadata(helper).FindViewKey("memory", "main", "mv");
+	auto sources = RefreshMetadata(helper).GetDeltaSources(key, "memory", "main");
+	if (sources.size() != 1) {
+		throw InvalidInputException("Ownership search-path fixture must have one source");
+	}
+	if (replay) {
+		Execute(owner, "BEGIN; CREATE MATERIALIZED VIEW sibling AS SELECT * FROM \"Source.Space\".source;");
+		TransactionalMVMetadataState::Get(*owner.context).Apply(helper);
+	}
+	Execute(helper, "USE \"Probe.Peer\".\"Source.Space\";");
+	RefreshMetadata::DeltaSource view_delta;
+	view_delta.table_name = SqlUtils::DeltaName(key);
+	view_delta.catalog_name = "memory";
+	view_delta.schema_name = "Internal Space";
+	if (!RefreshMetadata(helper).IsMaterializedViewDelta(view_delta) ||
+	    RefreshMetadata(helper).IsMaterializedViewDelta(sources[0])) {
+		throw InvalidInputException("Delta owner lookup followed the source search path");
+	}
+	// Inspect this helper's selected registry directly, as commit-time cleanup does.
+	// In the replay case only the shadow contains the uncommitted sibling.
+	auto registry = RefreshMetadata::MetadataTable(helper, openivm::DELTA_TABLES_TABLE);
+	if (!RefreshMetadata::HasSourceDeltaConsumers(helper, sources[0]) ||
+	    RefreshMetadata::HasSourceDeltaConsumers(helper, sources[0], nullptr, {{registry, Value(key).ToSQLString()}}) !=
+	        replay) {
+		throw InvalidInputException("Delta consumer lookup lost durable or replay ownership");
+	}
+	Execute(helper, "SELECT CASE WHEN current_database()='Probe.Peer' AND current_schema()='Source.Space' "
+	                "THEN true ELSE error('Ownership inspection changed the helper search path') END;");
+	if (replay) {
+		Execute(owner, "ROLLBACK;");
+	}
+	Execute(owner, "INSERT INTO \"Source.Space\".source VALUES (1),(2),(3),(3); "
+	               "DELETE FROM \"Source.Space\".source WHERE i=1; "
+	               "UPDATE \"Source.Space\".source SET i=4 WHERE i=2;");
+	Execute(owner, "PRAGMA refresh('mv');");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM mv EXCEPT ALL SELECT * FROM \"Source.Space\".source) "
+	               "OR EXISTS (SELECT * FROM \"Source.Space\".source EXCEPT ALL SELECT * FROM mv) "
+	               "THEN error('Ownership search-path survivor bag mismatch') ELSE true END;");
+	Execute(owner, "DROP VIEW mv;");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Ownership search-path cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
+// Scratch DROP must bind after its CREATE, using the caller's temporary catalog
+// even when a persistent same-named table and a separate metadata schema exist.
+static void TestDeferredScratchDrop(bool explicit_transaction, bool commit, bool executor_drop) {
+	std::cerr << "CASE deferred scratch drop explicit_transaction=" << explicit_transaction << " commit=" << commit
+	          << " executor_drop=" << executor_drop << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm;");
+	Execute(owner, "SET openivm_disable_daemon=true; SET openivm_metadata_schema='Control.Space'; "
+	               "SET openivm_internal_schema='Internal Space'; CREATE TABLE source(i INTEGER); "
+	               "INSERT INTO source VALUES (1),(1),(2); CREATE TABLE \"Scratch;Name\"(i INTEGER); "
+	               "INSERT INTO \"Scratch;Name\" VALUES (99); CREATE VIEW \"Scratch;View\" AS SELECT 99 AS i;");
+	Execute(owner, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	Execute(owner, "USE memory.\"Control.Space\";");
+	// Round-trip each physical DROP plan, including the direct executor route.
+	// Query verification would execute a SELECT with side effects repeatedly;
+	// serializer verification alone exercises the actual failing bind boundary.
+	ClientConfig::GetConfig(*owner.context).verify_serializer = true;
+	if (explicit_transaction) {
+		Execute(owner, "BEGIN;");
+	}
+	auto drop = executor_drop ? "SELECT * FROM openivm_execute_drop_table('', '', 'Scratch;Name', false, false); "
+	                          : "DROP TABLE \"Scratch;Name\"; ";
+	Execute(owner, "CREATE TEMP TABLE \"Scratch;Name\" AS SELECT 7 AS i; "
+	               "INSERT INTO \"Scratch;Name\" VALUES (8); " +
+	                   string(drop) +
+	                   "SELECT CASE WHEN count(*)=0 THEN true "
+	                   "ELSE error('Deferred scratch DROP lost temporary identity') END "
+	                   "FROM duckdb_tables() WHERE temporary AND table_name='Scratch;Name';");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM main.\"Scratch;Name\" EXCEPT ALL SELECT 99) "
+	               "OR EXISTS (SELECT 99 EXCEPT ALL SELECT * FROM main.\"Scratch;Name\") "
+	               "THEN error('Scratch DROP removed the persistent namesake') ELSE true END;");
+	// Exercise the same resolved-target round trip for VIEW, with a persistent
+	// namesake outside the active search path just as for TABLE above.
+	auto view_drop = executor_drop ? "SELECT * FROM openivm_execute_drop_view('', '', 'Scratch;View', false, false); "
+	                               : "DROP VIEW \"Scratch;View\"; ";
+	Execute(owner, "CREATE TEMP VIEW \"Scratch;View\" AS SELECT 7 AS i; " + string(view_drop) +
+	                   "SELECT CASE WHEN count(*)=0 THEN true "
+	                   "ELSE error('Deferred scratch VIEW DROP lost temporary identity') END "
+	                   "FROM duckdb_views() WHERE temporary AND view_name='Scratch;View';");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM main.\"Scratch;View\" EXCEPT ALL SELECT 99) "
+	               "OR EXISTS (SELECT 99 EXCEPT ALL SELECT * FROM main.\"Scratch;View\") "
+	               "THEN error('Scratch VIEW DROP removed the persistent namesake') ELSE true END;");
+	Execute(owner, "DROP TABLE IF EXISTS \"Missing;Scratch\"; SELECT 1;");
+	Execute(owner, "SELECT * FROM openivm_execute_drop_table('', '', 'Missing;Scratch', false, true);");
+	Execute(owner, "SELECT * FROM openivm_execute_drop_view('', '', 'Missing;Scratch', false, true);");
+	if (explicit_transaction) {
+		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	}
+	Execute(owner, "INSERT INTO main.source VALUES (1),(2),(3),(3); DELETE FROM main.source WHERE i=1; "
+	               "UPDATE main.source SET i=4 WHERE i=2; INSERT INTO main.source VALUES (1),(4),(5); "
+	               "DELETE FROM main.source WHERE i=5;");
+	Execute(owner, "PRAGMA refresh('main.mv');");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM main.mv EXCEPT ALL SELECT * FROM main.source) "
+	               "OR EXISTS (SELECT * FROM main.source EXCEPT ALL SELECT * FROM main.mv) "
+	               "THEN error('Deferred scratch DROP publication bag mismatch') ELSE true END;");
+	Execute(owner, "DROP VIEW main.mv; SELECT 1;");
+}
+
 // Replay on a reused helper must follow catalog/schema identity, including when
 // CREATE and CASCADE have both contributed mutations to the same transaction.
 static void TestMetadataReplayLocations() {
+	std::cerr << "CASE metadata replay locations" << std::endl;
 	DuckDB db(nullptr);
 	Connection owner(db), helper(db);
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; "
@@ -237,10 +457,36 @@ static void TestMetadataReplayLocations() {
 	}
 }
 
+static void CheckSourceWatermarkReplay(Connection &owner, DatabaseInstance &db) {
+	Connection helper(db);
+	RefreshMetadata::UseCatalog(*owner.context, helper, "memory");
+	const string columns = "SELECT d.table_name, d.last_update, d.last_refresh_ts FROM ";
+	const string predicate = " v ON d.view_name=v.view_name WHERE v.view_sql_name='mv2' "
+	                         "AND d.source_schema='Source.Space'";
+	auto durable = owner.Query(columns + RefreshMetadata::MetadataTable(helper, openivm::DELTA_TABLES_TABLE) +
+	                           " d JOIN " + RefreshMetadata::MetadataTable(helper, openivm::VIEWS_TABLE) + predicate);
+	if (durable->HasError() || durable->RowCount() != 1) {
+		throw InvalidInputException("Source watermark fixture must have one caller-visible source row");
+	}
+	// The replacement's new physical delta is uncommitted. Replay must retain
+	// exactly the watermark evaluated by the caller without reading that table.
+	TransactionalMVMetadataState::Get(*owner.context).Apply(helper);
+	string expected = "SELECT " + durable->GetValue(0, 0).ToSQLString() + " AS table_name, " +
+	                  durable->GetValue(1, 0).ToSQLString() + "::TIMESTAMP AS last_update, " +
+	                  durable->GetValue(2, 0).ToSQLString() + "::TIMESTAMP AS last_refresh_ts";
+	auto replayed = columns + "openivm_delta_tables d JOIN openivm_views" + predicate;
+	Execute(helper, "SELECT CASE WHEN EXISTS (" + replayed + " EXCEPT ALL " + expected + ") OR EXISTS (" + expected +
+	                    " EXCEPT ALL " + replayed +
+	                    ") THEN error('Source watermark replay changed the caller value') ELSE true END;");
+}
+
 // Keep an unrelated, later-sorted metadata catalog selected at the end of source
 // enumeration. Ownership in memory must include every earlier local mutation,
 // regardless of which location Apply() last shadowed on the compiler helper.
-static void TestSourceCascadeConsumerLocations(const string &mutation, bool commit) {
+static void TestSourceCascadeConsumerLocations(const string &mutation, bool commit, bool batched_drop,
+                                               bool explicit_transaction) {
+	std::cerr << "CASE source cascade mutation=" << mutation << " commit=" << commit << " batched_drop=" << batched_drop
+	          << " explicit_transaction=" << explicit_transaction << std::endl;
 	DuckDB db(nullptr);
 	Connection owner(db);
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
@@ -257,24 +503,61 @@ static void TestSourceCascadeConsumerLocations(const string &mutation, bool comm
 	               "INSERT INTO \"zz Replay Peer\".main.b VALUES (1),(1),(2); "
 	               "CREATE MATERIALIZED VIEW \"zz Replay Peer\".main.mv1 "
 	               "AS SELECT * FROM \"zz Replay Peer\".main.b;");
+	// Verify placement before any transaction replay or cleanup. A CREATE that
+	// folds the quoted catalog can bind successfully while publishing ownership
+	// in memory instead of the peer's native metadata catalog.
+	Execute(owner, "SELECT CASE WHEN count(*)=1 AND min(view_catalog)='zz Replay Peer' "
+	               "THEN true ELSE error('Quoted peer metadata was published in the wrong catalog') END "
+	               "FROM \"zz Replay Peer\".\"Control.Space\".openivm_views WHERE view_sql_name='mv1';");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true "
+	               "ELSE error('Peer ownership leaked into the source metadata catalog') END "
+	               "FROM memory.\"Control.Space\".openivm_views WHERE lower(view_catalog)='zz replay peer';");
+	{
+		Connection helper(db);
+		RefreshMetadata::UseCatalog(*owner.context, helper, "zz replay peer");
+		auto location = RefreshMetadata::CurrentLocation(helper);
+		if (location.catalog_name != "zz Replay Peer" || location.schema_name != "Control.Space") {
+			throw InvalidInputException("Case-insensitive catalog lookup changed metadata ownership");
+		}
+	}
 	bool added = mutation == "create";
 	bool removed = mutation == "drop";
+	// Retain a nonempty delta for mv1. A new consumer must replay MAX(delta)+1,
+	// not substitute its creation time or the helper's transaction timestamp.
+	Execute(owner, "INSERT INTO \"Source.Space\".b VALUES (6),(6);");
 	if (!added) {
 		Execute(owner, "CREATE MATERIALIZED VIEW mv2 AS SELECT * FROM \"Source.Space\".b;");
 	}
-	Execute(owner, "BEGIN;");
+	if (explicit_transaction) {
+		Execute(owner, "BEGIN;");
+	}
 	if (added) {
 		Execute(owner, "CREATE MATERIALIZED VIEW mv2 AS SELECT * FROM \"Source.Space\".b;");
 	} else if (removed) {
 		Execute(owner, "DROP VIEW mv2;");
 	} else {
 		Execute(owner, "CREATE OR REPLACE MATERIALIZED VIEW mv2 AS SELECT * FROM \"Source.Space\".c;");
+		if (explicit_transaction) {
+			CheckSourceWatermarkReplay(owner, *db.instance);
+		}
+		if (mutation == "replace") {
+			Execute(owner, "CREATE OR REPLACE MATERIALIZED VIEW mv2 AS SELECT * FROM \"Source.Space\".b;");
+			if (explicit_transaction) {
+				CheckSourceWatermarkReplay(owner, *db.instance);
+			}
+			Execute(owner, "CREATE OR REPLACE MATERIALIZED VIEW mv2 AS SELECT * FROM \"Source.Space\".c;");
+		}
 		if (mutation == "recreate") {
 			Execute(owner, "DROP VIEW mv2; CREATE MATERIALIZED VIEW mv2 AS SELECT * FROM \"Source.Space\".b;");
 		}
 	}
-	Execute(owner, "DROP TABLE \"Source.Space\".a CASCADE;");
-	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	if (explicit_transaction && !removed) {
+		CheckSourceWatermarkReplay(owner, *db.instance);
+	}
+	Execute(owner, "DROP TABLE \"Source.Space\".a CASCADE;" + string(batched_drop ? " SELECT 1;" : ""));
+	if (explicit_transaction) {
+		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	}
 	bool owns_b = !commit || added || mutation == "recreate";
 	Execute(owner, "SELECT CASE WHEN count(*)=" + string(owns_b ? "1" : "0") +
 	                   " THEN true ELSE error('Source CASCADE lost local ownership or leaked a removed delta') END "
@@ -324,6 +607,7 @@ static void TestSourceCascadeConsumerLocations(const string &mutation, bool comm
 // Legacy view keys may repeat across metadata locations. Exclusions must name
 // their metadata table even when the excluded key also appears elsewhere.
 static void TestStagedCascadeConsumerIdentity() {
+	std::cerr << "CASE staged cascade consumer identity" << std::endl;
 	DuckDB db(nullptr);
 	Connection owner(db);
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
@@ -370,19 +654,286 @@ static void TestStagedCascadeConsumerIdentity() {
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
 }
 
+// Native batches prepare each DROP after earlier statements have executed. Cover
+// full view cleanup, a committed sibling, final consumers, and rollback without
+// relying on optimizer or result-order settings to execute maintenance steps.
+static void TestBatchedViewDrop(bool explicit_transaction, bool commit, bool disable_optimizer) {
+	std::cerr << "CASE batched view drop explicit_transaction=" << explicit_transaction << " commit=" << commit
+	          << " disable_optimizer=" << disable_optimizer << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db), helper(db);
+	Execute(owner, "LOAD openivm;");
+	Execute(owner, "SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "SET openivm_stateful_auxstate=true; SET preserve_insertion_order=false; SET threads=4;");
+	Execute(owner, "CREATE SCHEMA \"Source.Space\"; CREATE SCHEMA \"Public.Space\"; CREATE SCHEMA \"Other.Public\"; "
+	               "CREATE TABLE \"Source.Space\".items(g INTEGER, x INTEGER); "
+	               "INSERT INTO \"Source.Space\".items VALUES (1,10),(1,10),(2,20);");
+	Execute(owner, "CREATE MATERIALIZED VIEW \"Public.Space\".\"Same.MV\" "
+	               "AS SELECT g, COUNT(DISTINCT x) AS n FROM \"Source.Space\".items GROUP BY g;");
+	Execute(owner, "CREATE MATERIALIZED VIEW \"Other.Public\".\"Same.MV\" AS SELECT * FROM \"Source.Space\".items;");
+	RefreshMetadata::UseCatalog(*owner.context, helper, "memory");
+	auto view_key = RefreshMetadata(helper).FindViewKey("memory", "Public.Space", "Same.MV");
+	if (view_key.empty() || RefreshMetadata(helper).GetAuxiliaryTables(view_key).empty()) {
+		throw InvalidInputException("Batched view DROP fixture must own auxiliary state");
+	}
+	auto metadata_table = RefreshMetadata::MetadataTable(helper, openivm::VIEWS_TABLE);
+	string owned_names;
+	vector<string> owned_tables = {IncrementalTableNames::DataTableName(view_key), PublishedViewName(view_key),
+	                               SqlUtils::DeltaName(view_key), SqlUtils::DeltaName(PublishedViewName(view_key))};
+	for (auto &name : RefreshMetadata(helper).GetAuxiliaryTables(view_key)) {
+		owned_tables.push_back(name);
+	}
+	for (auto &name : owned_tables) {
+		if (!owned_names.empty()) {
+			owned_names += ",";
+		}
+		owned_names += Value(name).ToSQLString();
+	}
+	auto owned_count = "(SELECT count(*) FROM duckdb_tables() WHERE schema_name='Internal Space' "
+	                   "AND table_name IN (" +
+	                   owned_names + "))";
+	Execute(owner, "SELECT CASE WHEN " + owned_count +
+	                   ">=3 THEN true "
+	                   "ELSE error('Batched DROP fixture has no backing/publication/auxiliary tables') END;");
+	if (disable_optimizer) {
+		Execute(owner, "PRAGMA disable_optimizer;");
+	}
+	if (explicit_transaction) {
+		Execute(owner, "BEGIN;");
+	}
+	// A preceding statement must finish before DROP looks up ownership. Both
+	// mutations and trailing queries must remain in their original batch order.
+	Execute(owner, string(disable_optimizer ? "SELECT 1; " : "INSERT INTO \"Source.Space\".items VALUES (3,30); ") +
+	                   "DROP VIEW \"Public.Space\".\"Same.MV\"; SELECT 1;");
+	if (disable_optimizer) {
+		Execute(owner, "PRAGMA enable_optimizer;");
+	}
+	Execute(owner, "SELECT CASE WHEN " + owned_count +
+	                   "=0 AND "
+	                   "(SELECT count(*) FROM " +
+	                   metadata_table + " WHERE view_name=" + Value(view_key).ToSQLString() +
+	                   ")=0 THEN true ELSE error('Batched view DROP leaked metadata or maintenance tables') END;");
+	if (explicit_transaction) {
+		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	}
+	bool retained = explicit_transaction && !commit;
+	Execute(owner, "SELECT CASE WHEN (SELECT count(*) FROM " + metadata_table +
+	                   " WHERE view_name=" + Value(view_key).ToSQLString() + ")=" + string(retained ? "1" : "0") +
+	                   " THEN true ELSE error('Batched DROP commit/rollback lost registry identity') END;");
+	Execute(owner, "INSERT INTO \"Source.Space\".items VALUES (1,10),(2,20),(3,30),(3,30); "
+	               "DELETE FROM \"Source.Space\".items WHERE x=10; "
+	               "UPDATE \"Source.Space\".items SET x=40 WHERE x=20; "
+	               "INSERT INTO \"Source.Space\".items VALUES (1,10),(4,40),(5,50); "
+	               "DELETE FROM \"Source.Space\".items WHERE x=50; "
+	               "UPDATE \"Source.Space\".items SET x=20 WHERE x=40;");
+	vector<pair<string, string>> survivors = {
+	    {"\"Other.Public\".\"Same.MV\"", "SELECT * FROM \"Source.Space\".items"},
+	};
+	if (retained) {
+		survivors.push_back(
+		    {"\"Public.Space\".\"Same.MV\"", "SELECT g, COUNT(DISTINCT x) FROM \"Source.Space\".items GROUP BY g"});
+	}
+	for (auto &view : survivors) {
+		Execute(owner, "PRAGMA refresh('" + view.first + "');");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view.first + " EXCEPT ALL " + view.second +
+		                   ") OR EXISTS (" + view.second + " EXCEPT ALL SELECT * FROM " + view.first +
+		                   ") THEN error('Batched view DROP survivor bag mismatch') ELSE true END;");
+	}
+	if (retained) {
+		Execute(owner, "BEGIN; DROP VIEW \"Public.Space\".\"Same.MV\"; "
+		               "DROP VIEW \"Other.Public\".\"Same.MV\"; COMMIT;");
+	} else {
+		Execute(owner, "DROP VIEW \"Other.Public\".\"Same.MV\"; SELECT 1;");
+	}
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Batched final consumer cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
+static void TestMixedLifecycleBatch(bool explicit_transaction, bool commit) {
+	std::cerr << "CASE mixed lifecycle explicit_transaction=" << explicit_transaction << " commit=" << commit
+	          << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal;Space'; "
+	               "CREATE SCHEMA \"Public;Space\"; CREATE TABLE source(i INTEGER); "
+	               "INSERT INTO source VALUES (1),(1),(2);");
+	const string view = "\"Public;Space\".\"Mixed;MV\"";
+	const string base_query = "SELECT i, 'value;--literal' AS label FROM source";
+	Execute(owner, "CREATE MATERIALIZED VIEW " + view + " AS " + base_query + ";");
+	Execute(owner, "CREATE MATERIALIZED VIEW sibling AS SELECT * FROM source;");
+	if (explicit_transaction) {
+		Execute(owner, "BEGIN;");
+	}
+	// Native statement binding follows execution order. The second DROP must
+	// consume ownership from a CREATE executed in this same batch.
+	Execute(owner, "SELECT $$native;literal$$, 'create materialized view in a literal'; "
+	               "/* outer ; /* nested ; */ comment */ DROP VIEW " +
+	                   view + "; -- delimiter ; inside a comment\n CREATE MATERIALIZED VIEW " + view + " AS " +
+	                   base_query + "; INSERT INTO source VALUES (3),(3); DROP VIEW " + view +
+	                   "; CREATE /* keyword comment ; */ OR REPLACE MATERIALIZED VIEW " + view + " AS " + base_query +
+	                   "; SELECT CASE WHEN count(*)=5 THEN true ELSE error('Mixed batch reordered DML') END FROM " +
+	                   view + ";");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + base_query + ") OR EXISTS (" +
+	                   base_query + " EXCEPT ALL SELECT * FROM " + view +
+	                   ") THEN error('Mixed lifecycle initial load bag mismatch') ELSE true END;");
+	if (explicit_transaction) {
+		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	}
+	Execute(owner, "INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
+	               "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (1),(5),(5); "
+	               "DELETE FROM source WHERE i=5; UPDATE source SET i=2 WHERE i=4;");
+	for (auto &survivor : vector<pair<string, string>> {{view, base_query}, {"sibling", "SELECT * FROM source"}}) {
+		Execute(owner, "PRAGMA refresh('" + survivor.first + "');");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + survivor.first + " EXCEPT ALL " + survivor.second +
+		                   ") OR EXISTS (" + survivor.second + " EXCEPT ALL SELECT * FROM " + survivor.first +
+		                   ") THEN error('Mixed lifecycle survivor bag mismatch') ELSE true END;");
+	}
+	Execute(owner, "DROP VIEW " + view + "; DROP VIEW sibling; SELECT 1;");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Mixed lifecycle final cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal;Space';");
+}
+
+static void TestSequentialCreateBatch(bool explicit_transaction, bool commit) {
+	std::cerr << "CASE sequential CREATE batch explicit_transaction=" << explicit_transaction << " commit=" << commit
+	          << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "PRAGMA enable_profiling='no_output'; PRAGMA enable_verification;");
+	const auto metrics = ClientConfig::GetConfig(*owner.context).profiler_settings;
+	// BEGIN, schema/table creation, DML, and MV creation are all in one input.
+	// No source exists when DuckDB preprocesses it. Each replacement must see
+	// the caller's preceding DROP and intervening mutations.
+	Execute(owner,
+	        string(explicit_transaction ? "BEGIN; " : "") +
+	            "CREATE SCHEMA \"Public;Space\"; CREATE TABLE \"Public;Space\".source(i INTEGER); "
+	            "INSERT INTO \"Public;Space\".source VALUES (1),(1),(2); "
+	            "CREATE MATERIALIZED VIEW \"Public;Space\".mv AS SELECT * FROM \"Public;Space\".source; "
+	            "DROP VIEW \"Public;Space\".mv; INSERT INTO \"Public;Space\".source VALUES (3),(3); "
+	            "CREATE MATERIALIZED VIEW \"Public;Space\".mv AS SELECT * FROM \"Public;Space\".source; "
+	            "CREATE OR REPLACE MATERIALIZED VIEW \"Public;Space\".mv AS SELECT * FROM \"Public;Space\".source;");
+	if (ClientConfig::GetConfig(*owner.context).profiler_settings != metrics) {
+		throw InvalidInputException("Lifecycle execution did not restore profiling metrics");
+	}
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM \"Public;Space\".mv EXCEPT ALL "
+	               "SELECT * FROM \"Public;Space\".source) OR EXISTS (SELECT * FROM \"Public;Space\".source "
+	               "EXCEPT ALL SELECT * FROM \"Public;Space\".mv) "
+	               "THEN error('Sequential CREATE initial load mismatch') ELSE true END;");
+	if (explicit_transaction) {
+		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	}
+	if (explicit_transaction && !commit) {
+		Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Sequential CREATE rollback leaked objects') "
+		               "END FROM duckdb_tables() WHERE schema_name IN ('Public;Space','Internal Space');");
+		return;
+	}
+	Execute(owner, "INSERT INTO \"Public;Space\".source VALUES (1),(2),(3),(3); "
+	               "DELETE FROM \"Public;Space\".source WHERE i=1; "
+	               "UPDATE \"Public;Space\".source SET i=4 WHERE i=2;");
+	Execute(owner, "PRAGMA refresh('\"Public;Space\".mv');");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM \"Public;Space\".mv EXCEPT ALL "
+	               "SELECT * FROM \"Public;Space\".source) OR EXISTS (SELECT * FROM \"Public;Space\".source "
+	               "EXCEPT ALL SELECT * FROM \"Public;Space\".mv) "
+	               "THEN error('Sequential CREATE refresh bag mismatch') ELSE true END;");
+	Execute(owner, "DROP VIEW \"Public;Space\".mv; SELECT CASE WHEN count(*)=0 THEN true "
+	               "ELSE error('Sequential CREATE final cleanup leaked') END FROM duckdb_tables() "
+	               "WHERE schema_name='Internal Space';");
+}
+
+static void TestLateLifecycleBindFailure(bool explicit_transaction) {
+	std::cerr << "CASE late lifecycle bind failure explicit_transaction=" << explicit_transaction << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; CREATE TABLE source(i INTEGER); "
+	               "INSERT INTO source VALUES (1),(1),(2); CREATE MATERIALIZED VIEW mv AS SELECT * FROM source; "
+	               "PRAGMA enable_profiling='no_output';");
+	const auto metrics = ClientConfig::GetConfig(*owner.context).profiler_settings;
+	if (explicit_transaction) {
+		Execute(owner, "BEGIN;");
+	}
+	// Exercise the same owning program abstraction with a deterministic *late*
+	// binder failure, after successful schema/table creation and captured DML.
+	// The public logical-statement API avoids introducing a test-only SQL function.
+	auto binder = Binder::CreateBinder(*owner.context);
+	auto plan =
+	    BindLifecycleProgram(*owner.context, *binder,
+	                         "CREATE SCHEMA \"Late;Schema\"; "
+	                         "CREATE TABLE \"Late;Schema\".scratch AS SELECT i, count(*) FROM source GROUP BY i; "
+	                         "CREATE TABLE \"Late;Schema\".recursive AS WITH RECURSIVE r(i) AS "
+	                         "(VALUES (1) UNION ALL SELECT i+1 FROM r WHERE i<3) SELECT * FROM r; "
+	                         "INSERT INTO source VALUES (7); SELECT missing_lifecycle_column FROM source;");
+	plan->ResolveOperatorTypes();
+	auto statement = make_uniq<LogicalPlanStatement>(std::move(plan));
+	statement->query = "OpenIVM late lifecycle bind failure regression";
+	auto result = owner.Query(std::move(statement));
+	if (!result->HasError() || result->GetError().find("missing_lifecycle_column") == string::npos) {
+		throw InvalidInputException("Lifecycle fixture did not reach its intended late binder failure");
+	}
+	if (ClientConfig::GetConfig(*owner.context).profiler_settings != metrics) {
+		throw InvalidInputException("Failed lifecycle execution did not restore profiling metrics");
+	}
+	if (explicit_transaction) {
+		// A binder error normally permits COMMIT. Partial lifecycle writes must
+		// instead invalidate the transaction, so COMMIT rolls all of them back.
+		Execute(owner, "COMMIT;");
+	}
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM (VALUES (1),(1),(2))) "
+	               "OR EXISTS (SELECT * FROM (VALUES (1),(1),(2)) EXCEPT ALL SELECT * FROM source) "
+	               "OR EXISTS (SELECT 1 FROM duckdb_schemas() WHERE schema_name='Late;Schema') "
+	               "THEN error('Failed lifecycle committed partial writes') ELSE true END;");
+	Execute(owner, "INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
+	               "UPDATE source SET i=4 WHERE i=2;");
+	Execute(owner, "PRAGMA refresh('mv');");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM mv EXCEPT ALL SELECT * FROM source) "
+	               "OR EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM mv) "
+	               "THEN error('Failed lifecycle damaged delta capture') ELSE true END;");
+	Execute(owner, "DROP VIEW mv;");
+}
+
 int main() {
 	try {
+		TestQuotedNamespaceNormalization();
+		TestSourceDeltaLookup();
+		TestSharedMetadataUpgrade(false, true);
+		TestSharedMetadataUpgrade(true, true);
+		TestSharedMetadataUpgrade(true, false);
+		for (bool executor_drop : {false, true}) {
+			TestDeferredScratchDrop(false, true, executor_drop);
+			TestDeferredScratchDrop(true, true, executor_drop);
+			TestDeferredScratchDrop(true, false, executor_drop);
+		}
+		TestSequentialCreateBatch(false, true);
+		TestSequentialCreateBatch(true, true);
+		TestSequentialCreateBatch(true, false);
+		TestLateLifecycleBindFailure(false);
+		TestLateLifecycleBindFailure(true);
 		TestMetadataReplayLocations();
+		TestDeltaOwnershipSearchPath(false);
+		TestDeltaOwnershipSearchPath(true);
 		for (const auto &mutation : vector<string> {"create", "drop", "replace", "recreate"}) {
-			TestSourceCascadeConsumerLocations(mutation, false);
-			TestSourceCascadeConsumerLocations(mutation, true);
+			for (bool batched_drop : {false, true}) {
+				TestSourceCascadeConsumerLocations(mutation, false, batched_drop, true);
+				TestSourceCascadeConsumerLocations(mutation, true, batched_drop, true);
+				TestSourceCascadeConsumerLocations(mutation, true, batched_drop, false);
+			}
 		}
 		TestStagedCascadeConsumerIdentity();
+		for (bool disable_optimizer : {false, true}) {
+			TestBatchedViewDrop(false, true, disable_optimizer);
+			TestBatchedViewDrop(true, true, disable_optimizer);
+			TestBatchedViewDrop(true, false, disable_optimizer);
+		}
 		TestPublication(false);
 		TestPublication(true);
 		TestDropDuringPublication(false, false);
 		TestDropDuringPublication(true, false);
 		TestDropDuringPublication(false, true);
+		TestMixedLifecycleBatch(false, true);
+		TestMixedLifecycleBatch(true, true);
+		TestMixedLifecycleBatch(true, false);
 		std::cout << "PASS" << std::endl;
 	} catch (const std::exception &ex) {
 		std::cerr << ex.what() << std::endl;

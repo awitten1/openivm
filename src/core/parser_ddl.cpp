@@ -9,11 +9,28 @@
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/printer.hpp"
+#include "duckdb/common/serializer/deserializer.hpp"
+#include "duckdb/common/serializer/serializer.hpp"
 #include "duckdb/function/table_function.hpp"
+#include "duckdb/function/scalar_function.hpp"
+#include "duckdb/execution/expression_executor_state.hpp"
+#include "duckdb/execution/executor.hpp"
+#include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
+#include "duckdb/main/attached_database.hpp"
+#include "duckdb/main/client_config.hpp"
+#include "duckdb/main/valid_checker.hpp"
+#include "duckdb/parallel/event.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/parallel/meta_pipeline.hpp"
+#include "duckdb/parallel/pipeline.hpp"
+#include "duckdb/planner/operator/logical_extension_operator.hpp"
+#include "duckdb/planner/operator/logical_simple.hpp"
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/planner/binder.hpp"
+#include "duckdb/planner/planner.hpp"
 
 #include <chrono>
 #include <cctype>
@@ -692,6 +709,7 @@ void TransactionalMVMetadataState::Register(ClientContext &context, const vector
                                             const string &view_name, const string &metadata_catalog,
                                             const string &metadata_schema) {
 	view_names.insert(view_name);
+	dropped_views.erase(view_name);
 	auto transaction_timestamp = context.transaction.ActiveTransaction().GetCurrentTransactionStartTimestamp();
 	// Delta-table DEFAULT now() is transaction-stable. Compile from one
 	// microsecond before it so rows inserted into a newly created MV delta
@@ -702,6 +720,14 @@ void TransactionalMVMetadataState::Register(ClientContext &context, const vector
 	for (auto &parameter : parameters) {
 		auto statement = parameter.GetValue<string>();
 		if (IsReplayableMetadataStatement(statement)) {
+			// The caller records the evaluated watermark at execution time. A
+			// helper cannot read source deltas created in the caller transaction.
+			auto target = MetadataTargetReference(statement, "update ", openivm::DELTA_TABLES_TABLE);
+			if (!target.empty() && StringUtil::StartsWith(statement.substr(strlen("update ") + target.size()),
+			                                              " SET last_update = " +
+			                                                  string(OPENIVM_RECORD_SOURCE_WATERMARK_FUNCTION) + "(")) {
+				continue;
+			}
 			statements.push_back(QualifyMetadataStatement(StabilizeTransactionalMetadata(statement, timestamp_sql),
 			                                              metadata_catalog, metadata_schema));
 		}
@@ -720,6 +746,15 @@ void TransactionalMVMetadataState::RegisterSQL(const string &sql, const string &
 
 void TransactionalMVMetadataState::IncludeView(const string &view_name) {
 	view_names.insert(view_name);
+}
+
+void TransactionalMVMetadataState::RegisterViewDrop(const string &view_name) {
+	view_names.insert(view_name);
+	dropped_views.insert(view_name);
+}
+
+bool TransactionalMVMetadataState::HasPendingViewDrop(const string &view_name) const {
+	return dropped_views.count(view_name) != 0;
 }
 
 vector<pair<string, string>> TransactionalMVMetadataState::MetadataLocations() const {
@@ -946,11 +981,284 @@ void TransactionalMVMetadataState::TransactionRollback(MetaTransaction &transact
 void TransactionalMVMetadataState::Clear() {
 	statements.clear();
 	view_names.clear();
+	dropped_views.clear();
 }
 
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace) {
 	return string(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX) + (replace ? "replace\t" : "create\t") + delta_table +
 	       "\t" + data_table;
+}
+
+string BuildSourceWatermarkUpdate(const string &metadata_table, const string &view_name, const string &source_name,
+                                  const string &watermark, const string &refresh_timestamp, bool record) {
+	auto value = watermark;
+	if (record) {
+		value = string(OPENIVM_RECORD_SOURCE_WATERMARK_FUNCTION) + "(" + Value(metadata_table).ToSQLString() + ", " +
+		        Value(view_name).ToSQLString() + ", " + Value(source_name).ToSQLString() + ", " + watermark + ", " +
+		        refresh_timestamp + ")";
+	}
+	return "UPDATE " + metadata_table + " SET last_update = " + value + ", last_refresh_ts = " + refresh_timestamp +
+	       " WHERE view_name = " + Value(view_name).ToSQLString() +
+	       " AND table_name = " + Value(source_name).ToSQLString();
+}
+
+static void RecordSourceWatermark(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &context = state.GetContext();
+	result.SetVectorType(VectorType::FLAT_VECTOR);
+	for (idx_t row = 0; row < args.size(); row++) {
+		auto watermark = args.GetValue(3, row);
+		if (!context.transaction.IsAutoCommit()) {
+			auto view_name = args.GetValue(1, row).GetValue<string>();
+			TransactionalMVMetadataState::Get(context).RegisterSQL(
+			    BuildSourceWatermarkUpdate(args.GetValue(0, row).GetValue<string>(), view_name,
+			                               args.GetValue(2, row).GetValue<string>(),
+			                               watermark.ToSQLString() + "::TIMESTAMP",
+			                               args.GetValue(4, row).ToSQLString() + "::TIMESTAMP", false),
+			    view_name);
+			OPENIVM_DEBUG_PRINT("[TRANSACTIONAL METADATA] Recorded source watermark for '%s'\n", view_name.c_str());
+		}
+		result.SetValue(row, watermark);
+	}
+}
+
+ScalarFunction SourceWatermarkFunction() {
+	return ScalarFunction(OPENIVM_RECORD_SOURCE_WATERMARK_FUNCTION,
+	                      {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::TIMESTAMP,
+	                       LogicalType::TIMESTAMP},
+	                      LogicalType::TIMESTAMP, RecordSourceWatermark, nullptr, nullptr, nullptr, nullptr,
+	                      LogicalType::INVALID, FunctionStability::VOLATILE);
+}
+
+namespace {
+
+// Each step has its own discard sink, so even statements returning no rows
+// finish before the next step starts. Ordered UNION only orders result rows;
+// it does not order the mutation sinks inside its children.
+class PhysicalLifecycleSink : public PhysicalOperator {
+public:
+	explicit PhysicalLifecycleSink(PhysicalPlan &physical_plan)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {}, 1) {
+	}
+
+	bool IsSink() const override {
+		return true;
+	}
+
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		return SinkResultType::NEED_MORE_INPUT;
+	}
+};
+
+// Dynamic steps are not in the query profiler's initial physical tree. Keep
+// their operator metrics inside the enclosing lifecycle operator's time, rather
+// than flushing unknown operator pointers into DuckDB's fixed profiling tree.
+// Retain this scope through cancellation on failure: tasks may still be draining.
+class LifecycleMetricsScope {
+public:
+	explicit LifecycleMetricsScope(ClientContext &context) : config(ClientConfig::GetConfig(context)) {
+		settings.swap(config.profiler_settings);
+	}
+
+	~LifecycleMetricsScope() {
+		settings.swap(config.profiler_settings);
+	}
+
+private:
+	ClientConfig &config;
+	profiler_settings_t settings;
+};
+
+struct LifecycleStepState {
+	unique_ptr<PhysicalPlan> plan;
+	PipelineBuildState build_state;
+	shared_ptr<MetaPipeline> pipeline;
+};
+
+// Recursive CTE iteration pipelines are detached from the ordinary children.
+// Ready them after Build, just as Executor::InitializeInternal does.
+static void ReadyLifecycleRecursivePipelines(const PhysicalOperator &op) {
+	if (op.type == PhysicalOperatorType::RECURSIVE_CTE) {
+		op.Cast<PhysicalRecursiveCTE>().recursive_meta_pipeline->Ready();
+	}
+	for (auto &child : op.GetChildren()) {
+		ReadyLifecycleRecursivePipelines(child.get());
+	}
+}
+
+struct LifecycleSourceState : public GlobalSourceState {
+	bool finished = false;
+	// Executor events retain references to the step plans until query cleanup.
+	vector<unique_ptr<LifecycleStepState>> steps;
+	unique_ptr<LifecycleMetricsScope> metrics;
+};
+
+class PhysicalLifecycleProgram : public PhysicalOperator {
+public:
+	PhysicalLifecycleProgram(PhysicalPlan &physical_plan, string program)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BOOLEAN}, 1),
+	      program(std::move(program)) {
+	}
+
+	bool IsSource() const override {
+		return true;
+	}
+
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
+		return make_uniq<LifecycleSourceState>();
+	}
+
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override {
+		auto &state = input.global_state.Cast<LifecycleSourceState>();
+		if (state.finished) {
+			return SourceResultType::FINISHED;
+		}
+		auto &client = context.client;
+		auto &executor = Executor::Get(client);
+		state.metrics = make_uniq<LifecycleMetricsScope>(client);
+		try {
+			ParserOptions options = client.GetParserOptions();
+			options.extensions = nullptr;
+			Parser parser(options);
+			parser.ParseQuery(program);
+			for (auto &statement : parser.statements) {
+				// Internal DROP already has a compiled ownership/cleanup program.
+				// Bind only its physical executor, without recursively compiling cleanup.
+				if (statement->type == StatementType::DROP_STATEMENT) {
+					auto &drop = statement->Cast<DropStatement>();
+					if (drop.info->type == CatalogType::TABLE_ENTRY || drop.info->type == CatalogType::VIEW_ENTRY) {
+						Parser drop_parser(options);
+						drop_parser.ParseQuery(drop.info->type == CatalogType::TABLE_ENTRY
+						                           ? BuildDropTableStatement(*drop.info)
+						                           : BuildDropViewStatement(*drop.info));
+						statement = std::move(drop_parser.statements[0]);
+					}
+				}
+				// Binding is deliberately here, after all prior physical steps finish.
+				// CREATE SCHEMA/TABLE, replacement and DROP dependencies are now visible
+				// in the caller's transaction, without a second connection or executor.
+				Planner planner(client);
+				planner.CreatePlan(std::move(statement));
+				for (auto &entry : planner.properties.modified_databases) {
+					auto &database = Catalog::GetCatalog(client, entry.first).GetAttached();
+					if (database.IsReadOnly()) {
+						throw InvalidInputException(
+						    "Cannot execute OpenIVM lifecycle writes on read-only database '%s'", entry.first);
+					}
+					MetaTransaction::Get(client).ModifyDatabase(database, entry.second.modifications);
+				}
+				auto logical = std::move(planner.plan);
+				// Run the maintenance optimizer extensions even when the caller disables
+				// ordinary query optimization: source retractions still need delta capture.
+				if (logical->RequireOptimizer()) {
+					Optimizer optimizer(*planner.binder, client);
+					logical = optimizer.Optimize(std::move(logical));
+				}
+				// Retain the plan before Build can register recursive CTEs or events
+				// with the executor, including when pipeline construction throws.
+				state.steps.push_back(make_uniq<LifecycleStepState>());
+				auto &step = *state.steps.back();
+				PhysicalPlanGenerator physical_planner(client);
+				step.plan = physical_planner.Plan(std::move(logical));
+				auto &sink = step.plan->Make<PhysicalLifecycleSink>();
+				step.pipeline = make_shared_ptr<MetaPipeline>(executor, step.build_state, &sink);
+				step.pipeline->Build(step.plan->Root());
+				step.pipeline->Ready();
+				ReadyLifecycleRecursivePipelines(step.plan->Root());
+				vector<shared_ptr<MetaPipeline>> pipelines;
+				step.pipeline->GetMetaPipelines(pipelines, true, false);
+				vector<shared_ptr<Event>> events;
+				executor.ReschedulePipelines(pipelines, events);
+				// This is DuckDB's recursive-CTE execution pattern: reschedule work on
+				// the active executor and drain it before compiling the next statement.
+				while (true) {
+					executor.WorkOnTasks();
+					if (executor.HasError()) {
+						executor.ThrowException();
+					}
+					bool finished = true;
+					for (auto &event : events) {
+						finished &= event->IsFinished();
+					}
+					if (finished) {
+						break;
+					}
+					if (client.IsInterrupted()) {
+						throw InterruptException();
+					}
+				}
+				OPENIVM_DEBUG_PRINT("[LIFECYCLE] Executed caller-transaction step %zu\n", state.steps.size());
+			}
+		} catch (std::exception &ex) {
+			// A late bind failure is an execution failure of this whole lifecycle,
+			// even when DuckDB would normally permit committing after a binder error.
+			ValidChecker::Invalidate(client.ActiveTransaction(), ex.what());
+			throw;
+		}
+		state.metrics.reset();
+		chunk.SetValue(0, 0, Value::BOOLEAN(true));
+		chunk.SetCardinality(1);
+		state.finished = true;
+		return SourceResultType::FINISHED;
+	}
+
+	vector<const_reference<PhysicalOperator>> GetSources() const override {
+		return {*this};
+	}
+
+private:
+	const string program;
+};
+
+class LogicalLifecycleProgram : public LogicalExtensionOperator {
+public:
+	LogicalLifecycleProgram(idx_t table_index, string program) : table_index(table_index), program(std::move(program)) {
+	}
+
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
+		return planner.Make<PhysicalLifecycleProgram>(program);
+	}
+
+	vector<ColumnBinding> GetColumnBindings() override {
+		return GenerateColumnBindings(table_index, 1);
+	}
+
+	vector<idx_t> GetTableIndex() const override {
+		return {table_index};
+	}
+
+	bool RequireOptimizer() const override {
+		// Each statement is bound and optimized immediately before execution.
+		return false;
+	}
+
+	bool SupportSerialization() const override {
+		return false;
+	}
+
+	string GetName() const override {
+		return "OPENIVM_LIFECYCLE_PROGRAM";
+	}
+
+protected:
+	void ResolveTypes() override {
+		types = {LogicalType::BOOLEAN};
+	}
+
+private:
+	const idx_t table_index;
+	const string program;
+};
+
+} // namespace
+
+unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder &binder, const string &program) {
+	// The native driver binds this one lifecycle after preceding user statements
+	// execute. Its generated SQL is still unbound: later steps may use objects
+	// created by earlier steps. Never pre-bind the entire program here.
+	binder.GetStatementProperties().always_require_rebind = true;
+	OPENIVM_DEBUG_PRINT("[LIFECYCLE] Prepared deferred caller-transaction program\n");
+	return make_uniq<LogicalLifecycleProgram>(binder.GenerateTableIndex(), program);
 }
 
 string BuildDropViewStatement(const DropInfo &drop_info) {
@@ -968,6 +1276,11 @@ string BuildDropTableStatement(const DropInfo &drop_info) {
 }
 
 struct DropViewBindData : public TableFunctionData {
+	DropViewBindData() = default;
+
+	explicit DropViewBindData(const DropInfo &info) : info(info) {
+	}
+
 	DropInfo info;
 };
 
@@ -992,29 +1305,36 @@ static unique_ptr<FunctionData> BindDropEntry(ClientContext &context, TableFunct
 	if (!input.binder) {
 		throw InternalException("OpenIVM DROP executor requires a binder");
 	}
-	auto &catalog = Catalog::GetCatalog(context, result->info.catalog);
-	input.binder->GetStatementProperties().RegisterDBModify(catalog, context,
-	                                                        DatabaseModificationType::DROP_CATALOG_ENTRY);
+	// Bind when this statement is reached, after preceding batch statements have
+	// executed. Native DROP binding resolves search paths (including temp.main),
+	// rejects internal entries and registers writes only for persistent objects.
+	DropStatement drop;
+	drop.info = make_uniq<DropInfo>(result->info);
+	auto bound = input.binder->Bind(static_cast<SQLStatement &>(drop));
+	auto &resolved = bound.plan->Cast<LogicalSimple>().info->Cast<DropInfo>();
+	result->info.catalog = resolved.catalog;
+	result->info.schema = resolved.schema;
+	result->info.name = resolved.name;
 	return_types.push_back(LogicalType::BOOLEAN);
 	names.emplace_back("Success");
 	return std::move(result);
 }
 
-unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindInput &input,
-                                      vector<LogicalType> &return_types, vector<string> &names) {
+static unique_ptr<FunctionData> BindDropView(ClientContext &context, TableFunctionBindInput &input,
+                                             vector<LogicalType> &return_types, vector<string> &names) {
 	return BindDropEntry(context, input, return_types, names, CatalogType::VIEW_ENTRY);
 }
 
-unique_ptr<FunctionData> BindDropTable(ClientContext &context, TableFunctionBindInput &input,
-                                       vector<LogicalType> &return_types, vector<string> &names) {
+static unique_ptr<FunctionData> BindDropTable(ClientContext &context, TableFunctionBindInput &input,
+                                              vector<LogicalType> &return_types, vector<string> &names) {
 	return BindDropEntry(context, input, return_types, names, CatalogType::TABLE_ENTRY);
 }
 
-unique_ptr<GlobalTableFunctionState> InitDropView(ClientContext &context, TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> InitDropView(ClientContext &context, TableFunctionInitInput &input) {
 	return make_uniq<DropViewGlobalState>();
 }
 
-void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
+static void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChunk &output) {
 	auto &state = input.global_state->Cast<DropViewGlobalState>();
 	if (state.finished) {
 		return;
@@ -1035,6 +1355,30 @@ void ExecuteDropView(ClientContext &context, TableFunctionInput &input, DataChun
 	output.SetValue(0, 0, Value::BOOLEAN(true));
 	output.SetCardinality(1);
 	state.finished = true;
+}
+
+static void SerializeDropEntry(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+                               const TableFunction &function) {
+	// LogicalGet's fallback deserializer calls bind without a Binder. Retain the
+	// native binder's resolved target instead of resolving the search path again.
+	serializer.WriteProperty(100, "drop_info", &bind_data->Cast<DropViewBindData>().info);
+}
+
+static unique_ptr<FunctionData> DeserializeDropEntry(Deserializer &deserializer, TableFunction &function) {
+	auto info = deserializer.ReadProperty<unique_ptr<ParseInfo>>(100, "drop_info");
+	return make_uniq<DropViewBindData>(info->Cast<DropInfo>());
+}
+
+TableFunction DropEntryFunction(CatalogType type) {
+	D_ASSERT(type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY);
+	const bool is_table = type == CatalogType::TABLE_ENTRY;
+	TableFunction function(
+	    is_table ? "openivm_execute_drop_table" : "openivm_execute_drop_view",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+	    ExecuteDropView, is_table ? BindDropTable : BindDropView, InitDropView);
+	function.serialize = SerializeDropEntry;
+	function.deserialize = DeserializeDropEntry;
+	return function;
 }
 
 string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog,
@@ -1151,6 +1495,10 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 				auto &drop = parser.statements[0]->Cast<DropStatement>();
 				if (drop.info->type == CatalogType::VIEW_ENTRY) {
 					append_statement(BuildDropViewStatement(*drop.info));
+					continue;
+				}
+				if (drop.info->type == CatalogType::TABLE_ENTRY) {
+					append_statement(BuildDropTableStatement(*drop.info));
 					continue;
 				}
 			}

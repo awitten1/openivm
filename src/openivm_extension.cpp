@@ -33,6 +33,7 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/planner/planner_extension.hpp"
 #include "core/parser.hpp"
 #include "core/parser_ddl.hpp"
 #include "rules/incremental_rewrite_rule.hpp"
@@ -407,21 +408,15 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto refresh_insert_rule = duckdb::RefreshInsertRule();
 
 	ParserExtension::Register(db_config, std::move(materialized_view_parser));
+	PlannerExtension mv_lifecycle;
+	mv_lifecycle.post_bind_function = BindMaterializedViewLifecycle;
+	PlannerExtension::Register(db_config, std::move(mv_lifecycle));
 	OptimizerExtension::Register(db_config, std::move(incremental_rewrite_rule));
 	OptimizerExtension::Register(db_config, std::move(refresh_insert_rule));
 
-	loader.RegisterFunction(PragmaFunction::PragmaCall("openivm_materialized_view_lifecycle",
-	                                                   MaterializedViewLifecycleQuery, {LogicalType::VARCHAR}));
-	loader.RegisterFunction(PragmaFunction::PragmaCall("openivm_materialized_view_drop", MaterializedViewDropQuery,
-	                                                   {LogicalType::VARCHAR}));
-	loader.RegisterFunction(TableFunction(
-	    "openivm_execute_drop_view",
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
-	    ExecuteDropView, BindDropView, InitDropView));
-	loader.RegisterFunction(TableFunction(
-	    "openivm_execute_drop_table",
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
-	    ExecuteDropView, BindDropTable, InitDropView));
+	loader.RegisterFunction(SourceWatermarkFunction());
+	loader.RegisterFunction(DropEntryFunction(CatalogType::VIEW_ENTRY));
+	loader.RegisterFunction(DropEntryFunction(CatalogType::TABLE_ENTRY));
 
 	TableFunction compute_delta_function("ComputeDelta",
 	                                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},

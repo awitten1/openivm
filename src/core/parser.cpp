@@ -1,4 +1,7 @@
 #include "core/parser.hpp"
+#include "duckdb/planner/planner_extension.hpp"
+#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
 
 #include "core/plan_rewrite.hpp"
 #include "core/openivm_constants.hpp"
@@ -277,15 +280,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	auto name_resolution_start = create_profile_now();
 	auto full_view_name = parse_data_ref.target_name;
-	// Keep the user's AS-query body as the source of truth for original-SQL fallback,
-	// qualifying its public source identities while the caller's search path is active.
-	// Do not recover this from DuckDB's parsed QueryNode::ToString(): that path is a
-	// best-effort pretty-printer and has segfaulted on set-operation query nodes with
-	// incomplete CTE/query internals. LPTS remains the normalized serializer below
-	// for supported logical plans; this string is only the safe fallback input.
-	auto original_view_query =
-	    openivm::TimeTravelPins::QualifySources(context, SqlUtils::ExtractViewQuery(statement->query));
-
 	auto target = ResolveMaterializedViewTarget(context, full_view_name);
 	string view_catalog_prefix;
 	string sql_view_name = target.view_name;
@@ -293,6 +287,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Reuse legacy keys written earlier in the caller transaction as well.
 		// Otherwise the helper allocates a second key for the same SQL name.
 		RefreshMetadata(con).SnapshotTransaction(context);
+	}
+	// Helper metadata probes must also see lifecycle mutations executed earlier
+	// in this caller transaction.
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		metadata_state->Apply(con);
 	}
 	string view_name = RefreshMetadata(con).AllocateViewKey(target.catalog_name, target.schema_name, sql_view_name);
 	view_key = view_name;
@@ -336,6 +335,25 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	    internal_schema.empty() ? view_catalog_prefix : SqlUtils::QualifiedPrefix(view_target_catalog, internal_schema);
 	string internal_target_catalog = view_target_catalog;
 	string internal_target_schema = internal_schema.empty() ? view_target_schema : internal_schema;
+	if (context.transaction.IsAutoCommit() && !internal_schema.empty() &&
+	    StringUtil::CIEquals(view_target_catalog, default_db)) {
+		// Shared source-delta allocation may create this same schema on a helper.
+		// Create it before source planning opens the caller's native catalog snapshot,
+		// so the caller can also create its backing/publication tables there.
+		auto created = con.Query("CREATE SCHEMA IF NOT EXISTS " + SqlUtils::QuoteIdentifier(internal_target_catalog) +
+		                         "." + SqlUtils::QuoteIdentifier(internal_target_schema));
+		if (created->HasError()) {
+			throw CatalogException("OpenIVM could not initialize its internal schema: %s", created->GetError());
+		}
+	}
+	// Keep the user's AS-query body as the source of truth for original-SQL fallback,
+	// qualifying its public source identities while the caller's search path is active.
+	// Do not recover this from DuckDB's parsed QueryNode::ToString(): that path is a
+	// best-effort pretty-printer and has segfaulted on set-operation query nodes with
+	// incomplete CTE/query internals. LPTS remains the normalized serializer below
+	// for supported logical plans; this string is only the safe fallback input.
+	auto original_view_query =
+	    openivm::TimeTravelPins::QualifySources(context, SqlUtils::ExtractViewQuery(statement->query));
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Internal objects for %s use %s.%s\n", view_name.c_str(),
 	                    internal_target_catalog.c_str(), internal_target_schema.c_str());
 	string data_table = IncrementalTableNames::DataTableName(view_name);
@@ -376,8 +394,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Fail before registering cleanup DDL. Otherwise a duplicate CREATE attempt
 		// can fail on the pre-existing backing table and then cleanup would drop the
 		// original MV's user-facing view/data table.
-		if (RelationExists(context, view_target_catalog, view_target_schema, view_name) ||
-		    RelationExists(context, internal_target_catalog, internal_target_schema, data_table)) {
+		auto metadata_state = TransactionalMVMetadataState::TryGet(context);
+		bool pending_drop = metadata_state && metadata_state->HasPendingViewDrop(view_name);
+		if (!pending_drop && (RelationExists(context, view_target_catalog, view_target_schema, view_name) ||
+		                      RelationExists(context, internal_target_catalog, internal_target_schema, data_table))) {
 			throw CatalogException("Table with name \"" + view_name + "\" already exists!");
 		}
 	}
@@ -1719,18 +1739,23 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// The initial load already includes every visible source delta, including
 		// writes earlier in this transaction and changes retained for other MVs.
 		auto source_delta = delta_prefix + SqlUtils::QuoteIdentifier(placement.table_name);
-		InitializeSourceDelta(context, con, source_delta, ddl.back());
+		auto allocated = InitializeSourceDelta(context, con, source_delta, ddl.back());
 		if (context.transaction.IsAutoCommit()) {
 			// Shared initialization has committed this DDL already. Reissuing even
 			// CREATE IF NOT EXISTS would enlist an attached native source as a writer.
 			ddl.pop_back();
 		}
+		// A newly allocated shared delta is empty and was committed after source
+		// planning opened the caller's snapshot. Its creation watermark needs no
+		// physical scan; existing or caller-created deltas still use the caller's
+		// visible rows, including uncommitted changes in an explicit transaction.
+		auto watermark = allocated ? creation_timestamp
+		                           : "COALESCE((SELECT MAX(openivm_timestamp) + INTERVAL '1 microsecond' FROM " +
+		                                 source_delta + "), " + creation_timestamp + ")";
 		native_watermark_ddl.push_back(
-		    "UPDATE " + SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE) +
-		    " SET last_update = COALESCE((SELECT MAX(openivm_timestamp) + INTERVAL '1 microsecond' FROM " +
-		    source_delta + "), " + creation_timestamp + "), last_refresh_ts = " + creation_timestamp +
-		    " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-		    SqlUtils::EscapeValue(source_metadata_key(source, SqlUtils::DeltaName(table_name))) + "'");
+		    BuildSourceWatermarkUpdate(SqlUtils::FullName(default_db, default_schema, openivm::DELTA_TABLES_TABLE),
+		                               view_name, source_metadata_key(source, SqlUtils::DeltaName(table_name)),
+		                               watermark, creation_timestamp, !context.transaction.IsAutoCommit()));
 	}
 
 	// --- Index DDL (for aggregate group queries) ---
@@ -1928,33 +1953,13 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 ParserExtensionPlanResult
 MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientContext &context,
                                               unique_ptr<ParserExtensionParseData> parse_data) {
-	string view_key;
-	return PlanMaterializedView(context, std::move(parse_data), view_key);
-}
-
-string MaterializedViewLifecycleQuery(ClientContext &context, const FunctionParameters &parameters) {
-	auto query = StringValue::Get(parameters.values[0]);
-	auto parse_result = ParseMaterializedViewStatement(query, OpenIvmInputDialect(context));
-	if (parse_result.type != ParserExtensionResultType::PARSE_SUCCESSFUL) {
-		throw ParserException("OpenIVM could not parse the materialized-view lifecycle statement");
+	auto lifecycle_info = make_shared_ptr<TransactionalDDLInfo>();
+	auto result = PlanMaterializedView(context, std::move(parse_data), lifecycle_info->view_key,
+	                                   &lifecycle_info->metadata_catalog, &lifecycle_info->metadata_schema);
+	if (result.function.name == OPENIVM_TRANSACTIONAL_DDL_FUNCTION) {
+		result.function.function_info = std::move(lifecycle_info);
 	}
-	string view_key;
-	string metadata_catalog;
-	string metadata_schema;
-	auto plan_result = PlanMaterializedView(context, std::move(parse_result.parse_data), view_key, &metadata_catalog,
-	                                        &metadata_schema);
-	if (plan_result.function.name == OPENIVM_TRANSACTIONAL_DDL_FUNCTION) {
-		if (!view_key.empty()) {
-			TransactionalMVLockState::Get(context).AcquireMutationLock();
-		}
-		if (!context.transaction.IsAutoCommit()) {
-			TransactionalMVMetadataState::Get(context).Register(context, plan_result.parameters, view_key,
-			                                                    metadata_catalog, metadata_schema);
-		}
-		return RenderTransactionalDDL(context, plan_result.parameters, metadata_catalog, metadata_schema);
-	}
-	ExecuteStagedDDL(context, plan_result.parameters);
-	return "SELECT true AS \"MATERIALIZED VIEW CREATION\"";
+	return result;
 }
 
 static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata &metadata, const string &view_name,
@@ -2068,9 +2073,9 @@ static string ExecuteAutocommitDropProgram(Connection &con, const string &progra
 	return "SELECT true AS Success";
 }
 
-static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop_info) {
+static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop_info, bool defer_native_execution) {
 	unique_ptr<MutationLockGuard> autocommit_guard;
-	if (context.transaction.IsAutoCommit()) {
+	if (context.transaction.IsAutoCommit() && !defer_native_execution) {
 		autocommit_guard = make_uniq<MutationLockGuard>(context);
 	} else {
 		TransactionalMVLockState::Get(context).AcquireMutationLock();
@@ -2080,6 +2085,13 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	auto table_entry = Catalog::GetEntry(context, drop_info.catalog, drop_info.schema,
 	                                     EntryLookupInfo(CatalogType::TABLE_ENTRY, drop_info.name, error_context),
 	                                     OnEntryNotFound::RETURN_NULL);
+	if (!table_entry) {
+		// Resolve this DROP when the native driver reaches it; temporary objects
+		// may have been created by preceding statements in the same batch.
+		// Keep the unresolved reference for the DROP executor's native bind; assigning
+		// the current metadata schema here loses temporary and search-path identities.
+		return BuildDropTableStatement(drop_info) + ";\n";
+	}
 	if (table_entry) {
 		drop_info.name = table_entry->name;
 		drop_info.catalog = table_entry->ParentCatalog().GetName();
@@ -2096,11 +2108,14 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 
 	// Lifecycle/refresh programs own their internal state cleanup. They are not
 	// source-table deletions and must not produce a second set of retractions.
-	if (!table_entry || SqlUtils::IsDelta(drop_info.name) || IncrementalTableNames::IsDataTable(drop_info.name)) {
+	if (table_entry->temporary || SqlUtils::IsDelta(drop_info.name) ||
+	    IncrementalTableNames::IsDataTable(drop_info.name)) {
 		return BuildDropTableStatement(drop_info) + ";\n";
 	}
 
 	Connection con(*context.db);
+	TransactionalMVLockState::Get(*con.context)
+	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	RefreshMetadata::UseCatalog(context, con, drop_info.catalog);
 	auto catalogs = RefreshMetadata::MetadataCatalogs(con);
 	// A first CREATE in this transaction may own metadata not yet discoverable
@@ -2139,9 +2154,9 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 			// Retained MVs must observe removal before a same-named replacement.
 			auto source = SqlUtils::FullName(drop_info.catalog, drop_info.schema, drop_info.name);
 			auto retract = "DELETE FROM " + source + ";\n" + BuildDropTableStatement(drop_info) + ";\n";
-			TransactionalMVLockState::Get(*con.context)
-			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
-			return context.transaction.IsAutoCommit() ? ExecuteAutocommitDropProgram(con, retract) : retract;
+			return context.transaction.IsAutoCommit() && !defer_native_execution
+			           ? ExecuteAutocommitDropProgram(con, retract)
+			           : retract;
 		}
 		RefreshMetadata metadata(con);
 		vector<string> local_views;
@@ -2164,6 +2179,7 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 			auto location = metadata.GetStoredViewLocation(view_name);
 			AppendTrackedViewDropProgram(context, metadata, view_name, location, local_program, sources, true,
 			                             OnEntryNotFound::RETURN_NULL);
+			TransactionalMVMetadataState::Get(context).RegisterViewDrop(view_name);
 			if (!local_excluded_views.empty()) {
 				local_excluded_views += ", ";
 			}
@@ -2187,7 +2203,9 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 			ExecuteStagedDDL(context, {Value(program)});
 			return "SELECT true AS Success";
 		}
-		return ExecuteAutocommitDropProgram(con, program);
+		if (!defer_native_execution) {
+			return ExecuteAutocommitDropProgram(con, program);
+		}
 	}
 	auto &state = TransactionalMVMetadataState::Get(context);
 	state.RegisterSQL(program, dependent_views.front());
@@ -2197,32 +2215,24 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	return program;
 }
 
-string MaterializedViewDropQuery(ClientContext &context, const FunctionParameters &parameters) {
-	auto query = StringValue::Get(parameters.values[0]);
-	ParserOptions options = context.GetParserOptions();
-	options.extensions = nullptr;
-	Parser parser(options);
-	parser.ParseQuery(query);
-	if (parser.statements.size() != 1 || parser.statements[0]->type != StatementType::DROP_STATEMENT) {
-		throw InternalException("OpenIVM DROP rewrite expected one DROP statement");
+static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo &drop_info,
+                                               bool defer_native_execution) {
+	Binder::BindSchemaOrCatalog(context, drop_info.catalog, drop_info.schema);
+	if (drop_info.type == CatalogType::TABLE_ENTRY) {
+		return BuildSourceDropTableProgram(context, drop_info, defer_native_execution);
 	}
-	auto &drop = parser.statements[0]->Cast<DropStatement>();
-	Binder::BindSchemaOrCatalog(context, drop.info->catalog, drop.info->schema);
-	if (drop.info->type == CatalogType::TABLE_ENTRY) {
-		return BuildSourceDropTableProgram(context, *drop.info);
-	}
-	if (drop.info->type != CatalogType::VIEW_ENTRY) {
+	if (drop_info.type != CatalogType::VIEW_ENTRY) {
 		throw InternalException("OpenIVM DROP rewrite expected DROP VIEW");
 	}
 	// Resolve ownership and shared-delta consumers under the same gate as CREATE.
 	// Retain it through native commit or the staged executor's re-entrant guard.
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
 
-	string catalog_name = drop.info->catalog;
-	string schema_name = drop.info->schema;
+	string catalog_name = drop_info.catalog;
+	string schema_name = drop_info.schema;
 	QueryErrorContext error_context;
 	auto view_entry = Catalog::GetEntry(context, catalog_name, schema_name,
-	                                    EntryLookupInfo(CatalogType::VIEW_ENTRY, drop.info->name, error_context),
+	                                    EntryLookupInfo(CatalogType::VIEW_ENTRY, drop_info.name, error_context),
 	                                    OnEntryNotFound::RETURN_NULL);
 	if (view_entry) {
 		catalog_name = view_entry->ParentCatalog().GetName();
@@ -2245,19 +2255,19 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	if (schema_name.empty()) {
 		schema_name = DEFAULT_SCHEMA;
 	}
-	drop.info->catalog = catalog_name;
-	drop.info->schema = schema_name;
+	drop_info.catalog = catalog_name;
+	drop_info.schema = schema_name;
 
 	Connection con(*context.db);
 	RefreshMetadata::UseCatalog(context, con, catalog_name);
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 		metadata_state->Apply(con);
 	}
-	auto view_key = RefreshMetadata(con).FindViewKey(catalog_name, schema_name, drop.info->name);
+	auto view_key = RefreshMetadata(con).FindViewKey(catalog_name, schema_name, drop_info.name);
 	if (view_key.empty()) {
-		return BuildDropViewStatement(*drop.info) + ";\n";
+		return BuildDropViewStatement(drop_info) + ";\n";
 	}
-	string program = BuildDropViewStatement(*drop.info) + ";\n";
+	string program = BuildDropViewStatement(drop_info) + ";\n";
 	string data_table_name = IncrementalTableNames::DataTableName(view_key);
 	string data_table_ref;
 	if (view_entry) {
@@ -2276,7 +2286,7 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 		tracked = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 		                    SqlUtils::EscapeValue(view_key) + "'");
 	}
-	if (data_table_ref.empty() || tracked->HasError() || tracked->RowCount() == 0) {
+	if (tracked->HasError() || tracked->RowCount() == 0) {
 		return program;
 	}
 	if (!legacy_identity && !tracked->GetValue(0, 0).IsNull() && !tracked->GetValue(1, 0).IsNull()) {
@@ -2300,7 +2310,7 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	program.clear();
 	vector<RefreshMetadata::DeltaSource> delta_sources;
 	vector<string> drop_views;
-	if (drop.info->cascade) {
+	if (drop_info.cascade) {
 		drop_views = metadata.GetDownstreamViewsStrict(view_key);
 		std::reverse(drop_views.begin(), drop_views.end());
 	}
@@ -2310,8 +2320,8 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	for (auto &view_name : drop_views) {
 		auto location = metadata.GetStoredViewLocation(view_name, catalog_name, schema_name);
 		staged_drop |= metadata.IsDuckLakeCatalog(location.catalog_name);
-		AppendTrackedViewDropProgram(context, metadata, view_name, location, program, delta_sources, drop.info->cascade,
-		                             view_name == view_key ? drop.info->if_not_found : OnEntryNotFound::RETURN_NULL);
+		AppendTrackedViewDropProgram(context, metadata, view_name, location, program, delta_sources, drop_info.cascade,
+		                             view_name == view_key ? drop_info.if_not_found : OnEntryNotFound::RETURN_NULL);
 		if (!excluded_views.empty()) {
 			excluded_views += ", ";
 		}
@@ -2328,18 +2338,45 @@ string MaterializedViewDropQuery(ClientContext &context, const FunctionParameter
 	if (staged_drop) {
 		program = QualifyDropMetadata(program, metadata_location);
 		OPENIVM_DEBUG_PRINT("[DROP] Staging DuckLake view and native metadata cleanup for '%s'\n",
-		                    drop.info->name.c_str());
+		                    drop_info.name.c_str());
 		ExecuteStagedDDL(context, {Value(program)});
 		return "SELECT true AS Success";
 	}
-	if (!context.transaction.IsAutoCommit()) {
-		// Replay retains this location before redirecting it to helper-local shadows.
-		auto &state = TransactionalMVMetadataState::Get(context);
-		state.RegisterSQL(QualifyDropMetadata(program, metadata_location), drop.info->name);
-		for (auto &view_name : drop_views) {
-			state.IncludeView(view_name);
-		}
+	// Replay retains this location before redirecting it to helper-local shadows.
+	auto &state = TransactionalMVMetadataState::Get(context);
+	state.RegisterSQL(QualifyDropMetadata(program, metadata_location), view_key);
+	for (auto &view_name : drop_views) {
+		state.RegisterViewDrop(view_name);
 	}
 	return QualifyDropMetadata(program, metadata_location);
 }
+
+// Unlike pragma preprocessing, post-bind runs when this particular statement
+// is prepared, after earlier statements in a native batch have executed. It
+// defers generated SQL binding until each preceding physical step has finished.
+void BindMaterializedViewLifecycle(PlannerExtensionInput &input, BoundStatement &statement) {
+	if (statement.plan && statement.plan->type == LogicalOperatorType::LOGICAL_GET) {
+		auto &get = statement.plan->Cast<LogicalGet>();
+		if (get.function.name == OPENIVM_TRANSACTIONAL_DDL_FUNCTION) {
+			auto &info = get.function.function_info->Cast<TransactionalDDLInfo>();
+			TransactionalMVMetadataState::Get(input.context)
+			    .Register(input.context, get.parameters, info.view_key, info.metadata_catalog, info.metadata_schema);
+			auto program =
+			    RenderTransactionalDDL(input.context, get.parameters, info.metadata_catalog, info.metadata_schema);
+			statement.plan = BindLifecycleProgram(input.context, input.binder, program);
+			return;
+		}
+	}
+	if (!statement.plan || statement.plan->type != LogicalOperatorType::LOGICAL_DROP) {
+		return;
+	}
+	auto &drop = statement.plan->Cast<LogicalSimple>().info->Cast<DropInfo>();
+	if (drop.type != CatalogType::TABLE_ENTRY && drop.type != CatalogType::VIEW_ENTRY) {
+		return;
+	}
+	auto program = BuildMaterializedViewDropProgram(input.context, drop, true);
+	OPENIVM_DEBUG_PRINT("[DROP] Binding common lifecycle for native DROP '%s'\n", drop.name.c_str());
+	statement.plan = BindLifecycleProgram(input.context, input.binder, program);
+}
+
 } // namespace duckdb

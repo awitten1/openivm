@@ -47,14 +47,20 @@ optional_ptr<MetadataLocationState> TryGetLocationState(ClientContext &context) 
 	return context.registered_state->Get<MetadataLocationState>(METADATA_LOCATION_STATE);
 }
 
+vector<string> CatalogSchemas(ClientContext &context, Catalog &catalog) {
+	vector<string> schemas;
+	// ScanSchemas holds the schema CatalogSet lock while invoking its callback.
+	// Collect names only; resolving entries inside the callback reacquires that
+	// same lock, even when looking up a table in another schema of this catalog.
+	catalog.ScanSchemas(context, [&](SchemaCatalogEntry &schema) { schemas.push_back(schema.name); });
+	std::sort(schemas.begin(), schemas.end());
+	return schemas;
+}
+
 vector<string> CatalogSchemas(Connection &con, const string &catalog) {
 	vector<string> schemas;
-	con.context->RunFunctionInTransaction([&]() {
-		Catalog::GetCatalog(*con.context, catalog).ScanSchemas(*con.context, [&](SchemaCatalogEntry &schema) {
-			schemas.push_back(schema.name);
-		});
-	});
-	std::sort(schemas.begin(), schemas.end());
+	con.context->RunFunctionInTransaction(
+	    [&]() { schemas = CatalogSchemas(*con.context, Catalog::GetCatalog(*con.context, catalog)); });
 	return schemas;
 }
 
@@ -74,8 +80,8 @@ string ResolveMetadataCatalog(ClientContext &context, Connection &con, const str
 	}
 	if (!catalog.empty()) {
 		auto type = con.Query("SELECT database_name, type FROM duckdb_databases() WHERE NOT internal AND "
-		                      "database_name = '" +
-		                      SqlUtils::EscapeValue(catalog) + "'");
+		                      "lower(database_name) = lower(" +
+		                      Value(catalog).ToSQLString() + ")");
 		if (type->HasError()) {
 			throw CatalogException("OpenIVM could not resolve metadata catalog: %s", type->GetError());
 		}
@@ -116,6 +122,15 @@ string PreferredMetadataSchema(ClientContext &context, const string &catalog) {
 		return state->schema_name;
 	}
 	return RefreshMetadata::ConfiguredMetadataSchema(context);
+}
+
+// Compilation may USE the source schema after selecting its metadata location.
+// Ownership reads must retain that location, including its transaction replay.
+string MetadataOwnershipTable(Connection &con, const string &table) {
+	if (con.TableInfo(TEMP_CATALOG, DEFAULT_SCHEMA, table)) {
+		return SqlUtils::FullName(TEMP_CATALOG, DEFAULT_SCHEMA, table);
+	}
+	return RefreshMetadata::MetadataTable(con, table);
 }
 
 } // namespace
@@ -624,11 +639,11 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDelta(ClientContext &
 		    metadata_catalog.IsTemporaryCatalog()) {
 			continue;
 		}
-		metadata_catalog.ScanSchemas(context, [&](SchemaCatalogEntry &metadata_schema) {
+		for (auto &metadata_schema : CatalogSchemas(context, metadata_catalog)) {
 			auto entry = metadata_catalog.GetEntry<TableCatalogEntry>(
-			    context, metadata_schema.name, openivm::DELTA_TABLES_TABLE, OnEntryNotFound::RETURN_NULL);
+			    context, metadata_schema, openivm::DELTA_TABLES_TABLE, OnEntryNotFound::RETURN_NULL);
 			if (!entry) {
-				return;
+				continue;
 			}
 			vector<StorageIndex> columns;
 			vector<LogicalType> types;
@@ -689,7 +704,7 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDelta(ClientContext &
 					}
 				}
 			}
-		});
+		}
 	}
 	if (delta) {
 		auto physical_key = StringUtil::Lower(SqlUtils::FullName(catalog, delta->schema.name, delta->name));
@@ -834,13 +849,14 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source) {
 		return false;
 	}
 	auto owner = PublishedSourceViewName(source.table_name);
+	auto views_table = MetadataOwnershipTable(con, openivm::VIEWS_TABLE);
 	// An MV's own deltas live in its internal location, which may differ from the view's schema.
 	auto query = [&](const string &schema_expression) {
-		return con.Query(
-		    "SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name='" + SqlUtils::EscapeValue(owner) +
-		    "' AND COALESCE(view_catalog,'" + SqlUtils::EscapeValue(source.catalog_name) + "')='" +
-		    SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(" + schema_expression + ",'" +
-		    SqlUtils::EscapeValue(source.schema_name) + "')='" + SqlUtils::EscapeValue(source.schema_name) + "'");
+		return con.Query("SELECT 1 FROM " + views_table + " WHERE view_name='" + SqlUtils::EscapeValue(owner) +
+		                 "' AND COALESCE(view_catalog,'" + SqlUtils::EscapeValue(source.catalog_name) + "')='" +
+		                 SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(" + schema_expression + ",'" +
+		                 SqlUtils::EscapeValue(source.schema_name) + "')='" +
+		                 SqlUtils::EscapeValue(source.schema_name) + "'");
 	};
 	auto result = query("internal_schema, view_schema");
 	if (result->HasError()) {
@@ -924,9 +940,9 @@ bool RefreshMetadata::HasSourceDeltaConsumers(Connection &con, const DeltaSource
 			UseLocation(*replay, location);
 			transaction_state->Apply(*replay);
 			reader = replay.get();
-			target = SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
+			target = MetadataOwnershipTable(*reader, openivm::DELTA_TABLES_TABLE);
 		} else if (StringUtil::CIEquals(table, current_table)) {
-			target = SqlUtils::QuoteIdentifier(openivm::DELTA_TABLES_TABLE);
+			target = MetadataOwnershipTable(*reader, openivm::DELTA_TABLES_TABLE);
 		}
 		auto query = "SELECT count(*) FROM " + target + " WHERE " +
 		             SourcePredicate(source.table_name, source.catalog_name, source.schema_name);
@@ -1369,8 +1385,8 @@ bool RefreshMetadata::IsDuckLakeCatalog(const string &catalog_name) {
 	if (catalog_name.empty()) {
 		return false;
 	}
-	auto result = con.Query("SELECT type FROM duckdb_databases() WHERE database_name = '" +
-	                        SqlUtils::EscapeValue(catalog_name) + "' LIMIT 1");
+	auto result = con.Query("SELECT type FROM duckdb_databases() WHERE lower(database_name) = lower(" +
+	                        Value(catalog_name).ToSQLString() + ") LIMIT 1");
 	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
 	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
 }

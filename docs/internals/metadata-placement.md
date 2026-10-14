@@ -87,6 +87,12 @@ When a preferred name is occupied (including by a legacy colocated delta),
 OpenIVM allocates a free name with an `__openivm_<number>` suffix. It checks source
 ownership before reusing an existing delta rather than adopting a table by name.
 CREATE holds the database mutation gate through ownership publication and commit.
+In autocommit, shared metadata initialization inspects and updates the helper's
+catalog snapshot. The native target's internal schema is also initialized before
+source planning opens the caller's snapshot. Newly allocated, empty source deltas
+use the creation watermark without a caller-side scan of the helper's newer table;
+existing deltas retain the caller-visible watermark calculation. Explicit
+transactions keep schema creation and metadata upgrades in the caller transaction.
 Before allocating a source delta, it reconciles transaction-local ownership with
 a fresh committed read, so an explicit transaction with an older metadata snapshot
 reuses the shared delta. If that identity conflicts with its local ownership or is
@@ -106,6 +112,26 @@ view DROP, and source-table CASCADE. A helper redirects only mutations for its
 selected metadata catalog and schema to temporary shadows, rebuilding those
 shadows when it inspects another location. Qualified CASCADE deletions therefore
 remain visible to a later final-consumer DROP in the same transaction.
+Delta ownership probes explicitly name the selected metadata location or its
+temporary replay tables. Source planning may change a helper's search path without
+redirecting replacement, DROP, or commit-time consumer checks to a user schema.
+Ordinary table DROP binds through the native planner after earlier batch statements
+execute. Scratch tables are therefore resolved in the temporary catalog, rather
+than assigned the control metadata schema before their CREATE has executed.
+The physical DROP executor uses native DROP binding for the same identity and
+transaction-write checks. Plan serialization retains that resolved DROP identity,
+including temporary targets, without repeating binding during deserialization.
+CREATE/ALTER lifecycle statements also bind at their
+native statement position, after preceding source DDL or BEGIN has executed.
+Their generated SQL binds and executes sequentially on the caller's active
+executor and transaction, so a step can use an object created by its predecessor
+and a later CREATE sees uncommitted DROP. A failed step invalidates the lifecycle's
+transaction, preventing partial writes from being committed. Native query profiling
+reports the enclosing lifecycle operator's time; dynamically compiled steps do not
+add operators to DuckDB's already initialized profiling tree.
+Source watermarks are recorded as evaluated timestamp values when the caller
+executes CREATE or replacement. Replay uses those values without reading physical
+delta tables that may still be invisible outside the caller transaction.
 `openivm_delta_tables` records each source's catalog and schema, the physical delta
 name (`delta_table_name`), and, for moved deltas, the internal schema (`delta_schema`).
 Older rows without a stored physical name retain their original naming rule.

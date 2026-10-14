@@ -240,29 +240,30 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 }
 
 template <class BUILD_DDL>
-static void InitializeSharedDDL(ClientContext &context, Connection &con, const string &probe, BUILD_DDL build_ddl) {
+static bool InitializeSharedDDL(ClientContext &context, Connection &con, const string &probe, BUILD_DDL build_ddl) {
 	// Explicit transactions retain their atomic, rollbackable initialization.
 	if (!context.transaction.IsAutoCommit()) {
-		return;
+		return false;
 	}
 	auto initialized = [&]() {
 		return !con.Query(probe)->HasError();
 	};
 	if (initialized()) {
-		return;
+		return false;
 	}
 	// Re-entrant when lifecycle planning already owns the publication gate.
 	MutationLockGuard guard(context);
 	if (initialized()) {
-		return;
+		return false;
 	}
-	vector<string> ddl;
-	build_ddl(ddl);
-	OPENIVM_DEBUG_PRINT("[METADATA] Initializing shared tables (%llu statements)\n", (unsigned long long)ddl.size());
 	bool transaction_started = false;
 	try {
 		con.BeginTransaction();
 		transaction_started = true;
+		vector<string> ddl;
+		build_ddl(ddl);
+		OPENIVM_DEBUG_PRINT("[METADATA] Initializing shared tables (%llu statements)\n",
+		                    (unsigned long long)ddl.size());
 		for (const auto &sql : ddl) {
 			auto result = con.Query(sql);
 			if (result->HasError()) {
@@ -277,6 +278,7 @@ static void InitializeSharedDDL(ClientContext &context, Connection &con, const s
 		throw;
 	}
 	OPENIVM_DEBUG_PRINT("[METADATA] Shared tables initialized\n");
+	return true;
 }
 
 void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema) {
@@ -293,12 +295,15 @@ void InitializeMVMetadata(ClientContext &context, Connection &con, const string 
 	                        table(openivm::PROFILE_TABLE) + " p, " + table(openivm::MV_DEPS_TABLE) + " dep, " +
 	                        table(openivm::MATCH_LOG_TABLE) + " m, " + table(openivm::CONSTRAINTS_CACHE_TABLE) +
 	                        " c LIMIT 0",
-	                    [&](vector<string> &ddl) { AppendMetadataSchemaDDL(context, catalog, schema, ddl); });
+	                    // Inspect the transaction that executes this DDL. Inspecting the caller
+	                    // here would open its catalog snapshot before the helper commits these
+	                    // tables, making the subsequent caller lifecycle conflict with them.
+	                    [&](vector<string> &ddl) { AppendMetadataSchemaDDL(*con.context, catalog, schema, ddl); });
 }
 
-void InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl) {
-	InitializeSharedDDL(context, con, "SELECT * FROM " + delta_table + " LIMIT 0",
-	                    [&](vector<string> &statements) { statements.push_back(ddl); });
+bool InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl) {
+	return InitializeSharedDDL(context, con, "SELECT * FROM " + delta_table + " LIMIT 0",
+	                           [&](vector<string> &statements) { statements.push_back(ddl); });
 }
 
 void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog, const string &schema,
