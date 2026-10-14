@@ -86,6 +86,12 @@ so same-named sources of different schemas have different preferred names.
 When a preferred name is occupied (including by a legacy colocated delta),
 OpenIVM allocates a free name with an `__openivm_<number>` suffix. It checks source
 ownership before reusing an existing delta rather than adopting a table by name.
+CREATE holds the database mutation gate through ownership publication and commit.
+Before allocating a source delta, it reconciles transaction-local ownership with
+a fresh committed read, so an explicit transaction with an older metadata snapshot
+reuses the shared delta. If that identity conflicts with its local ownership or is
+not visible in its catalog snapshot, the transaction must be retried rather than
+allocating a second delta.
 `openivm_delta_tables` records each source's catalog and schema, the physical delta
 name (`delta_table_name`), and, for moved deltas, the internal schema (`delta_schema`).
 Older rows without a stored physical name retain their original naming rule.

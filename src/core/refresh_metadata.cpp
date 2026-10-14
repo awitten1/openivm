@@ -7,6 +7,7 @@
 #include "core/sql_utils.hpp"
 #include "core/published_view.hpp"
 #include "duckdb/common/error_data.hpp"
+#include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/client_data.hpp"
 #include "duckdb/main/database_manager.hpp"
@@ -696,6 +697,37 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDelta(ClientContext &
 	if (!delta) {
 		delta = TransactionalMVLockState::Get(context).FindDeferredSourceDelta(catalog, schema, table);
 	}
+	return delta;
+}
+
+optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForCreate(ClientContext &context, const string &catalog,
+                                                                          const string &schema, const string &table) {
+	auto local = FindSourceDelta(context, catalog, schema, table);
+	// The mutation gate serializes publication, but does not advance an explicit
+	// transaction's snapshot. Reconcile a fresh committed read with its own writes
+	// before treating an occupied physical name as an unrelated naming collision.
+	Connection committed(*context.db);
+	optional_ptr<TableCatalogEntry> delta = local;
+	committed.context->RunFunctionInTransaction([&]() {
+		auto existing = FindSourceDelta(*committed.context, catalog, schema, table);
+		if (!existing) {
+			return;
+		}
+		if (local && (!StringUtil::CIEquals(local->schema.name, existing->schema.name) ||
+		              !StringUtil::CIEquals(local->name, existing->name))) {
+			throw TransactionException("OpenIVM source delta ownership changed for '%s'; retry the transaction",
+			                           SqlUtils::FullName(catalog, schema, table));
+		}
+		// Return an entry belonging to the caller's transaction, never the helper's.
+		delta = Catalog::GetEntry<TableCatalogEntry>(context, catalog, existing->schema.name, existing->name,
+		                                             OnEntryNotFound::RETURN_NULL);
+		if (!delta) {
+			throw TransactionException("OpenIVM source delta for '%s' is not visible; retry the transaction",
+			                           SqlUtils::FullName(catalog, schema, table));
+		}
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Reconciled committed source delta %s\n",
+		                    SqlUtils::FullName(catalog, delta->schema.name, delta->name).c_str());
+	});
 	return delta;
 }
 

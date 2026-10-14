@@ -125,6 +125,10 @@ public:
 	// Requires an active transaction on `context`.
 	static optional_ptr<TableCatalogEntry> FindSourceDelta(ClientContext &context, const string &catalog,
 	                                                       const string &schema, const string &table);
+	// Allocation must also see ownership committed after the caller's snapshot began.
+	// Requires the caller to hold the database mutation gate through publication/commit.
+	static optional_ptr<TableCatalogEntry> FindSourceDeltaForCreate(ClientContext &context, const string &catalog,
+	                                                                const string &schema, const string &table);
 
 	SourceLocation GetSourceLocation(const string &view_name, const string &table_name,
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");

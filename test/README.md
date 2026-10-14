@@ -12,6 +12,8 @@ make test_debug
 
 The native `source_delta_publication_test` integration executable pauses CREATE
 after source-delta allocation and before ownership publication, then checks a
-competing connection, shared placement, and refresh bag equality. Run it from a
+competing connection in both autocommit and an explicit transaction whose metadata
+snapshot predates ownership publication, shared placement, transaction-local
+ownership reuse, and refresh bag equality. Run it from a
 fresh pinned build alongside `test/sql/internal_schema.test` and
 `test/sql/internal_schema_ducklake.test` for namespace lifecycle regression coverage.

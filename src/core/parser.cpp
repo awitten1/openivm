@@ -1366,8 +1366,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		}
 		const auto &source = source_entry.second;
 		SourceDeltaPlacement placement;
-		auto existing =
-		    RefreshMetadata::FindSourceDelta(context, source.catalog_name, source.schema_name, source.table_name);
+		auto existing = RefreshMetadata::FindSourceDeltaForCreate(context, source.catalog_name, source.schema_name,
+		                                                          source.table_name);
 		// Change capture looks for moved deltas only in native catalogs.
 		bool internal_relation = SqlUtils::IsDelta(source.table_name) ||
 		                         IncrementalTableNames::IsDataTable(source.table_name) ||
