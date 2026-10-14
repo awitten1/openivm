@@ -24,6 +24,8 @@ class Planner;
 void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement);
 TableFunction SourceColumnsFunction();
 
+BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr, string *cast_type = nullptr);
+
 struct DuckLakeSourceTableInfo {
 	string table_name;
 	string catalog_name;

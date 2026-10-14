@@ -421,6 +421,7 @@ public:
 		string table;
 		idx_t occurrence = 0;
 		string column;
+		string cast_type;
 		bool cardinality_transition_check_safe = false;
 	};
 
