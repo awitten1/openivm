@@ -345,3 +345,341 @@ SELECT count(*) FROM internal_schema_host."Control Space".openivm_views;
 ----
 0
 
+# Auxiliary creation must bind unqualified sources before the staged executor selects native metadata.
+# A dot or parentheses inside a quoted parent MV name are identifier bytes, not qualification/functions.
+
+statement ok
+SET openivm_metadata_schema = 'Control Space';
+
+statement ok
+SET openivm_internal_schema = 'Lake Internal';
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+statement ok
+SET openivm_distinct_aux_state = true;
+
+statement ok
+SET openivm_snapshot_publication = false;
+
+statement ok
+USE dl.s1;
+
+statement ok
+CREATE TABLE namespace_items (g INTEGER, x INTEGER);
+
+statement ok
+INSERT INTO namespace_items VALUES (1,10),(1,10),(1,20),(2,30),(3,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW "Parent.MV(quoted)" AS SELECT g, x FROM namespace_items;
+
+statement ok
+CREATE MATERIALIZED VIEW inner_direct AS SELECT g, SUM(x) AS n FROM (SELECT DISTINCT g, x FROM namespace_items) d GROUP BY g;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_direct EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_direct));
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW inner_chained AS SELECT g, SUM(x) AS n FROM (SELECT DISTINCT g, x FROM "Parent.MV(quoted)") d GROUP BY g;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_chained EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_chained));
+----
+0
+
+statement ok
+CREATE MATERIALIZED VIEW counted_chained AS SELECT g, COUNT(DISTINCT x) AS n FROM "Parent.MV(quoted)" GROUP BY g;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.counted_chained EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.counted_chained));
+----
+0
+
+query TIT
+SELECT v.view_sql_name, v.type, t.schema_name FROM internal_schema_host."Control Space".openivm_views v JOIN duckdb_tables() t ON t.table_name = CASE v.view_sql_name WHEN 'counted_chained' THEN 'openivm_aux_' ELSE 'openivm_distinct_count_' END || v.view_name WHERE v.view_sql_name IN ('inner_direct','inner_chained','counted_chained') AND t.database_name = 'dl' ORDER BY v.view_sql_name;
+----
+counted_chained	11	Lake Internal
+inner_chained	8	Lake Internal
+inner_direct	8	Lake Internal
+
+statement ok
+INSERT INTO namespace_items VALUES (1,40),(2,30),(4,5),(4,5);
+
+statement ok
+DELETE FROM namespace_items WHERE x = 20;
+
+statement ok
+UPDATE namespace_items SET x = 40 WHERE x = 10;
+
+statement ok
+PRAGMA refresh('dl.s1."Parent.MV(quoted)"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1."Parent.MV(quoted)" EXCEPT ALL SELECT g, x FROM dl.s1.namespace_items) UNION ALL (SELECT g, x FROM dl.s1.namespace_items EXCEPT ALL SELECT * FROM dl.s1."Parent.MV(quoted)"));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.inner_direct');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_direct EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_direct));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.inner_chained');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_chained EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_chained));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.counted_chained');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.counted_chained EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.counted_chained));
+----
+0
+
+# Repair missing state with no pending deltas, even from the native metadata search path.
+
+statement ok
+USE internal_schema_host."Control Space";
+
+statement ok
+DROP TABLE dl."Lake Internal".openivm_distinct_count___openivm_mv_646c_7331_696e6e65725f646972656374_;
+
+statement ok
+PRAGMA refresh('dl.s1.inner_direct');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_direct EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_direct));
+----
+0
+
+statement ok
+DROP TABLE dl."Lake Internal".openivm_distinct_count___openivm_mv_646c_7331_696e6e65725f636861696e6564_;
+
+statement ok
+PRAGMA refresh('dl.s1.inner_chained');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_chained EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_chained));
+----
+0
+
+statement ok
+DROP TABLE dl."Lake Internal".openivm_aux___openivm_mv_646c_7331_636f756e7465645f636861696e6564_;
+
+statement ok
+PRAGMA refresh('dl.s1.counted_chained');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.counted_chained EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.counted_chained));
+----
+0
+
+restart
+
+statement ok
+LOAD ducklake;
+
+statement ok
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+
+statement ok
+SET openivm_cascade_refresh = 'off';
+
+statement ok
+USE internal_schema_host.main;
+
+statement ok
+INSERT INTO dl.s1.namespace_items VALUES (1,50),(1,50),(5,9);
+
+statement ok
+DELETE FROM dl.s1.namespace_items WHERE g = 4;
+
+statement ok
+UPDATE dl.s1.namespace_items SET x = 50 WHERE x = 40;
+
+statement ok
+PRAGMA refresh('dl.s1."Parent.MV(quoted)"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1."Parent.MV(quoted)" EXCEPT ALL SELECT g, x FROM dl.s1.namespace_items) UNION ALL (SELECT g, x FROM dl.s1.namespace_items EXCEPT ALL SELECT * FROM dl.s1."Parent.MV(quoted)"));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.inner_direct');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_direct EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_direct));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.inner_chained');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_chained EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_chained));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.counted_chained');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.counted_chained EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.counted_chained));
+----
+0
+
+# Reopened auxiliary repair retains both public parent identity and physical internal location.
+
+statement ok
+DROP TABLE dl."Lake Internal".openivm_distinct_count___openivm_mv_646c_7331_696e6e65725f646972656374_;
+
+statement ok
+PRAGMA refresh('dl.s1.inner_direct');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_direct EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_direct));
+----
+0
+
+statement ok
+DROP TABLE dl."Lake Internal".openivm_distinct_count___openivm_mv_646c_7331_696e6e65725f636861696e6564_;
+
+statement ok
+PRAGMA refresh('dl.s1.inner_chained');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_chained EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_chained));
+----
+0
+
+statement ok
+DROP TABLE dl."Lake Internal".openivm_aux___openivm_mv_646c_7331_636f756e7465645f636861696e6564_;
+
+statement ok
+PRAGMA refresh('dl.s1.counted_chained');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.counted_chained EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.counted_chained));
+----
+0
+
+# Replacement uses the caller namespace and keeps the persisted internal placement.
+
+statement ok
+USE dl.s1;
+
+statement ok
+SET openivm_metadata_schema = 'Control Space';
+
+statement ok
+SET openivm_internal_schema = 'Elsewhere';
+
+statement ok
+SET openivm_stateful_auxstate = true;
+
+statement ok
+SET openivm_distinct_aux_state = true;
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW inner_direct AS SELECT g, SUM(x) AS n FROM (SELECT DISTINCT g, x FROM namespace_items) d GROUP BY g;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_direct EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_direct));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW inner_chained AS SELECT g, SUM(x) AS n FROM (SELECT DISTINCT g, x FROM "Parent.MV(quoted)") d GROUP BY g;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_chained EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_chained));
+----
+0
+
+statement ok
+CREATE OR REPLACE MATERIALIZED VIEW counted_chained AS SELECT g, COUNT(DISTINCT x) AS n FROM "Parent.MV(quoted)" GROUP BY g;
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.counted_chained EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.counted_chained));
+----
+0
+
+query I
+SELECT count(*) FROM internal_schema_host."Control Space".openivm_views WHERE view_sql_name IN ('inner_direct','inner_chained','counted_chained') AND internal_schema = 'Lake Internal' AND type IN (8,11);
+----
+3
+
+statement ok
+INSERT INTO namespace_items VALUES (2,60),(2,60),(6,NULL);
+
+statement ok
+DELETE FROM namespace_items WHERE g = 5;
+
+statement ok
+UPDATE namespace_items SET x = 60 WHERE x = 50;
+
+statement ok
+PRAGMA refresh('dl.s1."Parent.MV(quoted)"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1."Parent.MV(quoted)" EXCEPT ALL SELECT g, x FROM dl.s1.namespace_items) UNION ALL (SELECT g, x FROM dl.s1.namespace_items EXCEPT ALL SELECT * FROM dl.s1."Parent.MV(quoted)"));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.inner_direct');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_direct EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1.namespace_items) d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_direct));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.inner_chained');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.inner_chained EXCEPT ALL SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g) UNION ALL (SELECT g, SUM(x) FROM (SELECT DISTINCT g, x FROM dl.s1."Parent.MV(quoted)") d GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.inner_chained));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.s1.counted_chained');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.s1.counted_chained EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM dl.s1."Parent.MV(quoted)" GROUP BY g EXCEPT ALL SELECT * FROM dl.s1.counted_chained));
+----
+0
+
+statement ok
+DROP VIEW dl.s1.inner_direct;
+
+statement ok
+DROP VIEW dl.s1.inner_chained;
+
+statement ok
+DROP VIEW dl.s1.counted_chained;
+
+statement ok
+DROP VIEW dl.s1."Parent.MV(quoted)";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'dl' AND schema_name = 'Lake Internal' AND starts_with(table_name, 'openivm_');
+----
+0
+
+query I
+SELECT count(*) FROM internal_schema_host."Control Space".openivm_views;
+----
+0

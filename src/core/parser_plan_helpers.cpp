@@ -203,12 +203,40 @@ string QualifyCreateSourceTable(ClientContext &context, const string &table_name
                                 const string &default_schema) {
 	// The staged executor builds auxiliary state with the metadata schema selected. Name the
 	// relation the view actually bound, which can come from any schema on the search path.
+	vector<string> parts;
+	try {
+		parts = SqlUtils::ParseQualifiedIdentifier(table_name);
+	} catch (const ParserException &) {
+		// Table functions are SQL expressions rather than relation identifiers.
+		return table_name;
+	}
+	if (parts.size() > 3) {
+		return table_name;
+	}
+	const auto &source_name = parts.back();
+	const string source_schema = parts.size() >= 2 ? parts[parts.size() - 2] : INVALID_SCHEMA;
+	const string source_catalog = parts.size() == 3 ? parts[0] : INVALID_CATALOG;
+	// Resolve public views before consulting physical scan facts: an MV binds to its
+	// publication table, whose name differs from the caller's quoted SQL identifier.
+	QueryErrorContext error_context;
+	for (auto type : {CatalogType::TABLE_ENTRY, CatalogType::VIEW_ENTRY}) {
+		auto entry = Catalog::GetEntry(context, source_catalog, source_schema,
+		                               EntryLookupInfo(type, source_name, error_context), OnEntryNotFound::RETURN_NULL);
+		if (entry) {
+			auto qualified =
+			    SqlUtils::FullName(entry->ParentCatalog().GetName(), entry->ParentSchema().name, entry->name);
+			OPENIVM_DEBUG_PRINT("[CREATE MV] Auxiliary source '%s' resolves to %s\n", table_name.c_str(),
+			                    qualified.c_str());
+			return qualified;
+		}
+	}
 	const SourceTableInfo *bound = nullptr;
 	bool bound_in_current_schema = false;
 	for (auto &entry : facts.source_table_info) {
 		auto &source = entry.second;
-		if (!StringUtil::CIEquals(source.table_name, table_name) &&
-		    !StringUtil::CIEquals(SqlUtils::QuoteIdentifier(source.table_name), table_name)) {
+		if (!StringUtil::CIEquals(source.table_name, source_name) ||
+		    (parts.size() >= 2 && !StringUtil::CIEquals(source.schema_name, source_schema)) ||
+		    (parts.size() == 3 && !StringUtil::CIEquals(source.catalog_name, source_catalog))) {
 			continue;
 		}
 		bool in_current_schema = StringUtil::CIEquals(source.catalog_name, current_catalog) &&
@@ -227,20 +255,8 @@ string QualifyCreateSourceTable(ClientContext &context, const string &table_name
 		                    SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name).c_str());
 		return SqlUtils::FullName(bound->catalog_name, bound->schema_name, bound->table_name);
 	}
-	// A bare table name can itself contain dots or parentheses. Only interpret SQL
-	// qualification/functions after checking the identities collected from the bound plan.
-	if (table_name.find('.') != string::npos || table_name.find('(') != string::npos) {
+	if (parts.size() > 1) {
 		return table_name;
-	}
-	// Sources such as another MV bind through a view; resolve the name as the caller's
-	// search path did when the view was planned.
-	QueryErrorContext error_context;
-	for (auto type : {CatalogType::TABLE_ENTRY, CatalogType::VIEW_ENTRY}) {
-		auto entry = Catalog::GetEntry(context, INVALID_CATALOG, INVALID_SCHEMA,
-		                               EntryLookupInfo(type, table_name, error_context), OnEntryNotFound::RETURN_NULL);
-		if (entry) {
-			return SqlUtils::FullName(entry->ParentCatalog().GetName(), entry->ParentSchema().name, entry->name);
-		}
 	}
 	if (current_catalog.empty() || (current_catalog == default_db && current_schema == default_schema)) {
 		return table_name;

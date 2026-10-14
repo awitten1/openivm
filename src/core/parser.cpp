@@ -767,8 +767,12 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 				                    "GROUP_RECOMPUTE\n");
 			} else {
 				distinct_extracted_cols = std::move(dcols);
-				distinct_extracted_input_sql = std::move(d_input_sql);
-				distinct_extracted_source = std::move(d_source);
+				distinct_extracted_source = QualifyCreateSourceTable(context, d_source, facts, current_catalog,
+				                                                     current_schema, default_db, default_schema);
+				// Table-reference matching uses decoded identifiers, whereas the extractor emits SQL quoting.
+				auto source_identifier = StringUtil::Join(SqlUtils::ParseQualifiedIdentifier(d_source), ".");
+				distinct_extracted_input_sql =
+				    SqlUtils::ReplaceTableReferences(d_input_sql, source_identifier, distinct_extracted_source);
 				distinct_extracted_filter = std::move(d_filter);
 			}
 		}
