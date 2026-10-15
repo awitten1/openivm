@@ -150,3 +150,57 @@ SELECT
        AND starts_with(table_name, 'openivm_'));
 ----
 0	0
+
+# Dollar literals and CTEs with metadata names are user SQL, including on the
+# staged DuckLake path with separate metadata and internal schemas.
+statement ok
+SET openivm_internal_schema = 'Literal Internal';
+CREATE TABLE dl.obs.literal_source(i INTEGER);
+INSERT INTO dl.obs.literal_source VALUES (1),(1),(2);
+USE dl.obs;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.obs."Literal;MV" AS
+WITH openivm_views AS (SELECT i FROM dl.obs.literal_source),
+openivm_delta_tables AS (SELECT i FROM openivm_views)
+SELECT i, $$FROM openivm_views WHERE true$$ AS label,
+    $metadata$FROM openivm_delta_tables; JOIN openivm_views$metadata$ AS tagged
+FROM openivm_delta_tables EXCEPT SELECT -1, 'never', 'never';
+
+statement ok
+CREATE VIEW memory.main.metadata_literal_expected AS
+WITH openivm_views AS (SELECT i FROM dl.obs.literal_source),
+openivm_delta_tables AS (SELECT i FROM openivm_views)
+SELECT i, $$FROM openivm_views WHERE true$$ AS label,
+    $metadata$FROM openivm_delta_tables; JOIN openivm_views$metadata$ AS tagged
+FROM openivm_delta_tables EXCEPT SELECT -1, 'never', 'never';
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM dl.obs."Literal;MV" EXCEPT ALL SELECT * FROM memory.main.metadata_literal_expected)
+    UNION ALL
+    (SELECT * FROM memory.main.metadata_literal_expected EXCEPT ALL SELECT * FROM dl.obs."Literal;MV"));
+----
+0
+
+statement ok
+INSERT INTO dl.obs.literal_source VALUES (1),(2),(3),(3),(8);
+DELETE FROM dl.obs.literal_source WHERE i=1;
+UPDATE dl.obs.literal_source SET i=4 WHERE i=2;
+DELETE FROM dl.obs.literal_source WHERE i=8;
+
+statement ok
+PRAGMA refresh('dl.obs."Literal;MV"');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM dl.obs."Literal;MV" EXCEPT ALL SELECT * FROM memory.main.metadata_literal_expected)
+    UNION ALL
+    (SELECT * FROM memory.main.metadata_literal_expected EXCEPT ALL SELECT * FROM dl.obs."Literal;MV"));
+----
+0
+
+statement ok
+DROP VIEW dl.obs."Literal;MV";
+DROP VIEW memory.main.metadata_literal_expected;
+USE memory.main;

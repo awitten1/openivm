@@ -780,6 +780,66 @@ static void RefreshAndCheckBag(Connection &owner, const string &view, const stri
 	                   ") THEN error('Publication owner survivor bag mismatch') ELSE true END;");
 }
 
+static void TestMetadataQueryText(bool explicit_transaction, bool commit) {
+	std::cerr << "CASE metadata qualification preserves query text explicit_transaction=" << explicit_transaction
+	          << " commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Public.Space\"; CREATE TABLE \"Public.Space\".source(i INTEGER); "
+	               "INSERT INTO \"Public.Space\".source VALUES (1),(1),(2); USE memory.\"Public.Space\";");
+	if (explicit_transaction) {
+		Execute(owner, "BEGIN;");
+	}
+	// EXCEPT retains the original query text for materialization. In particular,
+	// these dollar literals must not be scanned for metadata table references.
+	vector<string> queries = {"SELECT i, $$FROM openivm_views WHERE true$$ AS label FROM \"Public.Space\".source "
+	                          "EXCEPT SELECT -1, 'never'",
+	                          "SELECT i, $metadata$FROM openivm_delta_tables; JOIN openivm_views$metadata$ AS label "
+	                          "FROM \"Public.Space\".source EXCEPT SELECT -1, 'never'"};
+	for (auto &table : MetadataTableNames()) {
+		queries.push_back("WITH " + SqlUtils::QuoteIdentifier(table) +
+		                  " AS (SELECT i FROM \"Public.Space\".source) SELECT i FROM " +
+		                  SqlUtils::QuoteIdentifier(table) + " EXCEPT SELECT -1");
+	}
+	auto view_name = [&](idx_t index) {
+		return SqlUtils::FullName("memory", "Public.Space", "Literal;MV" + to_string(index));
+	};
+	auto expected_query = [&](idx_t index) {
+		return "SELECT * FROM (" + queries[index] + ") expected";
+	};
+	auto check_initial = [&](idx_t index) {
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view_name(index) + " EXCEPT ALL " +
+		                   expected_query(index) + ") OR EXISTS (" + expected_query(index) +
+		                   " EXCEPT ALL SELECT * FROM " + view_name(index) +
+		                   ") THEN error('Metadata qualification changed initial query results') ELSE true END;");
+	};
+	for (idx_t i = 0; i < queries.size(); i++) {
+		Execute(owner, "CREATE MATERIALIZED VIEW " + view_name(i) + " AS " + queries[i] + ";");
+		check_initial(i);
+	}
+	Execute(owner, "INSERT INTO \"Public.Space\".source VALUES (1),(2),(3),(3),(8); "
+	               "DELETE FROM \"Public.Space\".source WHERE i=1; "
+	               "UPDATE \"Public.Space\".source SET i=4 WHERE i=2; "
+	               "DELETE FROM \"Public.Space\".source WHERE i=8;");
+	for (idx_t i = 0; i < queries.size(); i++) {
+		RefreshAndCheckBag(owner, view_name(i), expected_query(i));
+	}
+	if (explicit_transaction) {
+		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	}
+	if (!explicit_transaction || commit) {
+		for (idx_t i = 0; i < queries.size(); i++) {
+			check_initial(i);
+			Execute(owner, "DROP VIEW " + view_name(i) + ";");
+		}
+	}
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Query-text lifecycle leaked views') END "
+	               "FROM duckdb_views() WHERE database_name='memory' AND schema_name='Public.Space' "
+	               "AND starts_with(view_name, 'Literal;MV');");
+}
+
 // Removing the last child must not remove either of its parent's delta companions.
 // Native DROP and staged cross-catalog DROP share the replacement cleanup path.
 static void TestPublicationOwnerCleanup(bool cross_catalog, bool replace, bool explicit_transaction, bool commit) {
@@ -2048,6 +2108,9 @@ int main(int argc, char **argv) {
 		TestLateLifecycleBindFailure(false);
 		TestLateLifecycleBindFailure(true);
 		TestMetadataReplayLocations();
+		TestMetadataQueryText(false, true);
+		TestMetadataQueryText(true, true);
+		TestMetadataQueryText(true, false);
 		for (bool dedicated_schema : {false, true}) {
 			TestCrossCatalogSharedDelta(dedicated_schema, false);
 			TestCrossCatalogSharedDelta(dedicated_schema, true);

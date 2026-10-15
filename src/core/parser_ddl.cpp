@@ -128,8 +128,21 @@ static bool IsSearchPathStatement(const string &statement) {
 	return StringUtil::StartsWith(lower, "use ") || StringUtil::StartsWith(lower, "set search_path");
 }
 
-// Name the metadata location explicitly instead of selecting it with USE.
-static string QualifyMetadataStatement(const string &statement, const string &catalog, const string &schema) {
+// Only generated metadata mutations need qualification. Materialization and
+// publication statements contain user SQL, whose literals and CTE names must
+// never be interpreted as references to our control tables. Generated metadata
+// reads (the duplicate-name guards) are qualified at construction instead.
+static string QualifyMetadataMutation(const string &statement, const string &catalog, const string &schema) {
+	bool metadata_target = false;
+	for (auto &table : MetadataTableNames()) {
+		if (TargetsMetadataTable(statement, table)) {
+			metadata_target = true;
+			break;
+		}
+	}
+	if (!metadata_target) {
+		return statement;
+	}
 	auto qualified = statement;
 	for (auto &table : MetadataTableNames()) {
 		auto target = SqlUtils::FullName(catalog, schema, table);
@@ -755,8 +768,8 @@ void TransactionalMVMetadataState::Register(ClientContext &context, const vector
 			                                                  string(OPENIVM_RECORD_SOURCE_WATERMARK_FUNCTION) + "(")) {
 				continue;
 			}
-			statements.push_back(QualifyMetadataStatement(StabilizeTransactionalMetadata(statement, timestamp_sql),
-			                                              metadata_catalog, metadata_schema));
+			statements.push_back(QualifyMetadataMutation(StabilizeTransactionalMetadata(statement, timestamp_sql),
+			                                             metadata_catalog, metadata_schema));
 		}
 	}
 }
@@ -1564,7 +1577,7 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 		if (IsSearchPathStatement(statement)) {
 			continue;
 		}
-		statement = QualifyMetadataStatement(statement, metadata_catalog, metadata_schema);
+		statement = QualifyMetadataMutation(statement, metadata_catalog, metadata_schema);
 
 		try {
 			Parser parser;

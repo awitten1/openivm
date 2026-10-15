@@ -310,10 +310,11 @@ void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog
                                    vector<string> &ddl, const string &view_name, bool is_replace,
                                    const string &view_catalog, const string &view_schema, const string &sql_view_name) {
 	AppendMetadataSchemaDDL(context, catalog, schema, ddl);
+	auto views_table = SqlUtils::FullName(catalog, schema, openivm::VIEWS_TABLE);
 	if (is_replace) {
 		// Legacy keys must still belong to the requested relation.
-		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +
-		              " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND (NOT " +
+		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + views_table + " WHERE view_name = '" +
+		              SqlUtils::EscapeValue(view_name) + "' AND (NOT " +
 		              SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(catalog).ToSQLString() + ")",
 		                                            Value(view_catalog).ToSQLString()) +
 		              " OR NOT " +
@@ -347,9 +348,8 @@ void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog
 		if (views && HasViewMetadata(context, *views, view_name)) {
 			ddl.push_back("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + stale_mv_condition);
 		}
-		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + string(openivm::VIEWS_TABLE) +
-		              " WHERE view_name = '" + escaped_view_name +
-		              "') THEN error('Duplicate key: materialized view \"" + escaped_sql_name +
+		ddl.push_back("SELECT CASE WHEN EXISTS (SELECT 1 FROM " + views_table + " WHERE view_name = '" +
+		              escaped_view_name + "') THEN error('Duplicate key: materialized view \"" + escaped_sql_name +
 		              "\" already exists in the requested catalog and schema.') ELSE NULL END AS openivm_name_check");
 	}
 }
