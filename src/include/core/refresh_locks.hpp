@@ -98,6 +98,10 @@ public:
 		return source;
 	}
 	void RecordCommit();
+	// Called under the owning transaction state's mutex, only by execution.
+	void MarkExecuted() {
+		executed = true;
+	}
 	bool HasCommitAfter(transaction_t snapshot);
 
 private:
@@ -105,6 +109,7 @@ private:
 	const void *owner;
 	string source;
 	bool publication;
+	bool executed = false;
 	shared_ptr<AttachedDatabase> source_database;
 };
 
@@ -122,6 +127,10 @@ public:
 	unique_ptr<SourceAdmissionGuard> AcquireSourceWriteAdmission(const string &catalog, const string &schema,
 	                                                             const string &table);
 	void RetainSourceWriteAdmission(unique_ptr<SourceAdmissionGuard> admission);
+	optional_ptr<TableCatalogEntry> FindSourceDeltaForWrite(const string &catalog, const string &schema,
+	                                                        const string &table);
+	void MarkSourceWriteExecuted(const string &catalog, const string &schema, const string &table,
+	                             const string &planned_delta);
 	void AcquireSourcePublicationLock(const string &catalog, const string &schema, const string &table);
 	void VerifySourceSnapshot(const string &catalog, const string &schema, const string &table);
 	vector<unique_ptr<SourceAdmissionGuard>> TakeSourcePublicationLocks();

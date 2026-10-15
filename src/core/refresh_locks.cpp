@@ -167,7 +167,7 @@ SourceAdmissionGuard::~SourceAdmissionGuard() {
 
 void SourceAdmissionGuard::RecordCommit() {
 	D_ASSERT(!publication);
-	if (source_database->GetCatalog().IsDuckCatalog()) {
+	if (executed && source_database->GetCatalog().IsDuckCatalog()) {
 		// Native transaction objects may already have been reclaimed when the
 		// commit callback runs. The manager supplies a safe upper bound instead.
 		// Record it before releasing admission, so publication cannot miss a writer.
@@ -223,6 +223,54 @@ void TransactionalMVLockState::RetainSourceWriteAdmission(unique_ptr<SourceAdmis
 	lock_guard<mutex> guard(state_lock);
 	auto source = admission->Source();
 	source_write_admissions.emplace(std::move(source), std::move(admission));
+}
+
+optional_ptr<TableCatalogEntry>
+TransactionalMVLockState::FindSourceDeltaForWrite(const string &catalog, const string &schema, const string &table) {
+	// Reserve only this source while deciding whether capture is needed. First
+	// publication excludes untracked writers, without serializing independent DML.
+	auto admission = AcquireSourceWriteAdmission(catalog, schema, table);
+	// Waiting does not advance the caller's metadata snapshot. Resolve committed
+	// ownership as well as its own writes, without adopting tables by name.
+	auto delta_table = RefreshMetadata::FindSourceDeltaForMutation(owner, catalog, schema, table);
+	if (!delta_table) {
+		RetainSourceWriteAdmission(std::move(admission));
+		return nullptr;
+	}
+	// CREATE holds the global gate before waiting for source admissions. Drop
+	// this temporary admission before waiting on that gate, then recheck because
+	// ownership may have changed in the gap. Prior untracked writes stay reserved.
+	admission.reset();
+	AcquireMutationLock();
+	// Keep committed writes known even if the final consumer drops its delta
+	// before a transaction with an older source snapshot attempts a new CREATE.
+	RetainSourceWriteAdmission(AcquireSourceWriteAdmission(catalog, schema, table));
+	return RefreshMetadata::FindSourceDeltaForMutation(owner, catalog, schema, table);
+}
+
+void TransactionalMVLockState::MarkSourceWriteExecuted(const string &catalog, const string &schema, const string &table,
+                                                       const string &planned_delta) {
+	auto source = StringUtil::Lower(SqlUtils::FullName(catalog, schema, table));
+	{
+		lock_guard<mutex> guard(state_lock);
+		auto entry = source_write_admissions.find(source);
+		if (entry != source_write_admissions.end()) {
+			entry->second->MarkExecuted();
+			return;
+		}
+	}
+	// A cached prepared plan can execute in a later transaction without another
+	// optimizer pass. Reacquire admission and verify that its capture target still
+	// matches before allowing the native DML sink to execute.
+	auto delta = FindSourceDeltaForWrite(catalog, schema, table);
+	auto current_delta =
+	    delta ? SqlUtils::FullName(delta->catalog.GetName(), delta->schema.name, delta->name) : string();
+	if (current_delta != planned_delta) {
+		throw TransactionException("OpenIVM source capture changed since preparation; retry the transaction");
+	}
+	lock_guard<mutex> guard(state_lock);
+	source_write_admissions.at(source)->MarkExecuted();
+	OPENIVM_DEBUG_PRINT("[SOURCE ADMISSION] Executing source write %s\n", source.c_str());
 }
 
 void TransactionalMVLockState::AcquireSourcePublicationLock(const string &catalog, const string &schema,

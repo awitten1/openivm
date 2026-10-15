@@ -112,9 +112,13 @@ suspending the planning transaction, through publication or allocation cleanup.
 An explicit transaction keeps its snapshot: first-source capture requires a retry
 if an admitted writer committed changes to that qualified source after
 the snapshot and there is no existing delta to cover them. Admission records a
-source commit marker only after a successful commit; rollback, read-only metadata
-probes and commits to other sources do not mark that source. The marker uses the
-native manager's latest commit ID as a conservative upper bound, because the
+source commit marker only after an executed DML plan successfully commits;
+planning-only admission from plain `EXPLAIN` or `PREPARE`, rollback, read-only
+metadata probes and commits to other sources do not mark that source. The native
+DML input pipeline marks execution, so `EXPLAIN ANALYZE` and executed prepared
+statements still record commits. Cached prepared plans reacquire source admission
+and verify their capture target before executing in a later transaction. The marker
+uses the native manager's latest commit ID as a conservative upper bound, because the
 writer's transaction object may already be reclaimed before the commit callback.
 It remains protected by admission until recorded. Admission release discards idle
 markers when no native snapshot can predate them; a new attachment with the same

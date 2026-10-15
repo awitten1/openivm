@@ -507,6 +507,130 @@ static string ConflictingSourceDML(const string &source) {
 	       " SET i=4 WHERE i=2; INSERT INTO " + source + " VALUES (5),(5); DELETE FROM " + source + " WHERE i=5;";
 }
 
+static string SourceAdmissionDML(const string &operation) {
+	if (operation == "insert") {
+		return "INSERT INTO source VALUES (99)";
+	}
+	if (operation == "delete") {
+		return "DELETE FROM source WHERE i=1";
+	}
+	if (operation == "update") {
+		return "UPDATE source SET i=99 WHERE i=2";
+	}
+	return "MERGE INTO source USING (VALUES (2),(99)) v(i) ON source.i=v.i "
+	       "WHEN MATCHED THEN UPDATE SET i=100 WHEN NOT MATCHED THEN INSERT VALUES(v.i)";
+}
+
+static void TestPlanningOnlySourceAdmission(bool dedicated_schema, bool tracked, const string &operation,
+                                            const string &mode, bool explicit_writer) {
+	std::cerr << "CASE planning-only source admission dedicated_schema=" << dedicated_schema << " tracked=" << tracked
+	          << " operation=" << operation << " mode=" << mode << " explicit_writer=" << explicit_writer << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), writer(db), observer(db);
+	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_metadata_schema='Control.Space'; "
+	                 "SET openivm_internal_schema=" +
+	                     Value(dedicated_schema ? "Internal Space" : "").ToSQLString() +
+	                     "; CREATE TABLE source(i INTEGER); CREATE TABLE other(i INTEGER); "
+	                     "INSERT INTO source VALUES (1),(1),(2); INSERT INTO other VALUES (1),(1),(2); "
+	                     "CREATE SCHEMA \"Prior Internal\"; CREATE TABLE seed(i INTEGER); "
+	                     "CREATE MATERIALIZED VIEW bootstrap AS SELECT * FROM seed; DROP VIEW bootstrap;");
+	// Pin only the source snapshot before another connection plans DML. For the
+	// tracked case, ownership comes and goes outside this snapshot; use another
+	// maintenance schema to avoid an unrelated native catalog tombstone conflict.
+	Execute(creator, "BEGIN; SELECT * FROM source;");
+	if (tracked) {
+		Execute(writer, "SET openivm_internal_schema='Prior Internal'; "
+		                "CREATE MATERIALIZED VIEW prior_mv AS SELECT * FROM source;");
+	}
+	if (explicit_writer) {
+		Execute(writer, "BEGIN;");
+	}
+	const auto dml = SourceAdmissionDML(operation);
+	if (mode == "explain") {
+		Execute(writer, "EXPLAIN " + dml);
+	} else if (mode == "prepare") {
+		Execute(writer, "PREPARE planned_dml AS " + dml);
+	} else {
+		auto prepared = writer.Prepare(dml);
+		if (prepared->HasError()) {
+			throw InvalidInputException("Planning-only native preparation failed: %s", prepared->GetError());
+		}
+	}
+	// Executing another source in the same transaction must not turn a retained
+	// planning-only admission into an executed write for the explained source.
+	Execute(writer, ConflictingSourceDML("other"));
+	if (explicit_writer) {
+		Execute(writer, "COMMIT;");
+	}
+	if (tracked) {
+		RefreshAndCheckBag(writer, "prior_mv", "SELECT * FROM source");
+		Execute(writer, "DROP VIEW prior_mv;");
+	}
+	Execute(creator, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source; COMMIT;");
+	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM (VALUES (1),(1),(2))) "
+	                  "OR EXISTS (SELECT * FROM (VALUES (1),(1),(2)) EXCEPT ALL SELECT * FROM source) "
+	                  "THEN error('Planning-only DML changed its source') ELSE true END;");
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, ConflictingSourceDML("source"));
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, "DROP VIEW mv;");
+}
+
+static void TestExecutedSourceAdmission(bool dedicated_schema, const string &operation, const string &mode,
+                                        bool commit) {
+	std::cerr << "CASE executed source admission dedicated_schema=" << dedicated_schema << " operation=" << operation
+	          << " mode=" << mode << " commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), writer(db), observer(db);
+	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_metadata_schema='Control.Space'; "
+	                 "SET openivm_internal_schema=" +
+	                     Value(dedicated_schema ? "Internal Space" : "").ToSQLString() +
+	                     "; CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1),(1),(2);");
+	const auto dml = SourceAdmissionDML(operation);
+	unique_ptr<PreparedStatement> prepared;
+	if (mode == "api_execute") {
+		// Preparation ends its own transaction. Execution must reacquire admission
+		// even if DuckDB reuses the physical plan without another optimizer pass.
+		prepared = writer.Prepare(dml);
+		if (prepared->HasError()) {
+			throw InvalidInputException("Native preparation failed: %s", prepared->GetError());
+		}
+	} else if (mode == "execute") {
+		Execute(writer, "PREPARE planned_dml AS " + dml);
+	}
+	Execute(creator, "BEGIN; SELECT * FROM source;");
+	Execute(writer, "BEGIN;");
+	if (mode == "api_execute") {
+		auto executed = prepared->Execute();
+		if (executed->HasError()) {
+			throw InvalidInputException("Native prepared DML execution failed: %s", executed->GetError());
+		}
+	} else {
+		Execute(writer, mode == "execute" ? "EXECUTE planned_dml;" : "EXPLAIN ANALYZE " + dml);
+	}
+	// A later planning-only statement must not erase an executed write either.
+	Execute(writer, "EXPLAIN UPDATE source SET i=77 WHERE i=99;");
+	// Isolate the commit marker from this execution: another ordinary source
+	// write here would hide a missing EXPLAIN ANALYZE or cached-plan marker.
+	Execute(writer, commit ? "COMMIT;" : "ROLLBACK;");
+	auto created = creator.Query("CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	if (commit) {
+		if (!created->HasError() || created->GetError().find("retry the transaction") == string::npos) {
+			throw InvalidInputException("Executed source DML lost its commit marker after planning-only preparation");
+		}
+		Execute(creator, "ROLLBACK; CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	} else {
+		if (created->HasError()) {
+			throw InvalidInputException("Rolled-back executed DML prevented first CREATE: %s", created->GetError());
+		}
+		Execute(creator, "COMMIT;");
+	}
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, ConflictingSourceDML("source"));
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, "DROP VIEW mv;");
+}
+
 static void TestFirstCreateWithOldSourceSnapshot(bool dedicated_schema, bool commit, bool pending_writer = false) {
 	std::cerr << "CASE first CREATE with old source snapshot dedicated_schema=" << dedicated_schema
 	          << " commit=" << commit << " pending_writer=" << pending_writer << std::endl;
@@ -3062,6 +3186,25 @@ int main(int argc, char **argv) {
 			TestIndependentUntrackedWriters(cross_catalog, true);
 		}
 		for (bool dedicated_schema : {false, true}) {
+			for (const auto &operation : vector<string> {"insert", "delete", "update", "merge"}) {
+				for (bool tracked : {false, true}) {
+					TestPlanningOnlySourceAdmission(dedicated_schema, tracked, operation, "explain", false);
+					TestPlanningOnlySourceAdmission(dedicated_schema, tracked, operation, "explain", true);
+				}
+				TestExecutedSourceAdmission(dedicated_schema, operation, "analyze", true);
+			}
+			for (const auto &mode : vector<string> {"prepare", "api_prepare"}) {
+				for (bool tracked : {false, true}) {
+					TestPlanningOnlySourceAdmission(dedicated_schema, tracked, "insert", mode, false);
+					TestPlanningOnlySourceAdmission(dedicated_schema, tracked, "insert", mode, true);
+				}
+			}
+			for (const auto &mode : vector<string> {"analyze", "execute", "api_execute"}) {
+				TestExecutedSourceAdmission(dedicated_schema, "insert", mode, false);
+				if (mode != "analyze") {
+					TestExecutedSourceAdmission(dedicated_schema, "insert", mode, true);
+				}
+			}
 			TestFirstCreateWithOldSourceSnapshot(dedicated_schema, false);
 			TestFirstCreateWithOldSourceSnapshot(dedicated_schema, true);
 			TestFirstCreateWithOldSourceSnapshot(dedicated_schema, false, true);

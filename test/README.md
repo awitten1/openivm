@@ -269,3 +269,14 @@ unchanged and permits allocation in another maintenance schema. Legacy-registry 
 pinned source snapshot through CREATE and commit/rollback. These cases run for
 colocated and dedicated maintenance schemas alongside the deterministic concurrent
 CREATE/DML and independent-writer cases; refreshes check both `EXCEPT ALL` directions.
+
+Planning-only source admission is checked for plain `EXPLAIN` over INSERT,
+DELETE, UPDATE and MERGE, and for SQL/API preparation without execution. A
+second connection pins a source snapshot before that planning; commits to an
+unrelated source must still permit first-MV creation. Colocated and dedicated
+maintenance schemas cover autocommit and explicit writer transactions, including
+a tracked consumer created and dropped outside the pinned snapshot. Executed
+`EXPLAIN ANALYZE` and SQL/API prepared DML must retain source commit markers;
+rollback must discard them. These checks isolate the planned/executed statement
+from other writes to its source, then check surviving MV refreshes after
+conflicting batched writes with bidirectional `EXCEPT ALL`.

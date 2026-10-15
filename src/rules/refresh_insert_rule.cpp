@@ -148,35 +148,29 @@ static void AlterDeltaInCallerTransaction(ClientContext &context, AlterTableInfo
 	catalog.Alter(context, *delta_alter);
 }
 
-static optional_ptr<TableCatalogEntry> TryGetTrackedDeltaTable(ClientContext &context, TableCatalogEntry &table) {
-	const auto &table_name = table.name;
-	if (table_name.empty() || SqlUtils::IsDelta(table_name) || IncrementalTableNames::IsDataTable(table_name) ||
-	    table.catalog.GetCatalogType() == "ducklake") {
+static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
+	optional_ptr<TableCatalogEntry> table;
+	switch (dml.type) {
+	case LogicalOperatorType::LOGICAL_INSERT:
+		table = &dml.Cast<LogicalInsert>().table;
+		break;
+	case LogicalOperatorType::LOGICAL_DELETE:
+		table = &dml.Cast<LogicalDelete>().table;
+		break;
+	case LogicalOperatorType::LOGICAL_UPDATE:
+		table = &dml.Cast<LogicalUpdate>().table;
+		break;
+	case LogicalOperatorType::LOGICAL_MERGE_INTO:
+		table = &dml.Cast<LogicalMergeInto>().table;
+		break;
+	default:
+		throw InternalException("OpenIVM expected a source DML operator");
+	}
+	if (table->name.empty() || SqlUtils::IsDelta(table->name) || IncrementalTableNames::IsDataTable(table->name) ||
+	    table->catalog.GetCatalogType() == "ducklake") {
 		return nullptr;
 	}
-	// Reserve only this source while deciding whether capture is needed. First
-	// publication excludes untracked writers, without serializing independent DML.
-	auto &locks = TransactionalMVLockState::Get(context);
-	auto admission = locks.AcquireSourceWriteAdmission(table.catalog.GetName(), table.schema.name, table_name);
-	// Waiting does not advance the caller's metadata snapshot. Resolve committed
-	// ownership as well as its own writes, without adopting tables by name.
-	auto delta_table =
-	    RefreshMetadata::FindSourceDeltaForMutation(context, table.catalog.GetName(), table.schema.name, table_name);
-	if (!delta_table) {
-		locks.RetainSourceWriteAdmission(std::move(admission));
-		return nullptr;
-	}
-	// CREATE holds the global gate before waiting for source admissions. Drop
-	// this temporary admission before waiting on that gate, then recheck because
-	// ownership may have changed in the gap. Prior untracked writes stay reserved.
-	admission.reset();
-	locks.AcquireMutationLock();
-	// Publication cannot start while this gate is held. Retain source admission
-	// again so committed writes remain known even if the final consumer later
-	// drops its delta before an older source snapshot attempts a new CREATE.
-	locks.RetainSourceWriteAdmission(
-	    locks.AcquireSourceWriteAdmission(table.catalog.GetName(), table.schema.name, table_name));
-	return RefreshMetadata::FindSourceDeltaForMutation(context, table.catalog.GetName(), table.schema.name, table_name);
+	return table;
 }
 
 static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert &insert) {
@@ -394,76 +388,74 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		dml = dml_owner->get();
 	}
 
-	switch (dml->type) {
-	case LogicalOperatorType::LOGICAL_INSERT: {
-		auto &insert = dml->Cast<LogicalInsert>();
-		const auto &table_name = insert.table.name;
-		auto delta_table = TryGetTrackedDeltaTable(input.context, insert.table);
-		if (!delta_table) {
-			return;
-		}
-		ResolveInsertDefaults(input, insert);
-		auto capture =
-		    make_uniq<LogicalTransactionalDeltaCapture>(insert.table, *delta_table, DeltaCaptureMode::INSERT);
-		capture->children.push_back(std::move(insert.children[0]));
-		insert.children[0] = std::move(capture);
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional INSERT delta capture for '%s'\n", table_name.c_str());
-		break;
-	}
-	case LogicalOperatorType::LOGICAL_DELETE: {
-		auto &delete_op = dml->Cast<LogicalDelete>();
-		const auto &table_name = delete_op.table.name;
-		auto delta_table = TryGetTrackedDeltaTable(input.context, delete_op.table);
-		if (!delta_table) {
-			return;
-		}
-		D_ASSERT(delete_op.expressions.size() == 1);
-		auto row_id_index = FindExpressionBindingIndex(*delete_op.children[0], *delete_op.expressions[0]);
-		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
-		    delete_op.table, *delta_table, DeltaCaptureMode::DELETE, vector<unique_ptr<Expression>> {},
-		    vector<PhysicalIndex> {}, optional_idx(row_id_index));
-		capture->children.push_back(std::move(delete_op.children[0]));
-		delete_op.children[0] = std::move(capture);
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional DELETE delta capture for '%s'\n", table_name.c_str());
-		break;
-	}
-	case LogicalOperatorType::LOGICAL_UPDATE: {
-		auto &update = dml->Cast<LogicalUpdate>();
-		const auto &table_name = update.table.name;
-		auto delta_table = TryGetTrackedDeltaTable(input.context, update.table);
-		if (!delta_table) {
-			return;
-		}
-		ResolveUpdateDefaults(input, update);
-		vector<unique_ptr<Expression>> update_expressions;
-		update_expressions.reserve(update.expressions.size());
-		for (idx_t index = 0; index < update.expressions.size(); index++) {
-			update_expressions.push_back(update.expressions[index]->Copy());
-		}
-		auto row_id_index = update.children[0]->GetColumnBindings().size() - 1;
-		auto capture = make_uniq<LogicalTransactionalDeltaCapture>(update.table, *delta_table, DeltaCaptureMode::UPDATE,
-		                                                           std::move(update_expressions), update.columns,
-		                                                           optional_idx(row_id_index));
-		capture->children.push_back(std::move(update.children[0]));
-		update.children[0] = std::move(capture);
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional UPDATE delta capture for '%s'\n", table_name.c_str());
-		break;
-	}
-	case LogicalOperatorType::LOGICAL_MERGE_INTO: {
-		auto &merge = dml->Cast<LogicalMergeInto>();
-		const auto &table_name = merge.table.name;
-		auto delta_table = TryGetTrackedDeltaTable(input.context, merge.table);
-		if (!delta_table) {
-			return;
-		}
-		auto capture = make_uniq<LogicalTransactionalMergeDeltaCapture>(merge.table, *delta_table);
-		capture->children.push_back(std::move(*dml_owner));
-		*dml_owner = std::move(capture);
-		OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional MERGE action delta capture for '%s'\n", table_name.c_str());
-		break;
-	}
-	default:
+	auto table = GetNativeDMLTable(*dml);
+	if (!table) {
 		return;
 	}
+	auto delta_table = TransactionalMVLockState::Get(input.context)
+	                       .FindSourceDeltaForWrite(table->catalog.GetName(), table->schema.name, table->name);
+	if (delta_table) {
+		switch (dml->type) {
+		case LogicalOperatorType::LOGICAL_INSERT: {
+			auto &insert = dml->Cast<LogicalInsert>();
+			const auto &table_name = insert.table.name;
+			ResolveInsertDefaults(input, insert);
+			auto capture =
+			    make_uniq<LogicalTransactionalDeltaCapture>(insert.table, *delta_table, DeltaCaptureMode::INSERT);
+			capture->children.push_back(std::move(insert.children[0]));
+			insert.children[0] = std::move(capture);
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional INSERT delta capture for '%s'\n", table_name.c_str());
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_DELETE: {
+			auto &delete_op = dml->Cast<LogicalDelete>();
+			const auto &table_name = delete_op.table.name;
+			D_ASSERT(delete_op.expressions.size() == 1);
+			auto row_id_index = FindExpressionBindingIndex(*delete_op.children[0], *delete_op.expressions[0]);
+			auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
+			    delete_op.table, *delta_table, DeltaCaptureMode::DELETE, vector<unique_ptr<Expression>> {},
+			    vector<PhysicalIndex> {}, optional_idx(row_id_index));
+			capture->children.push_back(std::move(delete_op.children[0]));
+			delete_op.children[0] = std::move(capture);
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional DELETE delta capture for '%s'\n", table_name.c_str());
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_UPDATE: {
+			auto &update = dml->Cast<LogicalUpdate>();
+			const auto &table_name = update.table.name;
+			ResolveUpdateDefaults(input, update);
+			vector<unique_ptr<Expression>> update_expressions;
+			update_expressions.reserve(update.expressions.size());
+			for (idx_t index = 0; index < update.expressions.size(); index++) {
+				update_expressions.push_back(update.expressions[index]->Copy());
+			}
+			auto row_id_index = update.children[0]->GetColumnBindings().size() - 1;
+			auto capture = make_uniq<LogicalTransactionalDeltaCapture>(
+			    update.table, *delta_table, DeltaCaptureMode::UPDATE, std::move(update_expressions), update.columns,
+			    optional_idx(row_id_index));
+			capture->children.push_back(std::move(update.children[0]));
+			update.children[0] = std::move(capture);
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional UPDATE delta capture for '%s'\n", table_name.c_str());
+			break;
+		}
+		case LogicalOperatorType::LOGICAL_MERGE_INTO: {
+			auto &merge = dml->Cast<LogicalMergeInto>();
+			const auto &table_name = merge.table.name;
+			auto capture = make_uniq<LogicalTransactionalMergeDeltaCapture>(merge.table, *delta_table);
+			capture->children.push_back(std::move(*dml_owner));
+			*dml_owner = std::move(capture);
+			OPENIVM_DEBUG_PRINT("[INSERT RULE] transactional MERGE action delta capture for '%s'\n",
+			                    table_name.c_str());
+			break;
+		}
+		default:
+			return;
+		}
+	}
+	// Put the execution marker in the DML input pipeline, before its native sink.
+	// Plain EXPLAIN builds this operator but never initializes its runtime state.
+	auto execution = make_uniq<LogicalSourceWriteExecution>(*table, delta_table);
+	execution->children.push_back(std::move(dml->children[0]));
+	dml->children[0] = std::move(execution);
 }
 } // namespace duckdb
