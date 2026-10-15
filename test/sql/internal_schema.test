@@ -2653,3 +2653,107 @@ query I
 SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema' AND schema_name='Outer Internal';
 ----
 0
+
+# LEFT JOIN projection lineage carries a qualified SQL identity when bare names
+# repeat, and a raw table name otherwise. Both must retain dots/escaped quotes
+# and the intended affected-key pushdown path in a separate internal schema.
+statement ok
+SET openivm_metadata_schema='Case Control';
+SET openivm_internal_schema='Projection Internal';
+SET openivm_cascade_refresh='off';
+SET openivm_files_path='__TEST_DIR__';
+CREATE SCHEMA openivm_internal_schema."Projection.Left";
+CREATE SCHEMA openivm_internal_schema."Projection.Right";
+USE openivm_internal_schema."Case Control";
+
+foreach nullable_table Items.Dot""Q projection_peer
+
+statement ok
+CREATE TABLE openivm_internal_schema."Projection.Left"."Items.Dot""Q"(id INTEGER, payload VARCHAR);
+CREATE TABLE openivm_internal_schema."Projection.Right"."${nullable_table}"(id INTEGER, label VARCHAR);
+INSERT INTO openivm_internal_schema."Projection.Left"."Items.Dot""Q" VALUES (1,'one'),(1,'one'),(2,'two'),(4,'four'),(6,'six'),(6,'six'),(NULL,'null-key');
+INSERT INTO openivm_internal_schema."Projection.Right"."${nullable_table}" VALUES (1,'x'),(4,'stable'),(4,'duplicate');
+
+statement ok
+CREATE MATERIALIZED VIEW openivm_internal_schema.main.left_namespace_projection AS
+SELECT l.id, l.payload, r.label FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" l LEFT JOIN openivm_internal_schema."Projection.Right"."${nullable_table}" r USING(id);
+
+query I
+SELECT count(*) FROM openivm_internal_schema."Case Control".openivm_views
+WHERE view_sql_name='left_namespace_projection' AND view_catalog='openivm_internal_schema' AND type=2
+AND internal_schema='Projection Internal' AND contains(lineage_json, '"k":"left_join_key_source"');
+----
+1
+
+# Both sources change in a single refresh, including duplicate bags, cancelled
+# inserts and match/unmatch transitions. Neither append-only shortcut applies.
+statement ok
+INSERT INTO openivm_internal_schema."Projection.Left"."Items.Dot""Q" VALUES (3,'three'),(9,'discard'),(9,'discard');
+DELETE FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" WHERE id IN (6,9);
+UPDATE openivm_internal_schema."Projection.Left"."Items.Dot""Q" SET payload=payload || '-updated' WHERE id IN (2,4);
+INSERT INTO openivm_internal_schema."Projection.Right"."${nullable_table}" VALUES (2,'z'),(4,'replacement'),(4,'replacement'),(9,'discard');
+DELETE FROM openivm_internal_schema."Projection.Right"."${nullable_table}" WHERE id IN (1,9) OR label='duplicate';
+UPDATE openivm_internal_schema."Projection.Right"."${nullable_table}" SET label='changed' WHERE label='stable';
+
+statement ok
+PRAGMA refresh('openivm_internal_schema.main.left_namespace_projection');
+
+query I
+SELECT count(*) FROM (
+(SELECT * FROM openivm_internal_schema.main.left_namespace_projection EXCEPT ALL SELECT l.id, l.payload, r.label FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" l LEFT JOIN openivm_internal_schema."Projection.Right"."${nullable_table}" r USING(id))
+UNION ALL
+(SELECT l.id, l.payload, r.label FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" l LEFT JOIN openivm_internal_schema."Projection.Right"."${nullable_table}" r USING(id) EXCEPT ALL SELECT * FROM openivm_internal_schema.main.left_namespace_projection));
+----
+0
+
+# Bag equality alone would let an unpushed recompute hide the namespace defect.
+query I
+SELECT contains(content, 'openivm_lj_src INNER JOIN openivm_affected')
+       AND contains(content, 'SELECT DISTINCT openivm_left_key')
+FROM read_text('__TEST_DIR__/openivm_upsert_queries___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_6d61696e_6c6566745f6e616d6573706163655f70726f6a656374696f6e_.sql');
+----
+true
+
+# Rollback must preserve source watermarks and ownership; the committed version
+# then reverses the transitions and moves a join key on both sides.
+foreach outcome ROLLBACK COMMIT
+
+statement ok
+BEGIN;
+INSERT INTO openivm_internal_schema."Projection.Left"."Items.Dot""Q" VALUES (1,'one'),(1,'one'),(8,'eight'),(9,'discard');
+DELETE FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" WHERE id IN (3,9);
+UPDATE openivm_internal_schema."Projection.Left"."Items.Dot""Q" SET id=5 WHERE id=4;
+INSERT INTO openivm_internal_schema."Projection.Right"."${nullable_table}" VALUES (1,'returned'),(1,'returned'),(8,'new'),(9,'discard');
+DELETE FROM openivm_internal_schema."Projection.Right"."${nullable_table}" WHERE id IN (2,9);
+UPDATE openivm_internal_schema."Projection.Right"."${nullable_table}" SET id=5 WHERE id=4;
+${outcome};
+
+statement ok
+PRAGMA refresh('openivm_internal_schema.main.left_namespace_projection');
+
+query I
+SELECT count(*) FROM (
+(SELECT * FROM openivm_internal_schema.main.left_namespace_projection EXCEPT ALL SELECT l.id, l.payload, r.label FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" l LEFT JOIN openivm_internal_schema."Projection.Right"."${nullable_table}" r USING(id))
+UNION ALL
+(SELECT l.id, l.payload, r.label FROM openivm_internal_schema."Projection.Left"."Items.Dot""Q" l LEFT JOIN openivm_internal_schema."Projection.Right"."${nullable_table}" r USING(id) EXCEPT ALL SELECT * FROM openivm_internal_schema.main.left_namespace_projection));
+----
+0
+
+endloop
+
+statement ok
+DROP VIEW openivm_internal_schema.main.left_namespace_projection;
+DROP TABLE openivm_internal_schema."Projection.Left"."Items.Dot""Q";
+DROP TABLE openivm_internal_schema."Projection.Right"."${nullable_table}";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='openivm_internal_schema' AND schema_name='Projection Internal'
+AND starts_with(table_name,'openivm_');
+----
+0
+
+endloop
+
+statement ok
+DROP SCHEMA openivm_internal_schema."Projection.Left";
+DROP SCHEMA openivm_internal_schema."Projection.Right";

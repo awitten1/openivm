@@ -218,3 +218,11 @@ Every surviving view is refreshed after conflicting writes and checked in both
 `EXCEPT ALL` directions. The DuckLake fixture additionally selects a projection
 key from the second same-named source in a three-way join and checks failed staged
 CREATE over a native source through retry and final cleanup.
+
+The native and DuckLake internal-schema fixtures also require LEFT JOIN projection
+maintenance to retain qualified source identities for same-named tables across
+schemas, and raw table names containing dots and escaped quotes. They inspect the
+generated SQL for affected-key pushdown (native) or hybrid transition maintenance
+(DuckLake), so bag equality cannot hide a lost maintenance path. Both sources
+receive conflicting INSERT/DELETE/UPDATE batches, including duplicate rows and
+NULL keys, with commit/rollback and bidirectional `EXCEPT ALL` checks before cleanup.

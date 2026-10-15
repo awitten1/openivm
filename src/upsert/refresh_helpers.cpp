@@ -909,11 +909,17 @@ static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string
 	return predicate.empty() ? "" : " WHERE " + predicate;
 }
 
-static string BuildLeftJoinLineagePushedQuery(const string &view_query_sql, const string &affected_source,
-                                              const string &affected_alias, const string &lk,
-                                              const RefreshMetadata::LeftJoinKeySource &key_source) {
-	string source_ref = SqlUtils::FindTableReferenceOccurrence(
-	    view_query_sql, SqlUtils::QuoteIdentifier(key_source.table), key_source.occurrence);
+static string BuildLeftJoinLineagePushedQuery(RefreshMetadata &metadata, const string &view_name,
+                                              const vector<string> &delta_table_names, const string &view_query_sql,
+                                              const string &affected_source, const string &affected_alias,
+                                              const string &lk, const RefreshMetadata::LeftJoinKeySource &key_source) {
+	// Lineage stores either a raw table name or a qualified SQL identity. Use
+	// source metadata to disambiguate embedded dots/quotes, then quote only raw names.
+	auto delta_key = ResolveDeltaMetadataKey(metadata, view_name, key_source.table, delta_table_names);
+	auto source = metadata.GetSourceLocation(view_name, delta_key);
+	auto source_parts = ParseLineageSourceName(key_source.table, BaseTableNameFromDeltaKey(source.table_name));
+	auto source_table = source_parts.size() == 1 ? SqlUtils::QuoteIdentifier(source_parts[0]) : key_source.table;
+	string source_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, source_table, key_source.occurrence);
 	if (source_ref.empty()) {
 		return "";
 	}
@@ -923,8 +929,8 @@ static string BuildLeftJoinLineagePushedQuery(const string &view_query_sql, cons
 	                     affected_source + " " + affected_alias + " ON openivm_lj_src." + key_col +
 	                     " IS NOT DISTINCT FROM " + affected_alias + "." + lk + ")";
 	bool replaced = false;
-	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(
-	    view_query_sql, SqlUtils::QuoteIdentifier(key_source.table), key_source.occurrence, replacement, replaced);
+	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, source_table, key_source.occurrence,
+	                                                                replacement, replaced);
 	if (!replaced || pushed_query == view_query_sql) {
 		return "";
 	}
@@ -951,8 +957,8 @@ static string TryBuildLeftJoinLineagePushdown(RefreshMetadata &metadata, const s
 	if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
 		return "";
 	}
-	string pushed_query =
-	    BuildLeftJoinLineagePushedQuery(view_query_sql, "openivm_affected", "openivm_lj_aff", lk, key_source);
+	string pushed_query = BuildLeftJoinLineagePushedQuery(metadata, view_name, delta_table_names, view_query_sql,
+	                                                      "openivm_affected", "openivm_lj_aff", lk, key_source);
 	if (pushed_query.empty()) {
 		return "";
 	}
@@ -998,8 +1004,8 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 		if (!metadata.GetLeftJoinKeySource(view_name, key_source)) {
 			return "";
 		}
-		pushed_query =
-		    BuildLeftJoinLineagePushedQuery(view_query_sql, affected_table, "openivm_lj_aff", lk, key_source);
+		pushed_query = BuildLeftJoinLineagePushedQuery(metadata, view_name, delta_table_names, view_query_sql,
+		                                               affected_table, "openivm_lj_aff", lk, key_source);
 		if (pushed_query.empty() || !key_source.cardinality_transition_check_safe) {
 			return "";
 		}
@@ -1039,8 +1045,8 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 	string transition_query;
 	if (!nullable_side_quiet) {
 		string transition_source = "(SELECT " + lk + " FROM " + stats_table + " WHERE NOT openivm_safe)";
-		transition_query =
-		    BuildLeftJoinLineagePushedQuery(view_query_sql, transition_source, "openivm_lj_transition", lk, key_source);
+		transition_query = BuildLeftJoinLineagePushedQuery(metadata, view_name, delta_table_names, view_query_sql,
+		                                                   transition_source, "openivm_lj_transition", lk, key_source);
 		if (transition_query.empty()) {
 			return "";
 		}
