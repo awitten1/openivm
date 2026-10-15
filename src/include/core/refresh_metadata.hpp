@@ -196,6 +196,8 @@ public:
 	void SetRefreshInProgress(const string &view_name, bool in_progress);
 
 	// Build SQL to delete old delta rows that all dependent views have already consumed.
+	// Execute after advancing the refreshing consumer's watermark, or defer until commit
+	// when cleanup writes a different native catalog.
 	// target: the (possibly schema-qualified) table to delete from.
 	// metadata_key: the name used in openivm_delta_tables (unqualified delta name).
 	// delta_metadata_tables: qualified openivm_delta_tables of every native metadata location.
@@ -424,9 +426,9 @@ public:
 		vector<string> preserved_cols;
 		// Identities of the two sides whose pending changes the placeholders stand for. Refresh needs
 		// them to build the right row source per storage backend (delta table vs DuckLake snapshots).
-		vector<string> inner_tables; // bare base-table names of the inner (null-supplying) sides
+		vector<string> inner_tables; // qualified base-table names of the inner (null-supplying) sides
 		vector<string> inner_keys;   // join key columns on the inner sides
-		vector<string> pres_tables;  // bare base-table names of the preserved sides
+		vector<string> pres_tables;  // qualified base-table names of the preserved sides
 		vector<string> pres_keys;    // join key columns on the preserved sides
 	};
 

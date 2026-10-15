@@ -1599,10 +1599,11 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 	// Empty-delta skipping: skip terms where any table in the mask has zero delta rows.
 	// A join with an empty input always produces zero rows.
 	bool skip_empty_enabled = SqlUtils::GetBoolSetting(context, "openivm_skip_empty_deltas", true);
-	uint64_t empty_mask = 0;
-	if (skip_empty_enabled) {
-		empty_mask = compile_only ? (delta_status.empty_mask & delta_status.constant_mask) : delta_status.empty_mask;
-	}
+	// Compile-only plans also execute against caller-local and future deltas that
+	// the metadata connection cannot see. Only constant leaves are known empty;
+	// use that same inventory for term pruning and kept-outer-join guards below.
+	uint64_t known_empty_mask = compile_only ? delta_status.constant_mask : delta_status.empty_mask;
+	uint64_t empty_mask = skip_empty_enabled ? known_empty_mask : 0;
 
 	Connection key_probe_con(*context.db);
 	vector<JoinColumnRef> leaf_refs(N);
@@ -1665,8 +1666,10 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 
 	uint64_t pruned_count = 0;
 	map<pair<size_t, idx_t>, idx_t> transition_cte_indexes;
-	OPENIVM_DEBUG_PRINT("[DeltaJoin] Building inclusion-exclusion terms (%lu total, skip_bits=%lu, empty_mask=%lu)\n",
-	                    (unsigned long)total_terms, (unsigned long)skip_bits, (unsigned long)empty_mask);
+	OPENIVM_DEBUG_PRINT("[DeltaJoin] Building inclusion-exclusion terms (%lu total, skip_bits=%lu, empty_mask=%lu, "
+	                    "known_empty_mask=%lu)\n",
+	                    (unsigned long)total_terms, (unsigned long)skip_bits, (unsigned long)empty_mask,
+	                    (unsigned long)known_empty_mask);
 	for (uint64_t mask = 1; mask < (1ULL << N); mask++) {
 		// FK pruning: skip any term whose mask overlaps with insert-only PK leaves.
 		// All such terms cancel algebraically via XOR (see ComputeSkipBits).
@@ -1779,7 +1782,7 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 		// it in an anti-join -- doing this earlier corrupts the leaf-replacement step above, which would
 		// otherwise try to compute a delta of our anti-join wrapper instead of the original subtree.
 		if (has_left_join) {
-			uint64_t leaf_has_delta_mask = (~delta_status.empty_mask) & total_terms;
+			uint64_t leaf_has_delta_mask = (~known_empty_mask) & total_terms;
 			if (leaf_has_delta_mask) {
 				bool portable_anti_guard = compile_facts.target_dialect != SqlDialect::DUCKDB;
 				GuardKeptOuterJoinsForMask(context, input.context.metadata_con, binder, term.get(), leaves,

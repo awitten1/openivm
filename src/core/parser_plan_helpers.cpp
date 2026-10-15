@@ -2573,7 +2573,10 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		return "";
 	}
 	string pres_table = pres_get->GetTable().get()->name;
-	if (pres_get->table_index == inner_tidx || StringUtil::CIEquals(pres_table, inner_table)) {
+	auto pres_identity = SqlUtils::FullName(pres_get->GetTable()->ParentCatalog().GetName(),
+	                                        pres_get->GetTable()->schema.name, pres_table);
+	auto inner_identity = SqlUtils::FullName(cat, sch, inner_table);
+	if (pres_get->table_index == inner_tidx || StringUtil::CIEquals(pres_identity, inner_identity)) {
 		// Self-referencing deepest join (preserved and inner sides are the same base table): the
 		// old_pres_count/old_count arithmetic below assumes two distinct tables with independent
 		// delta tracking. Bail rather than risk generating ambiguous or incorrect SQL for this rare
@@ -2725,9 +2728,9 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	col_list += "openivm_multiplicity";
 	sel += "CASE WHEN (__newc - __t.dsum) > 0 AND __newc = 0 THEN 1 ELSE -1 END";
 
-	out_inner_table = inner_table;
+	out_inner_table = inner_identity;
 	out_inner_key = inner_col;
-	out_pres_table = pres_table;
+	out_pres_table = pres_identity;
 	out_pres_key = pres_col;
 
 	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when

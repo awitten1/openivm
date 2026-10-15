@@ -245,25 +245,6 @@ vector<string> SqlUtils::ParseQualifiedIdentifier(const string &name) {
 	}
 }
 
-static bool ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end, string &identifier) {
-	idx_t pos = start;
-	string segment;
-	if (!ReadIdentifierSegment(sql, pos, segment)) {
-		return false;
-	}
-	identifier = segment;
-	while (pos < sql.size() && sql[pos] == '.') {
-		idx_t dot_pos = pos++;
-		if (!ReadIdentifierSegment(sql, pos, segment)) {
-			pos = dot_pos;
-			break;
-		}
-		identifier += "." + segment;
-	}
-	end = pos;
-	return true;
-}
-
 static bool ReadQualifiedIdentifierSpans(const string &sql, idx_t start, idx_t &end,
                                          vector<IdentifierSegmentSpan> &segments) {
 	idx_t pos = start;
@@ -903,6 +884,19 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 	if (table_name.empty()) {
 		return matches;
 	}
+	// Keep component boundaries: a quoted dot is part of a name, not qualification.
+	auto target_parts = SqlUtils::ParseQualifiedIdentifier(table_name);
+	auto matches_table = [&](const vector<IdentifierSegmentSpan> &parts) {
+		if (parts.size() < target_parts.size()) {
+			return false;
+		}
+		for (idx_t part = 0; part < target_parts.size(); part++) {
+			if (!StringUtil::CIEquals(parts[parts.size() - target_parts.size() + part].value, target_parts[part])) {
+				return false;
+			}
+		}
+		return true;
+	};
 	bool in_single_quote = false;
 	bool expect_table = false;
 	for (idx_t i = 0; i < sql.size();) {
@@ -919,16 +913,16 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 		if (!in_single_quote && IsIdentifierTokenStart(c)) {
 			idx_t start = i;
 			idx_t end = i;
-			string qualified_identifier;
-			if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier)) {
-				if (expect_table && SqlUtils::IdentifierMatchesTable(qualified_identifier, table_name)) {
+			vector<IdentifierSegmentSpan> parts;
+			if (ReadQualifiedIdentifierSpans(sql, start, end, parts)) {
+				if (expect_table && matches_table(parts)) {
 					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end});
 					i = matches.back().end;
 					expect_table = false;
 					continue;
 				}
 				i = end;
-				expect_table = IsTableReferenceKeyword(qualified_identifier);
+				expect_table = parts.size() == 1 && sql[start] != '"' && IsTableReferenceKeyword(parts[0].value);
 				continue;
 			}
 		}

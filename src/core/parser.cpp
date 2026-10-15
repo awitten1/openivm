@@ -805,10 +805,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 				distinct_extracted_cols = std::move(dcols);
 				distinct_extracted_source = QualifyCreateSourceTable(context, d_source, facts, current_catalog,
 				                                                     current_schema, default_db, default_schema);
-				// Table-reference matching uses decoded identifiers, whereas the extractor emits SQL quoting.
-				auto source_identifier = StringUtil::Join(SqlUtils::ParseQualifiedIdentifier(d_source), ".");
 				distinct_extracted_input_sql =
-				    SqlUtils::ReplaceTableReferences(d_input_sql, source_identifier, distinct_extracted_source);
+				    SqlUtils::ReplaceTableReferences(d_input_sql, d_source, distinct_extracted_source);
 				distinct_extracted_filter = std::move(d_filter);
 			}
 		}
@@ -1731,19 +1729,22 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			                SqlUtils::QuoteIdentifier(placement.schema_name) + ";\n";
 		}
 
-		ddl.push_back(create_schema + "create table if not exists " + delta_prefix +
-		              SqlUtils::QuoteIdentifier(placement.table_name) + " as select *, 1::INTEGER as " +
-		              string(openivm::MULTIPLICITY_COL) + ", " + string(openivm::UTC_NOW_SQL) + " as " +
-		              string(openivm::TIMESTAMP_COL) + " from " + catalog_schema +
-		              KeywordHelper::WriteOptionallyQuoted(table_name) + " limit 0");
+		auto create_delta = create_schema + "create table if not exists " + delta_prefix +
+		                    SqlUtils::QuoteIdentifier(placement.table_name) + " as select *, 1::INTEGER as " +
+		                    string(openivm::MULTIPLICITY_COL) + ", " + string(openivm::UTC_NOW_SQL) + " as " +
+		                    string(openivm::TIMESTAMP_COL) + " from " + catalog_schema +
+		                    KeywordHelper::WriteOptionallyQuoted(table_name) + " limit 0";
 		// The initial load already includes every visible source delta, including
 		// writes earlier in this transaction and changes retained for other MVs.
 		auto source_delta = delta_prefix + SqlUtils::QuoteIdentifier(placement.table_name);
-		auto allocated = InitializeSourceDelta(context, con, source_delta, ddl.back());
-		if (context.transaction.IsAutoCommit()) {
-			// Shared initialization has committed this DDL already. Reissuing even
-			// CREATE IF NOT EXISTS would enlist an attached native source as a writer.
-			ddl.pop_back();
+		auto allocated = InitializeSourceDelta(context, con, source_delta, create_delta);
+		if (!context.transaction.IsAutoCommit() &&
+		    !Catalog::GetEntry<TableCatalogEntry>(context, source.catalog_name, placement.schema_name,
+		                                          placement.table_name, OnEntryNotFound::RETURN_NULL)) {
+			// Even redundant CREATE IF NOT EXISTS enlists the source catalog as a
+			// writer. Reuse deltas visible to the caller without issuing source DDL;
+			// a delta removed earlier in this transaction still needs recreation.
+			ddl.push_back(std::move(create_delta));
 		}
 		// A newly allocated shared delta is empty and was committed after source
 		// planning opened the caller's snapshot. Its creation watermark needs no

@@ -207,8 +207,10 @@ string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &vi
 		const auto &other_table = left ? join.right_table : join.left_table;
 		const auto &source_key = left ? join.left_col : join.right_col;
 		const auto &other_key = left ? join.right_col : join.left_col;
-		auto source_ref = SqlUtils::FindTableReference(view_query_sql, lpts_table_prefix + spec.base_table);
-		auto other_ref = SqlUtils::FindTableReference(view_query_sql, lpts_table_prefix + other_table);
+		auto source_ref = SqlUtils::FindTableReference(view_query_sql,
+		                                               lpts_table_prefix + SqlUtils::QuoteIdentifier(spec.base_table));
+		auto other_ref =
+		    SqlUtils::FindTableReference(view_query_sql, lpts_table_prefix + SqlUtils::QuoteIdentifier(other_table));
 		if (source_ref.empty() || other_ref.empty()) {
 			continue;
 		}
@@ -590,10 +592,11 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
 	                     " IS NOT DISTINCT FROM openivm_key_source." + SqlUtils::QuoteIdentifier(lineage.key_col) +
 	                     "))";
 	bool replaced = false;
-	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, lineage.key_source,
-	                                                                lineage.key_occurrence, replacement, replaced);
+	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(
+	    view_query_sql, SqlUtils::QuoteIdentifier(lineage.key_source), lineage.key_occurrence, replacement, replaced);
 	if (!replaced) {
-		pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_spec->loc.table_name,
+		pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql,
+		                                                         SqlUtils::QuoteIdentifier(key_spec->loc.table_name),
 		                                                         lineage.key_occurrence, replacement, replaced);
 	}
 	if (!replaced || pushed_query == view_query_sql) {
@@ -896,7 +899,8 @@ static string BuildGuardedDeltaWhere(const string &delta_ts_filter, const string
 static string BuildLeftJoinLineagePushedQuery(const string &view_query_sql, const string &affected_source,
                                               const string &affected_alias, const string &lk,
                                               const RefreshMetadata::LeftJoinKeySource &key_source) {
-	string source_ref = SqlUtils::FindTableReferenceOccurrence(view_query_sql, key_source.table, key_source.occurrence);
+	string source_ref = SqlUtils::FindTableReferenceOccurrence(
+	    view_query_sql, SqlUtils::QuoteIdentifier(key_source.table), key_source.occurrence);
 	if (source_ref.empty()) {
 		return "";
 	}
@@ -906,8 +910,8 @@ static string BuildLeftJoinLineagePushedQuery(const string &view_query_sql, cons
 	                     affected_source + " " + affected_alias + " ON openivm_lj_src." + key_col +
 	                     " IS NOT DISTINCT FROM " + affected_alias + "." + lk + ")";
 	bool replaced = false;
-	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_source.table,
-	                                                                key_source.occurrence, replacement, replaced);
+	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(
+	    view_query_sql, SqlUtils::QuoteIdentifier(key_source.table), key_source.occurrence, replacement, replaced);
 	if (!replaced || pushed_query == view_query_sql) {
 		return "";
 	}

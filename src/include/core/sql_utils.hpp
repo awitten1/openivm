@@ -65,6 +65,8 @@ public:
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
 	                                                 const string &replacement);
+	// Table-reference helpers accept SQL identifier spellings. Use QuoteIdentifier for
+	// raw table names from the catalog so embedded dots and quotes retain their meaning.
 	static string ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement);
 	static string ReplaceTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence,
 	                                              const string &replacement, bool &replaced);

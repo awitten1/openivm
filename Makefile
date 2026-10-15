@@ -28,4 +28,4 @@ test_release_internal: test_source_delta_publication
 
 test_source_delta_publication:
 	cmake --build build/release --target source_delta_publication_test
-	cmake -E env ./build/release/extension/openivm/source_delta_publication_test
+	python3 test/integration/test_source_delta_publication.py ./build/release/extension/openivm/source_delta_publication_test

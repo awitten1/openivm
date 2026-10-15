@@ -18,6 +18,32 @@ ownership reuse, and refresh bag equality. `make test` builds and runs it throug
 `test_release_internal`; `make test_source_delta_publication` runs it on its own.
 Together with `test/sql/internal_schema.test` and
 `test/sql/internal_schema_ducklake.test`, it covers namespace lifecycle regressions.
+The DuckLake fixture also verifies snapshot-backed auxiliary refresh and repair
+for COUNT(DISTINCT), inner DISTINCT and filtered-group counts: repeated refreshes
+must not replay a consumed snapshot, unrelated lake snapshots permit repair, and
+pending source changes prevent rebuilding missing state.
+Snapshot publications in quoted internal schemas check creation, chained reads,
+reopen and refresh. The lifecycle executable also checks reference matching with
+quoted dots and escaped quotes: catalog/schema components must remain distinct
+when pinning maintenance scans, and existing pins must be replaced exactly once.
+The Python integration wrapper supplies a temporary database path and removes it
+after execution. After building the executable, a focused diagnostic uses the
+same wrapper as the normal test target:
+
+```bash
+python3 test/integration/test_source_delta_publication.py ./build/release/extension/openivm/source_delta_publication_test
+```
+
+Direct executable invocations require a fresh database path as their sole argument;
+invoking it without arguments prints usage and does not run the lifecycle cases.
+The executable closes and reopens that database with a fresh
+configuration, verifies that placement settings were not persisted, and checks
+metadata discovery, source-delta reuse, replacement, refresh bag equality and
+final-consumer cleanup with a non-default search path. SQLLogicTest's `restart`
+copies extension settings, so its unset-placement case explicitly clears the
+setting before restart and retains its physical-placement assertions.
+DuckLake fixtures select a persistent native schema before `restart`: SQLLogicTest
+restores the saved search path before the fixture can reattach the lake catalog.
 It also checks source-delta lookup with separate control, source and maintenance
 schemas, including same-named sources and a missing owner. Catalog enumeration
 must release its schema lock before resolving table entries. Batched conflicting
@@ -97,3 +123,21 @@ The fixture also injects a late binder failure after successful lifecycle writes
 Autocommit rolls back the statement; an explicit transaction must be invalidated
 so COMMIT cannot retain partial writes. Profiling metrics must be restored on
 success and failure, and surviving MVs must refresh to bidirectional bag equality.
+
+The internal-schema SQL fixtures keep LEFT JOIN aggregate sources with matching
+bare names distinct by catalog/schema. Nullable-side SUM and COUNT explicitly
+require incremental aggregate maintenance (type 0) and qualified secondary-delta
+metadata. Separate preserved-side SUM fixtures require the existing source-delta
+group-recompute path (type 6); they do not add preserved-value reconstruction.
+Both paths cover conflicting INSERT/DELETE/UPDATE batches on both sources,
+duplicates, quoted output names and NULLs. Native refreshes exercise commit and
+rollback; DuckLake refreshes exercise snapshot changes and reopen with unset
+placement settings and a native metadata search path. Every refresh checks both
+`EXCEPT ALL` directions before final-consumer cleanup.
+
+`left_join_pipeline_secondary_delta.test` also starts with empty committed source
+deltas, then refreshes after conflicting writes on both sides in an explicit
+transaction. Compile-only plans must retain the outer-join transition guards for
+caller-local deltas; deleting both sides must not leave a negative-count group.
+Both COMMIT and ROLLBACK check bidirectional bag equality inside and after the
+transaction. The qualified-source variants remain in the namespace fixtures.

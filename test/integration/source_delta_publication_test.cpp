@@ -65,6 +65,107 @@ static void TestQuotedNamespaceNormalization() {
 	}
 }
 
+static void TestQualifiedTableReferences() {
+	// These two physical identities flatten to the same text if quoted dots are
+	// mistaken for qualification. Only the maintenance table may receive a pin.
+	const string data_table = "\"Lake\".\"Internal.Space\".\"maintenance\"";
+	const string other_table = "\"Lake.Internal\".\"Space\".\"maintenance\"";
+	const string reference = "lake.\"Internal.Space\".maintenance";
+	const string query = "SELECT * FROM " + reference + " JOIN " + other_table + " USING(i)";
+	const string pinned_table = data_table + " AT (VERSION => 7)";
+	const string expected = "SELECT * FROM " + pinned_table + " JOIN " + other_table + " USING(i)";
+	if (SqlUtils::FindTableReference(query, data_table) != reference ||
+	    SqlUtils::CountTableReferences(query, data_table) != 1 ||
+	    SqlUtils::ReplaceTableReferences(query, data_table, pinned_table) != expected ||
+	    SqlUtils::ReplaceTableReferences(expected, data_table, pinned_table) != expected) {
+		throw InvalidInputException("Publication pinning lost quoted catalog/schema identity");
+	}
+	const string escaped_table = SqlUtils::FullName("Lake\"Catalog", "Internal Space", "maintenance");
+	const string escaped_query = "SELECT * FROM " + escaped_table;
+	if (SqlUtils::ReplaceTableReferences(escaped_query, escaped_table, pinned_table) !=
+	    "SELECT * FROM " + pinned_table) {
+		throw InvalidInputException("Publication pinning did not match escaped identifiers");
+	}
+	// Unqualified names still match a qualified reference. Catalog callers quote
+	// bare names containing punctuation before passing them to the SQL matcher.
+	if (SqlUtils::FindTableReference(query, "maintenance") != reference ||
+	    SqlUtils::FindTableReference("SELECT * FROM lake.\"Internal Space\".\"Table Name\"",
+	                                 SqlUtils::QuoteIdentifier("Table Name")) !=
+	        "lake.\"Internal Space\".\"Table Name\"") {
+		throw InvalidInputException("Table-reference matching lost unqualified table names");
+	}
+	const string dotted_query = "SELECT * FROM lake.main.\"Table.Name\"";
+	if (SqlUtils::FindTableReference(dotted_query, SqlUtils::QuoteIdentifier("Table.Name")) !=
+	        "lake.main.\"Table.Name\"" ||
+	    !SqlUtils::FindTableReference(dotted_query, "Table.Name").empty()) {
+		throw InvalidInputException("Table-reference matching confused a quoted table name with qualification");
+	}
+}
+
+// Unlike SQLLogicTest's restart, separate DuckDB instances with no supplied
+// DBConfig cannot carry extension settings across the close/reopen boundary.
+static void TestInternalSchemaReopen(const string &path) {
+	std::cerr << "CASE internal schema reopen with fresh configuration" << std::endl;
+	{
+		DuckDB db(path);
+		Connection owner(db);
+		Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; "
+		               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+		               "CREATE SCHEMA \"Source.Space\"; CREATE TABLE \"Source.Space\".items(i INTEGER); "
+		               "INSERT INTO \"Source.Space\".items VALUES (1),(1),(2); "
+		               "CREATE MATERIALIZED VIEW \"Source.Space\".original AS SELECT * FROM \"Source.Space\".items;");
+	}
+	{
+		DuckDB db(path);
+		Connection owner(db);
+		Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true;");
+		Execute(owner, "SELECT CASE WHEN current_setting('openivm_internal_schema')='' "
+		               "AND current_setting('openivm_metadata_schema')='' "
+		               "THEN true ELSE error('Reopen persisted placement settings') END;");
+		Execute(owner,
+		        "SET search_path='\"Control.Space\"'; "
+		        "CREATE MATERIALIZED VIEW \"Source.Space\".after_reopen AS SELECT * FROM \"Source.Space\".items; "
+		        "CREATE OR REPLACE MATERIALIZED VIEW \"Source.Space\".original "
+		        "AS SELECT * FROM \"Source.Space\".items;");
+		Execute(owner, "SELECT CASE WHEN "
+		               "(SELECT count(*) FROM \"Control.Space\".openivm_views "
+		               "WHERE view_sql_name='after_reopen' AND coalesce(internal_schema,'')='')=1 "
+		               "AND (SELECT count(*) FROM \"Control.Space\".openivm_views "
+		               "WHERE view_sql_name='original' AND internal_schema='Internal Space')=1 "
+		               "AND (SELECT count(*) FROM duckdb_tables() t JOIN \"Control.Space\".openivm_views v "
+		               "ON t.table_name='openivm_data_' || v.view_name "
+		               "WHERE v.view_sql_name='after_reopen' AND t.schema_name='Source.Space')=1 "
+		               "AND (SELECT count(*) FROM duckdb_tables() t JOIN \"Control.Space\".openivm_views v "
+		               "ON t.table_name='openivm_data_' || v.view_name "
+		               "WHERE v.view_sql_name='original' AND t.schema_name='Internal Space')=1 "
+		               "AND (SELECT count(*) FROM \"Control.Space\".openivm_delta_tables "
+		               "WHERE source_schema='Source.Space' AND delta_schema='Internal Space')=2 "
+		               "AND (SELECT count(DISTINCT delta_table_name) FROM \"Control.Space\".openivm_delta_tables "
+		               "WHERE source_schema='Source.Space')=1 "
+		               "THEN true ELSE error('Reopen changed internal placement or duplicated a source delta') END;");
+		Execute(owner, "INSERT INTO \"Source.Space\".items VALUES (1),(2),(3),(3); "
+		               "DELETE FROM \"Source.Space\".items WHERE i=1; "
+		               "UPDATE \"Source.Space\".items SET i=4 WHERE i=2; "
+		               "INSERT INTO \"Source.Space\".items VALUES (1),(4),(5); "
+		               "DELETE FROM \"Source.Space\".items WHERE i=5;");
+		for (const auto &view : vector<string> {"original", "after_reopen"}) {
+			auto qualified = SqlUtils::QuoteIdentifier("Source.Space") + "." + SqlUtils::QuoteIdentifier(view);
+			Execute(owner, "PRAGMA refresh(" + Value(qualified).ToSQLString() + ");");
+			Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + qualified +
+			                   " EXCEPT ALL SELECT * FROM \"Source.Space\".items) "
+			                   "OR EXISTS (SELECT * FROM \"Source.Space\".items EXCEPT ALL SELECT * FROM " +
+			                   qualified + ") THEN error('Reopened MV bag mismatch') ELSE true END;");
+		}
+		Execute(owner, "DROP VIEW \"Source.Space\".original; DROP VIEW \"Source.Space\".after_reopen;");
+		Execute(owner, "SELECT CASE WHEN "
+		               "NOT EXISTS (SELECT 1 FROM \"Control.Space\".openivm_views) "
+		               "AND NOT EXISTS (SELECT 1 FROM \"Control.Space\".openivm_delta_tables) "
+		               "AND NOT EXISTS (SELECT 1 FROM duckdb_tables() "
+		               "WHERE schema_name IN ('Source.Space','Internal Space') AND starts_with(table_name,'openivm_')) "
+		               "THEN true ELSE error('Reopened namespace cleanup leaked') END;");
+	}
+}
+
 static void TestPublication(bool explicit_transaction) {
 	std::cerr << "CASE publication explicit_transaction=" << explicit_transaction << std::endl;
 	DuckDB db(nullptr);
@@ -455,6 +556,74 @@ static void TestMetadataReplayLocations() {
 		                   ") OR EXISTS (" + view.second + " EXCEPT ALL SELECT * FROM " + view.first +
 		                   ") THEN error('Catalog replay rollback MV bag mismatch') ELSE true END;");
 	}
+}
+
+static void TestCrossCatalogSharedDelta(bool dedicated_schema, bool commit) {
+	std::cerr << "CASE cross-catalog shared delta dedicated_schema=" << dedicated_schema << " commit=" << commit
+	          << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema=" +
+	                   Value(dedicated_schema ? "Internal Space" : "").ToSQLString() + ";");
+	Execute(owner, "CREATE SCHEMA \"Source.Space\"; CREATE TABLE \"Source.Space\".a(i INTEGER); "
+	               "CREATE TABLE \"Source.Space\".b(i INTEGER); "
+	               "INSERT INTO \"Source.Space\".a VALUES (1),(1),(2); "
+	               "INSERT INTO \"Source.Space\".b VALUES (3),(3),(4); "
+	               "CREATE MATERIALIZED VIEW main.sentinel_a AS SELECT * FROM \"Source.Space\".a; "
+	               "CREATE MATERIALIZED VIEW main.sentinel_b AS SELECT * FROM \"Source.Space\".b; "
+	               "ATTACH ':memory:' AS \"Consumer.Catalog\"; "
+	               "CREATE MATERIALIZED VIEW \"Consumer.Catalog\".main.mv AS SELECT * FROM \"Source.Space\".b;");
+	// Leave nonempty shared deltas before the new initial loads. Their watermarks
+	// must still come from the caller's visible rows when source DDL is omitted.
+	for (const auto &source : vector<string> {"a", "b"}) {
+		auto source_table = SqlUtils::FullName("memory", "Source.Space", source);
+		Execute(owner, "INSERT INTO " + source_table + " VALUES (1),(2),(3),(3); DELETE FROM " + source_table +
+		                   " WHERE i=1; UPDATE " + source_table + " SET i=4 WHERE i=2;");
+	}
+	Execute(owner, "USE memory.\"Control.Space\"; BEGIN; "
+	               "CREATE OR REPLACE MATERIALIZED VIEW \"Consumer.Catalog\".main.mv "
+	               "AS SELECT * FROM \"Source.Space\".a; "
+	               "CREATE MATERIALIZED VIEW \"Consumer.Catalog\".main.new_mv AS SELECT * FROM \"Source.Space\".a;");
+	for (const auto &view : vector<string> {"mv", "new_mv"}) {
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM \"Consumer.Catalog\".main." + view +
+		                   " EXCEPT ALL SELECT * FROM \"Source.Space\".a) OR EXISTS "
+		                   "(SELECT * FROM \"Source.Space\".a EXCEPT ALL SELECT * FROM \"Consumer.Catalog\".main." +
+		                   view + ") THEN error('Cross-catalog initial load bag mismatch') ELSE true END;");
+	}
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	Execute(owner, "SELECT CASE WHEN count(*)=" + string(commit ? "1" : "0") +
+	                   " THEN true ELSE error('Cross-catalog CREATE transaction outcome mismatch') END "
+	                   "FROM duckdb_views() WHERE database_name='Consumer.Catalog' AND schema_name='main' "
+	                   "AND view_name='new_mv';");
+	for (const auto &source : vector<string> {"a", "b"}) {
+		auto source_table = SqlUtils::FullName("memory", "Source.Space", source);
+		Execute(owner, "INSERT INTO " + source_table + " VALUES (4),(5),(5),(6); DELETE FROM " + source_table +
+		                   " WHERE i=4; UPDATE " + source_table + " SET i=7 WHERE i=5; INSERT INTO " + source_table +
+		                   " VALUES (4),(7); DELETE FROM " + source_table + " WHERE i=6;");
+	}
+	vector<pair<string, string>> survivors = {
+	    {"main.sentinel_a", "a"},
+	    {"main.sentinel_b", "b"},
+	    {"\"Consumer.Catalog\".main.mv", commit ? "a" : "b"},
+	};
+	if (commit) {
+		survivors.emplace_back("\"Consumer.Catalog\".main.new_mv", "a");
+	}
+	for (const auto &view : survivors) {
+		Execute(owner, "PRAGMA refresh(" + Value(view.first).ToSQLString() + ");");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view.first +
+		                   " EXCEPT ALL SELECT * FROM \"Source.Space\"." + view.second +
+		                   ") OR EXISTS (SELECT * FROM \"Source.Space\"." + view.second + " EXCEPT ALL SELECT * FROM " +
+		                   view.first +
+		                   ") THEN error('Cross-catalog shared delta refresh bag mismatch') ELSE true END;");
+	}
+	for (const auto &view : survivors) {
+		Execute(owner, "DROP VIEW " + view.first + ";");
+	}
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Cross-catalog final cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE database_name='memory' "
+	               "AND schema_name IN ('Source.Space','Internal Space') AND starts_with(table_name,'openivm_');");
 }
 
 static void CheckSourceWatermarkReplay(Connection &owner, DatabaseInstance &db) {
@@ -893,9 +1062,15 @@ static void TestLateLifecycleBindFailure(bool explicit_transaction) {
 	Execute(owner, "DROP VIEW mv;");
 }
 
-int main() {
+int main(int argc, char **argv) {
+	if (argc != 2) {
+		std::cerr << "Usage: source_delta_publication_test <fresh-database-path>" << std::endl;
+		return 2;
+	}
 	try {
 		TestQuotedNamespaceNormalization();
+		TestQualifiedTableReferences();
+		TestInternalSchemaReopen(argv[1]);
 		TestSourceDeltaLookup();
 		TestSharedMetadataUpgrade(false, true);
 		TestSharedMetadataUpgrade(true, true);
@@ -911,6 +1086,10 @@ int main() {
 		TestLateLifecycleBindFailure(false);
 		TestLateLifecycleBindFailure(true);
 		TestMetadataReplayLocations();
+		for (bool dedicated_schema : {false, true}) {
+			TestCrossCatalogSharedDelta(dedicated_schema, false);
+			TestCrossCatalogSharedDelta(dedicated_schema, true);
+		}
 		TestDeltaOwnershipSearchPath(false);
 		TestDeltaOwnershipSearchPath(true);
 		for (const auto &mutation : vector<string> {"create", "drop", "replace", "recreate"}) {
