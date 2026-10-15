@@ -250,28 +250,44 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	string current_catalog_schema = KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
 	                                KeywordHelper::WriteOptionallyQuoted(current_schema);
 
+	if (parse_data_ref.alter_sql.empty()) {
+		InitializeMVMetadata(context, con, default_db, default_schema);
+	}
+	if (!context.transaction.IsAutoCommit()) {
+		// CREATE and ALTER must resolve against the same caller-visible registry,
+		// including a metadata schema created earlier in this transaction.
+		RefreshMetadata(con).SnapshotTransaction(context);
+	}
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		metadata_state->Apply(con);
+	}
+
 	// Handle ALTER MATERIALIZED VIEW — just execute the metadata UPDATE
 	if (!parse_data_ref.alter_sql.empty()) {
 		auto target = ResolveMaterializedViewTarget(context, parse_data_ref.target_name);
 		auto metadata_table = SqlUtils::FullName(default_db, default_schema, openivm::VIEWS_TABLE);
 		auto target_key = RefreshMetadata(con).FindViewKey(target.catalog_name, target.schema_name, target.view_name);
 		view_key = target_key;
-		auto target_filter = "view_name = '" + SqlUtils::EscapeValue(target_key) + "' AND COALESCE(view_catalog, '" +
-		                     SqlUtils::EscapeValue(default_db) + "') = '" + SqlUtils::EscapeValue(target.catalog_name) +
-		                     "' AND COALESCE(view_schema, '" + string(DEFAULT_SCHEMA) + "') = '" +
-		                     SqlUtils::EscapeValue(target.schema_name) + "'";
-		auto tracked = con.Query("SELECT 1 FROM " + metadata_table + " WHERE " + target_filter);
+		auto target_filter =
+		    "view_name = " + Value(target_key).ToSQLString() + " AND " +
+		    SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(default_db).ToSQLString() + ")",
+		                                  Value(target.catalog_name).ToSQLString()) +
+		    " AND " +
+		    SqlUtils::IdentifierEqualsSQL("COALESCE(view_schema, 'main')", Value(target.schema_name).ToSQLString());
+		// Helper reads use the temporary registry; only the executed UPDATE targets
+		// the physical metadata table in the caller's transaction.
+		auto tracked = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE " + target_filter);
 		if (tracked->HasError() || tracked->RowCount() == 0) {
 			throw CatalogException("Materialized view '%s' does not exist in OpenIVM metadata",
 			                       parse_data_ref.target_name);
 		}
 		result.parameters.push_back(Value("UPDATE " + metadata_table + " SET refresh_interval = " +
 		                                  parse_data_ref.alter_sql + " WHERE " + target_filter));
+		OPENIVM_DEBUG_PRINT("[ALTER MV] Compiled refresh interval update for %s in %s\n", target_key.c_str(),
+		                    metadata_table.c_str());
 		ConfigureDDLExecutorResult(result, DDLExecutionMode::CALLER_TRANSACTION);
 		return result;
 	}
-
-	InitializeMVMetadata(context, con, default_db, default_schema);
 
 	// PAC compatibility boundary: internal planning uses a fresh connection, so
 	// forward PAC settings when that extension is loaded in the caller session.
@@ -283,16 +299,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	auto target = ResolveMaterializedViewTarget(context, full_view_name);
 	string view_catalog_prefix;
 	string sql_view_name = target.view_name;
-	if (!context.transaction.IsAutoCommit()) {
-		// Reuse legacy keys written earlier in the caller transaction as well.
-		// Otherwise the helper allocates a second key for the same SQL name.
-		RefreshMetadata(con).SnapshotTransaction(context);
-	}
-	// Helper metadata probes must also see lifecycle mutations executed earlier
-	// in this caller transaction.
-	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
-		metadata_state->Apply(con);
-	}
 	string view_name = RefreshMetadata(con).AllocateViewKey(target.catalog_name, target.schema_name, sql_view_name);
 	view_key = view_name;
 	string view_target_catalog = target.catalog_name;

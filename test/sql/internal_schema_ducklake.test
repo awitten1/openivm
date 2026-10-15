@@ -1400,3 +1400,117 @@ SELECT count(*) FROM duckdb_tables() WHERE database_name='dl' AND schema_name='L
 AND starts_with(table_name,'openivm_');
 ----
 0
+
+# Full-outer source-delta group recompute must retain both physical source
+# identities, including when the view lives in neither source schema. Group by
+# non-key columns so losing a match creates a distinct null-extended group.
+statement ok
+USE internal_schema_host.main;
+SET openivm_metadata_schema='Control Space';
+SET openivm_internal_schema='Lake Internal';
+SET openivm_cascade_refresh='off';
+
+statement ok
+CREATE TABLE dl.s1."Outer.Items"(id INTEGER, g VARCHAR, x INTEGER);
+CREATE TABLE dl."Other Schema"."Outer.Items"(id INTEGER, g VARCHAR, x INTEGER);
+INSERT INTO dl.s1."Outer.Items" VALUES
+    (1,'L1',10),(1,'L1',10),(2,'L2',20),(3,'L3',30),(5,'L5',50),(7,'L7',70),(NULL,'LN',90);
+INSERT INTO dl."Other Schema"."Outer.Items" VALUES
+    (1,'R1',100),(1,'R1',100),(1,'R1',NULL),(2,'R2',200),(4,'R4',400),(6,'R6',600),(7,'R7',700),(NULL,'RN',900);
+
+statement ok
+CREATE MATERIALIZED VIEW dl.main."Outer.Groups" AS SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM dl.s1."Outer.Items" a FULL OUTER JOIN dl."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g;
+
+# This is incremental affected-group maintenance, not full/current-diff refresh.
+query IT
+SELECT type, group_recompute_affected_mode FROM internal_schema_host."Control Space".openivm_views
+WHERE view_sql_name='Outer.Groups' AND view_catalog='dl' AND view_schema='main';
+----
+6	source_delta
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM dl.main."Outer.Groups" EXCEPT ALL SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM dl.s1."Outer.Items" a FULL OUTER JOIN dl."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g)
+    UNION ALL
+    (SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM dl.s1."Outer.Items" a FULL OUTER JOIN dl."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g EXCEPT ALL SELECT * FROM dl.main."Outer.Groups")
+);
+----
+0
+
+statement ok
+USE internal_schema_host."Control Space";
+INSERT INTO dl.s1."Outer.Items" VALUES (4,'L4',40),(9,'discard',90),(9,'discard',90);
+DELETE FROM dl.s1."Outer.Items" WHERE id IN (1,9);
+UPDATE dl.s1."Outer.Items" SET id=6 WHERE id=3;
+UPDATE dl.s1."Outer.Items" SET x=41 WHERE id=4;
+INSERT INTO dl."Other Schema"."Outer.Items" VALUES (5,'R5',500),(9,'discard',900),(9,'discard',900);
+DELETE FROM dl."Other Schema"."Outer.Items" WHERE id IN (2,9);
+UPDATE dl."Other Schema"."Outer.Items" SET id=8 WHERE id=7;
+UPDATE dl."Other Schema"."Outer.Items" SET x=501 WHERE id=5;
+
+# Deleting left id=1 must discover the new (NULL,R1) group, although the
+# opposite-side id=1 rows have no delta. The right id=2 deletion is symmetric.
+statement ok
+PRAGMA refresh('dl.main."Outer.Groups"');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM dl.main."Outer.Groups" EXCEPT ALL SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM dl.s1."Outer.Items" a FULL OUTER JOIN dl."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g)
+    UNION ALL
+    (SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM dl.s1."Outer.Items" a FULL OUTER JOIN dl."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g EXCEPT ALL SELECT * FROM dl.main."Outer.Groups")
+);
+----
+0
+
+# Rollback leaves the first transition intact; commit reverses it. Both source
+# images and conflicting duplicate INSERT/DELETE/UPDATE operations are batched
+# before each refresh.
+foreach outcome ROLLBACK COMMIT
+
+statement ok
+BEGIN;
+INSERT INTO dl.s1."Outer.Items" VALUES (1,'L1',10),(1,'L1',10),(9,'discard',90);
+DELETE FROM dl.s1."Outer.Items" WHERE id IN (4,9);
+UPDATE dl.s1."Outer.Items" SET id=3 WHERE id=6;
+INSERT INTO dl."Other Schema"."Outer.Items" VALUES (2,'R2',200),(2,'R2',200),(9,'discard',900);
+DELETE FROM dl."Other Schema"."Outer.Items" WHERE id IN (5,9);
+UPDATE dl."Other Schema"."Outer.Items" SET id=7 WHERE id=8;
+${outcome};
+
+statement ok
+PRAGMA refresh('dl.main."Outer.Groups"');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM dl.main."Outer.Groups" EXCEPT ALL SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM dl.s1."Outer.Items" a FULL OUTER JOIN dl."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g)
+    UNION ALL
+    (SELECT a.g AS left_group, b.g AS right_group, COUNT(DISTINCT b.x) AS distinct_values, COUNT(*) AS row_count
+FROM dl.s1."Outer.Items" a FULL OUTER JOIN dl."Other Schema"."Outer.Items" b USING (id) GROUP BY a.g, b.g EXCEPT ALL SELECT * FROM dl.main."Outer.Groups")
+);
+----
+0
+
+endloop
+
+statement ok
+DROP VIEW dl.main."Outer.Groups";
+DROP TABLE dl.s1."Outer.Items";
+DROP TABLE dl."Other Schema"."Outer.Items";
+
+query I
+SELECT count(*) FROM internal_schema_host."Control Space".openivm_views
+WHERE view_sql_name='Outer.Groups' AND view_catalog='dl';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='dl' AND schema_name='Lake Internal'
+AND starts_with(table_name,'openivm_');
+----
+0

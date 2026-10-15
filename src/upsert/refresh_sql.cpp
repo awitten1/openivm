@@ -1262,7 +1262,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		string unmatched_groups;
 		if (source_has_full_outer) {
 			unmatched_groups = BuildFullOuterUnmatchedGroups(metadata, view_name, delta_table_names, group_columns,
-			                                                 view_query_sql, delta_specs, lpts_table_prefix);
+			                                                 view_query_sql, delta_specs);
 		}
 		upsert_query =
 		    CompileGroupRecompute(view_name, view_query_sql, group_columns, delta_specs, internal_catalog_prefix,

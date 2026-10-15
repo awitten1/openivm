@@ -111,19 +111,24 @@ struct FojJoinInfo {
 				info.right_col = right_part.substr(rc + 1);
 			}
 		}
-		for (auto &dt_name : delta_table_names) {
-			auto loc = metadata.GetSourceLocation(view_name, dt_name);
-			string base = BaseTableNameFromDeltaKey(loc.table_name);
-			if (dt_name != loc.table_name) {
-				base = SqlUtils::FullName(loc.catalog_name, loc.schema_name, base);
+		auto resolve_source = [&](string &table, string &delta_name) {
+			if (table.empty()) {
+				return;
 			}
-			if (StringUtil::CIEquals(base, info.left_table)) {
-				info.dt_left_name = dt_name;
+			auto key = ResolveDeltaMetadataKey(metadata, view_name, table, delta_table_names);
+			for (auto &dt_name : delta_table_names) {
+				if (dt_name != key) {
+					continue;
+				}
+				auto loc = metadata.GetSourceLocation(view_name, dt_name);
+				table =
+				    SqlUtils::FullName(loc.catalog_name, loc.schema_name, BaseTableNameFromDeltaKey(loc.table_name));
+				delta_name = dt_name;
+				return;
 			}
-			if (StringUtil::CIEquals(base, info.right_table)) {
-				info.dt_right_name = dt_name;
-			}
-		}
+		};
+		resolve_source(info.left_table, info.dt_left_name);
+		resolve_source(info.right_table, info.dt_right_name);
 		return info;
 	}
 };
@@ -207,32 +212,30 @@ string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec) {
 // changed join keys, then evaluate both null-extended projections to recover them.
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
-                                     const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs,
-                                     const string &lpts_table_prefix) {
+                                     const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs) {
 	auto join = FojJoinInfo::Parse(metadata, view_name, delta_table_names);
-	if (join.left_col.empty() || join.right_col.empty() || join.left_table == join.right_table) {
+	if (join.left_col.empty() || join.right_col.empty() || join.dt_left_name.empty() || join.dt_right_name.empty() ||
+	    join.left_table == join.right_table) {
 		return "";
 	}
 	string groups;
 	for (const auto &spec : delta_specs) {
-		bool left = StringUtil::CIEquals(spec.base_table, join.left_table);
-		if (!left && !StringUtil::CIEquals(spec.base_table, join.right_table)) {
+		bool left = StringUtil::CIEquals(spec.source_sql, join.left_table);
+		if (!left && !StringUtil::CIEquals(spec.source_sql, join.right_table)) {
 			continue;
 		}
 		const auto &other_table = left ? join.right_table : join.left_table;
 		const auto &source_key = left ? join.left_col : join.right_col;
 		const auto &other_key = left ? join.right_col : join.left_col;
-		auto source_ref = SqlUtils::FindTableReference(view_query_sql,
-		                                               lpts_table_prefix + SqlUtils::QuoteIdentifier(spec.base_table));
-		auto other_ref =
-		    SqlUtils::FindTableReference(view_query_sql, lpts_table_prefix + SqlUtils::QuoteIdentifier(other_table));
+		auto source_ref = SqlUtils::FindTableReference(view_query_sql, spec.source_sql);
+		auto other_ref = SqlUtils::FindTableReference(view_query_sql, other_table);
 		if (source_ref.empty() || other_ref.empty()) {
 			continue;
 		}
 		auto delta = BuildGroupRecomputeDeltaRowsSQL(spec);
 		string other_rows = "SELECT * FROM " + other_ref;
 		for (const auto &other_spec : delta_specs) {
-			if (StringUtil::CIEquals(other_spec.base_table, other_table)) {
+			if (StringUtil::CIEquals(other_spec.source_sql, other_table)) {
 				// Deleted opposite-side rows can carry an old unmatched group too.
 				other_rows += " UNION ALL SELECT * FROM " + BuildGroupRecomputeDeltaRowsSQL(other_spec);
 			}

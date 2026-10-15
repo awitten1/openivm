@@ -1379,6 +1379,86 @@ static void TestSequentialCreateBatch(bool explicit_transaction, bool commit) {
 	               "WHERE schema_name='Internal Space';");
 }
 
+static void TestCreateAlterTransaction(bool existing_metadata, bool batched, bool commit) {
+	std::cerr << "CASE CREATE/ALTER existing_metadata=" << existing_metadata << " batched=" << batched
+	          << " commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Public;Space\"; CREATE TABLE source(i INTEGER); "
+	               "INSERT INTO source VALUES (1),(1),(2);");
+	if (existing_metadata) {
+		Execute(owner, "CREATE MATERIALIZED VIEW main.\"Same;MV\" REFRESH EVERY '1 hour' AS SELECT * FROM source;");
+		Execute(owner, "USE memory.\"Control.Space\";");
+	}
+	const string view = "\"Public;Space\".\"Same;MV\"";
+	const string registry = "memory.\"Control.Space\".openivm_views";
+	const string target_filter = "view_sql_name='Same;MV' AND view_schema='Public;Space'";
+	vector<string> statements = {
+	    "BEGIN",
+	    "CREATE MATERIALIZED VIEW " + view + " REFRESH EVERY '1 hour' AS SELECT * FROM main.source",
+	    "ALTER /* lifecycle ; */ MATERIALIZED VIEW memory.\"pUBLIC;sPACE\".\"sAME;mv\" SET REFRESH MANUAL",
+	    "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Transaction-local ALTER MANUAL failed') END FROM " +
+	        registry + " WHERE " + target_filter + " AND refresh_interval IS NULL",
+	    "ALTER MATERIALIZED VIEW " + view + " SET REFRESH EVERY '2 hours'",
+	    "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Transaction-local ALTER EVERY failed') END FROM " +
+	        registry + " WHERE " + target_filter + " AND refresh_interval=7200",
+	};
+	if (batched) {
+		Execute(owner, StringUtil::Join(statements, "; ") + ";");
+	} else {
+		for (auto &sql : statements) {
+			Execute(owner, sql + ";");
+		}
+	}
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	Execute(owner, "SELECT CASE WHEN count(*)=" + string(commit ? "1" : "0") +
+	                   " THEN true ELSE error('CREATE/ALTER transaction outcome mismatch') END FROM duckdb_views() "
+	                   "WHERE schema_name='Public;Space' AND view_name='Same;MV';");
+	if (!existing_metadata && !commit) {
+		Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('CREATE/ALTER rollback leaked schemas') END "
+		               "FROM duckdb_schemas() WHERE schema_name IN ('Control.Space','Internal Space');");
+		return;
+	}
+	if (existing_metadata) {
+		Execute(owner, "SELECT CASE WHEN count(*)=1 THEN true ELSE error('ALTER changed a same-named sibling') END "
+		               "FROM " +
+		                   registry +
+		                   " WHERE view_sql_name='Same;MV' AND view_schema='main' AND refresh_interval=3600;");
+	}
+	if (commit) {
+		Execute(owner, "SELECT CASE WHEN count(*)=1 THEN true ELSE error('ALTER interval was not committed') END "
+		               "FROM " +
+		                   registry + " WHERE " + target_filter + " AND refresh_interval=7200;");
+	} else {
+		Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('ALTER rollback leaked metadata') END FROM " +
+		                   registry + " WHERE " + target_filter + ";");
+	}
+	Execute(owner, "INSERT INTO main.source VALUES (1),(2),(3),(3); DELETE FROM main.source WHERE i=1; "
+	               "UPDATE main.source SET i=4 WHERE i=2; INSERT INTO main.source VALUES (4),(5),(5); "
+	               "DELETE FROM main.source WHERE i=5;");
+	vector<string> survivors;
+	if (commit) {
+		survivors.push_back(view);
+	}
+	if (existing_metadata) {
+		survivors.push_back("main.\"Same;MV\"");
+	}
+	for (auto &survivor : survivors) {
+		Execute(owner, "PRAGMA refresh(" + Value(survivor).ToSQLString() + ");");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + survivor +
+		                   " EXCEPT ALL SELECT * FROM main.source) OR EXISTS (SELECT * FROM main.source "
+		                   "EXCEPT ALL SELECT * FROM " +
+		                   survivor + ") THEN error('CREATE/ALTER survivor bag mismatch') ELSE true END;");
+	}
+	for (auto &survivor : survivors) {
+		Execute(owner, "DROP VIEW " + survivor + ";");
+	}
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('CREATE/ALTER final cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
 static void TestLateLifecycleBindFailure(bool explicit_transaction) {
 	std::cerr << "CASE late lifecycle bind failure explicit_transaction=" << explicit_transaction << std::endl;
 	DuckDB db(nullptr);
@@ -1452,6 +1532,12 @@ int main(int argc, char **argv) {
 		TestSequentialCreateBatch(false, true);
 		TestSequentialCreateBatch(true, true);
 		TestSequentialCreateBatch(true, false);
+		for (bool existing_metadata : {false, true}) {
+			for (bool batched : {false, true}) {
+				TestCreateAlterTransaction(existing_metadata, batched, true);
+				TestCreateAlterTransaction(existing_metadata, batched, false);
+			}
+		}
 		TestLateLifecycleBindFailure(false);
 		TestLateLifecycleBindFailure(true);
 		TestMetadataReplayLocations();
