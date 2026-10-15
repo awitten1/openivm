@@ -56,7 +56,9 @@ INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2);
 INSERT INTO namespace_lifecycle.b VALUES (3),(3),(4);
 
 foreach placement namespace_lifecycle NamespaceInternal
+
 foreach recreated namespace_lifecycle NamespaceInternal
+
 foreach outcome COMMIT ROLLBACK
 
 statement ok
@@ -172,7 +174,9 @@ DELETE FROM namespace_lifecycle.a;
 INSERT INTO namespace_lifecycle.a VALUES (1),(1),(2);
 
 endloop
+
 endloop
+
 endloop
 
 statement ok
@@ -1769,6 +1773,7 @@ INSERT INTO "Ownership Sources".a VALUES (1),(1),(2);
 INSERT INTO "Ownership Sources".b VALUES (3),(3),(4);
 
 foreach replacement a b
+
 foreach outcome COMMIT ROLLBACK
 
 statement ok
@@ -1830,6 +1835,7 @@ SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Ownership Internal';
 0
 
 endloop
+
 endloop
 
 statement ok
