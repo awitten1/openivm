@@ -82,6 +82,13 @@ USE "Other Native".main;
 statement ok
 SET openivm_profile_refresh = true;
 
+# Upgrade the frontend registry while another native catalog is active. These
+# ALTERs execute during shared initialization, before staged lake DDL profiling.
+statement ok
+ALTER TABLE memory.openivm.openivm_views DROP COLUMN pending_after_hook;
+ALTER TABLE memory.openivm.openivm_delta_tables DROP COLUMN pending_estimate_ts;
+ALTER TABLE memory.openivm.openivm_refresh_history DROP COLUMN strategy;
+
 statement ok
 CREATE MATERIALIZED VIEW dl.obs.sensor_totals AS
 SELECT sensor, SUM(val) AS total, COUNT(*) AS cnt FROM dl.obs.readings GROUP BY sensor;
@@ -99,6 +106,18 @@ SELECT
     (SELECT count(*) FROM "Other Native".openivm.openivm_refresh_profile);
 ----
 1	0	1
+
+query IIII
+SELECT count(*),
+    count(*) FILTER (WHERE contains(p.detail, 'sql=alter table openivm_views add column if not exists pending_after_hook') AND p.duration_ms >= 0),
+    count(*) FILTER (WHERE contains(p.detail, 'sql=alter table openivm_delta_tables add column if not exists pending_estimate_ts') AND p.duration_ms >= 0),
+    count(*) FILTER (WHERE contains(p.detail, 'sql=alter table openivm_refresh_history add column if not exists strategy') AND p.duration_ms >= 0)
+FROM memory.openivm.openivm_refresh_profile p
+JOIN memory.openivm.openivm_views v USING (view_name)
+WHERE v.view_sql_name = 'sensor_totals' AND v.view_catalog = 'dl'
+  AND p.step_name = 'create_mv_sql_stmt' AND contains(p.detail, 'sql=alter table openivm_');
+----
+3	1	1	1
 
 query I
 SELECT count(*) FROM "Other Native".openivm.openivm_refresh_profile

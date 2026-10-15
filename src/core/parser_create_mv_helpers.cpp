@@ -12,6 +12,8 @@
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 
+#include <chrono>
+
 namespace duckdb {
 
 string SqlCsvLiteralOrNull(const vector<string> &values) {
@@ -240,7 +242,8 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 }
 
 template <class BUILD_DDL>
-static bool InitializeSharedDDL(ClientContext &context, Connection &con, const string &probe, BUILD_DDL build_ddl) {
+static bool InitializeSharedDDL(ClientContext &context, Connection &con, const string &probe, BUILD_DDL build_ddl,
+                                vector<CreateMVProfileRecord> *profile_steps = nullptr) {
 	// Explicit transactions retain their atomic, rollbackable initialization.
 	if (!context.transaction.IsAutoCommit()) {
 		return false;
@@ -264,8 +267,18 @@ static bool InitializeSharedDDL(ClientContext &context, Connection &con, const s
 		build_ddl(ddl);
 		OPENIVM_DEBUG_PRINT("[METADATA] Initializing shared tables (%llu statements)\n",
 		                    (unsigned long long)ddl.size());
-		for (const auto &sql : ddl) {
+		for (idx_t i = 0; i < ddl.size(); i++) {
+			const auto &sql = ddl[i];
+			auto start = profile_steps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
 			auto result = con.Query(sql);
+			if (profile_steps) {
+				auto duration_ms =
+				    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start)
+				        .count();
+				profile_steps->push_back({"create_mv_sql_stmt", duration_ms,
+				                          "phase=create_mv_system_tables; statement=" + to_string(i + 1) + "/" +
+				                              to_string(ddl.size()) + "; sql=" + SqlUtils::SQLStatementPreview(sql)});
+			}
 			if (result->HasError()) {
 				throw CatalogException("OpenIVM shared-table initialization failed: %s", result->GetError());
 			}
@@ -281,24 +294,25 @@ static bool InitializeSharedDDL(ClientContext &context, Connection &con, const s
 	return true;
 }
 
-void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema) {
+void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema,
+                          vector<CreateMVProfileRecord> *profile_steps) {
 	// Probe the selected schema itself: unqualified names could fall back to legacy tables in main.
 	auto table = [&](const char *name) {
 		return SqlUtils::FullName(catalog, schema, name);
 	};
-	InitializeSharedDDL(context, con,
-	                    "SELECT v.view_sql_name, v.pending_after_hook, v.internal_schema, d.source_table_id, "
-	                    "d.delta_schema, d.delta_table_name, h.mode, "
-	                    "r.strategy, p.step_order, dep.edge_kind, m.query_hash, c.is_trusted FROM " +
-	                        table(openivm::VIEWS_TABLE) + " v, " + table(openivm::DELTA_TABLES_TABLE) + " d, " +
-	                        table(openivm::REFRESH_HOOKS_TABLE) + " h, " + table(openivm::HISTORY_TABLE) + " r, " +
-	                        table(openivm::PROFILE_TABLE) + " p, " + table(openivm::MV_DEPS_TABLE) + " dep, " +
-	                        table(openivm::MATCH_LOG_TABLE) + " m, " + table(openivm::CONSTRAINTS_CACHE_TABLE) +
-	                        " c LIMIT 0",
-	                    // Inspect the transaction that executes this DDL. Inspecting the caller
-	                    // here would open its catalog snapshot before the helper commits these
-	                    // tables, making the subsequent caller lifecycle conflict with them.
-	                    [&](vector<string> &ddl) { AppendMetadataSchemaDDL(*con.context, catalog, schema, ddl); });
+	InitializeSharedDDL(
+	    context, con,
+	    "SELECT v.view_sql_name, v.pending_after_hook, v.internal_schema, d.source_table_id, "
+	    "d.delta_schema, d.delta_table_name, h.mode, "
+	    "r.strategy, p.step_order, dep.edge_kind, m.query_hash, c.is_trusted FROM " +
+	        table(openivm::VIEWS_TABLE) + " v, " + table(openivm::DELTA_TABLES_TABLE) + " d, " +
+	        table(openivm::REFRESH_HOOKS_TABLE) + " h, " + table(openivm::HISTORY_TABLE) + " r, " +
+	        table(openivm::PROFILE_TABLE) + " p, " + table(openivm::MV_DEPS_TABLE) + " dep, " +
+	        table(openivm::MATCH_LOG_TABLE) + " m, " + table(openivm::CONSTRAINTS_CACHE_TABLE) + " c LIMIT 0",
+	    // Inspect the transaction that executes this DDL. Inspecting the caller
+	    // here would open its catalog snapshot before the helper commits these
+	    // tables, making the subsequent caller lifecycle conflict with them.
+	    [&](vector<string> &ddl) { AppendMetadataSchemaDDL(*con.context, catalog, schema, ddl); }, profile_steps);
 }
 
 bool InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl) {

@@ -982,8 +982,10 @@ SELECT count(*) FROM (SELECT id, name, dept, salary FROM staff EXCEPT ALL SELECT
 statement ok
 CREATE TABLE agg_target (id INT, name VARCHAR, dept VARCHAR, salary INT);
 
+# Register capture through an MV owner; a reserved table name alone does not
+# establish source-delta ownership.
 statement ok
-CREATE TABLE openivm_delta_agg_target AS SELECT *, 1::INTEGER AS openivm_multiplicity, now()::timestamp AS openivm_timestamp FROM agg_target LIMIT 0;
+CREATE MATERIALIZED VIEW mv_agg_target AS SELECT * FROM agg_target;
 
 statement ok
 INSERT INTO agg_target SELECT 999, dept, dept, SUM(salary) FROM staff WHERE dept = 'eng' GROUP BY dept;
@@ -992,6 +994,15 @@ query I
 SELECT count(*) FROM openivm_delta_agg_target;
 ----
 1
+
+statement ok
+PRAGMA refresh('mv_agg_target');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM mv_agg_target EXCEPT ALL SELECT * FROM agg_target)
+UNION ALL (SELECT * FROM agg_target EXCEPT ALL SELECT * FROM mv_agg_target));
+----
+0
 
 # ==========================================
 # Complex 9: DELETE with subquery (WHERE id IN (SELECT ...))

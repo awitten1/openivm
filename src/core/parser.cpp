@@ -201,12 +201,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	TransactionalMVLockState::Get(*con.context)
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	RefreshMetadata::UseCatalog(context, con, metadata_catalog_name);
-	struct CreateMVPreProfileStep {
-		string step_name;
-		int64_t duration_ms;
-		string detail;
-	};
-	vector<CreateMVPreProfileStep> create_profile_steps;
+	vector<CreateMVProfileRecord> create_profile_steps;
 	Value create_profile_val;
 	bool create_profile_enabled = context.TryGetCurrentSetting("openivm_profile_refresh", create_profile_val) &&
 	                              !create_profile_val.IsNull() && create_profile_val.GetValue<bool>();
@@ -254,7 +249,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	                                KeywordHelper::WriteOptionallyQuoted(current_schema);
 
 	if (parse_data_ref.alter_sql.empty()) {
-		InitializeMVMetadata(context, con, default_db, default_schema);
+		// Shared metadata migrations execute before the staged lifecycle program.
+		// Retain their actual measurements in that CREATE's profile as well.
+		InitializeMVMetadata(context, con, default_db, default_schema,
+		                     create_profile_enabled ? &create_profile_steps : nullptr);
 	}
 	if (!context.transaction.IsAutoCommit()) {
 		// CREATE and ALTER must resolve against the same caller-visible registry,

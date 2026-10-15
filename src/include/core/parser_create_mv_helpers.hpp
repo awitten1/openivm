@@ -10,7 +10,14 @@ string CreateMVDependenciesSQL();
 const vector<string> &MetadataTableNames();
 // CREATE TABLE IF NOT EXISTS for a control-metadata table. An empty target uses the unqualified table name.
 string CreateMetadataTableSQL(const string &table, const string &target = "");
-void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema);
+struct CreateMVProfileRecord {
+	string step_name;
+	int64_t duration_ms;
+	string detail;
+};
+
+void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema,
+                          vector<CreateMVProfileRecord> *profile_steps);
 // True when the helper committed a new, empty source delta.
 bool InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl);
 string SqlCsvLiteralOrNull(const vector<string> &values);
