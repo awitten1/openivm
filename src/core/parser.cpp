@@ -960,6 +960,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			}
 			CountDistinctExtract cd_extract;
 			if (ExtractCountDistinctAggregate(local_view_query, candidate_group_columns, output_names, cd_extract)) {
+				// Auxiliary columns must not collide with group outputs or the multiplicity counter.
+				auto aux_columns = candidate_group_columns;
+				aux_columns.push_back("_count");
+				cd_extract.distinct_col = UniqueInternalColumnName(aux_columns, cd_extract.distinct_col);
 				count_distinct_aux_candidate = {"openivm_aux_" + view_name,
 				                                QualifyCreateSourceTable(context, cd_extract.source, facts,
 				                                                         current_catalog, current_schema, default_db,
