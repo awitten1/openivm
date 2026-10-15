@@ -1289,3 +1289,114 @@ query I
 SELECT count(*) FROM internal_schema_host."Control Space".openivm_views;
 ----
 0
+
+# The lake schema's catalog spelling can differ from both parent and child
+# settings. Publication must still find its consumers and pipeline edges.
+statement ok
+SET openivm_internal_schema='lake internal';
+CREATE TABLE dl.main."Window Source"(grp INTEGER, val INTEGER);
+INSERT INTO dl.main."Window Source" VALUES (1,10),(1,10),(2,20);
+CREATE MATERIALIZED VIEW dl.main.case_parent AS SELECT * FROM dl.main."Window Source";
+SET openivm_internal_schema='LAKE INTERNAL';
+CREATE MATERIALIZED VIEW dl.main.case_child AS SELECT * FROM dl.main.case_parent;
+CREATE MATERIALIZED VIEW dl.main.quoted_window AS
+SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) AS r FROM dl.main."Window Source";
+
+query I
+SELECT type FROM internal_schema_host."Control Space".openivm_views WHERE view_sql_name='quoted_window';
+----
+5
+
+statement ok
+INSERT INTO dl.main."Window Source" VALUES (1,10),(1,20),(3,30),(3,30);
+DELETE FROM dl.main."Window Source" WHERE val=10;
+UPDATE dl.main."Window Source" SET grp=1, val=40 WHERE val=20;
+
+statement ok
+PRAGMA refresh('dl.main.case_parent');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.main.case_parent EXCEPT ALL SELECT * FROM dl.main."Window Source")
+UNION ALL (SELECT * FROM dl.main."Window Source" EXCEPT ALL SELECT * FROM dl.main.case_parent));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.main.case_child');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.main.case_child EXCEPT ALL SELECT * FROM dl.main."Window Source")
+UNION ALL (SELECT * FROM dl.main."Window Source" EXCEPT ALL SELECT * FROM dl.main.case_child));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.main.quoted_window');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.main.quoted_window EXCEPT ALL
+SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM dl.main."Window Source")
+UNION ALL (SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM dl.main."Window Source"
+EXCEPT ALL SELECT * FROM dl.main.quoted_window));
+----
+0
+
+# SQL-quoted lineage must resolve the same lake source after reopen.
+statement ok
+UPDATE internal_schema_host."Control Space".openivm_views
+SET lineage_json=replace(lineage_json, '"source":"Window Source"', '"source":"\"Window Source\""') WHERE view_sql_name='quoted_window';
+
+query I
+SELECT contains(lineage_json, '"source":"\"Window Source\""') FROM internal_schema_host."Control Space".openivm_views
+WHERE view_sql_name='quoted_window';
+----
+true
+
+restart
+
+statement ok
+LOAD ducklake;
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+SET openivm_disable_daemon=true;
+SET openivm_cascade_refresh='downstream';
+INSERT INTO dl.main."Window Source" VALUES (1,40),(2,20),(4,50),(4,50);
+DELETE FROM dl.main."Window Source" WHERE val=30;
+UPDATE dl.main."Window Source" SET val=60 WHERE val=40;
+
+statement ok
+PRAGMA refresh_pipeline('dl.main.case_parent');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.main.case_parent EXCEPT ALL SELECT * FROM dl.main."Window Source")
+UNION ALL (SELECT * FROM dl.main."Window Source" EXCEPT ALL SELECT * FROM dl.main.case_parent));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.main.case_child EXCEPT ALL SELECT * FROM dl.main."Window Source")
+UNION ALL (SELECT * FROM dl.main."Window Source" EXCEPT ALL SELECT * FROM dl.main.case_child));
+----
+0
+
+statement ok
+PRAGMA refresh('dl.main.quoted_window');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl.main.quoted_window EXCEPT ALL
+SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM dl.main."Window Source")
+UNION ALL (SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM dl.main."Window Source"
+EXCEPT ALL SELECT * FROM dl.main.quoted_window));
+----
+0
+
+statement ok
+DROP VIEW dl.main.case_child;
+DROP VIEW dl.main.case_parent;
+DROP VIEW dl.main.quoted_window;
+DROP TABLE dl.main."Window Source";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name='dl' AND schema_name='Lake Internal'
+AND starts_with(table_name,'openivm_');
+----
+0

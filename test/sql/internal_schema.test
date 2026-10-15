@@ -2413,3 +2413,130 @@ DROP SCHEMA q2;
 DROP SCHEMA "Cleanup.Internal";
 SET openivm_refresh_mode='incremental';
 SET openivm_internal_schema='Quoted Internal';
+
+# Settings may spell an existing schema differently from its catalog entry.
+# Publication, dependency traversal and cleanup must agree on physical identity.
+statement ok
+USE openivm_internal_schema.main;
+SET openivm_disable_daemon=true;
+SET openivm_metadata_schema='Case Control';
+SET openivm_cascade_refresh='off';
+CREATE SCHEMA "Case Internal";
+SET openivm_internal_schema='case internal';
+CREATE TABLE main.case_source(i INTEGER);
+INSERT INTO main.case_source VALUES (1),(1),(2);
+CREATE MATERIALIZED VIEW main.case_parent AS SELECT * FROM main.case_source;
+SET openivm_internal_schema='CASE INTERNAL';
+CREATE MATERIALIZED VIEW main.case_child AS SELECT * FROM main.case_parent;
+
+# Single-source lineage stores a raw catalog name. Refresh must resolve it as
+# one identifier, including after reopen without either placement setting.
+statement ok
+CREATE TABLE main."Window Source"(grp INTEGER, val INTEGER);
+INSERT INTO main."Window Source" VALUES (1,10),(1,10),(2,20);
+CREATE MATERIALIZED VIEW main.quoted_window AS
+SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) AS r FROM main."Window Source";
+
+query I
+SELECT type FROM "Case Control".openivm_views WHERE view_sql_name='quoted_window';
+----
+5
+
+restart
+
+statement ok
+SET openivm_disable_daemon=true;
+SET openivm_cascade_refresh='off';
+INSERT INTO main.case_source VALUES (1),(2),(3),(3);
+DELETE FROM main.case_source WHERE i=1;
+UPDATE main.case_source SET i=4 WHERE i=2;
+INSERT INTO main."Window Source" VALUES (1,10),(1,20),(3,30),(3,30);
+DELETE FROM main."Window Source" WHERE val=10;
+UPDATE main."Window Source" SET grp=1, val=40 WHERE val=20;
+
+statement ok
+PRAGMA refresh('main.case_parent');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.case_parent EXCEPT ALL SELECT * FROM main.case_source)
+UNION ALL (SELECT * FROM main.case_source EXCEPT ALL SELECT * FROM main.case_parent));
+----
+0
+
+statement ok
+PRAGMA refresh('main.case_child');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.case_child EXCEPT ALL SELECT * FROM main.case_source)
+UNION ALL (SELECT * FROM main.case_source EXCEPT ALL SELECT * FROM main.case_child));
+----
+0
+
+statement ok
+PRAGMA refresh('main.quoted_window');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.quoted_window EXCEPT ALL
+SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM main."Window Source")
+UNION ALL (SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM main."Window Source"
+EXCEPT ALL SELECT * FROM main.quoted_window));
+----
+0
+
+# Both raw catalog spelling and SQL-quoted lineage must resolve the same source.
+statement ok
+UPDATE "Case Control".openivm_views SET lineage_json=replace(lineage_json, '"source":"Window Source"', '"source":"\"Window Source\""')
+WHERE view_sql_name='quoted_window';
+
+query I
+SELECT contains(lineage_json, '"source":"\"Window Source\""') FROM "Case Control".openivm_views
+WHERE view_sql_name='quoted_window';
+----
+true
+
+statement ok
+INSERT INTO main.case_source VALUES (4),(5),(5);
+DELETE FROM main.case_source WHERE i=3;
+UPDATE main.case_source SET i=6 WHERE i=4;
+INSERT INTO main."Window Source" VALUES (1,40),(2,20),(4,50),(4,50);
+DELETE FROM main."Window Source" WHERE val=30;
+UPDATE main."Window Source" SET val=60 WHERE val=40;
+SET openivm_cascade_refresh='downstream';
+
+statement ok
+PRAGMA refresh_pipeline('main.case_parent');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.case_parent EXCEPT ALL SELECT * FROM main.case_source)
+UNION ALL (SELECT * FROM main.case_source EXCEPT ALL SELECT * FROM main.case_parent));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.case_child EXCEPT ALL SELECT * FROM main.case_source)
+UNION ALL (SELECT * FROM main.case_source EXCEPT ALL SELECT * FROM main.case_child));
+----
+0
+
+statement ok
+PRAGMA refresh('main.quoted_window');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM main.quoted_window EXCEPT ALL
+SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM main."Window Source")
+UNION ALL (SELECT grp, val, rank() OVER (PARTITION BY grp ORDER BY val) FROM main."Window Source"
+EXCEPT ALL SELECT * FROM main.quoted_window));
+----
+0
+
+statement ok
+DROP VIEW main.case_child;
+DROP VIEW main.case_parent;
+DROP VIEW main.quoted_window;
+DROP TABLE main.case_source;
+DROP TABLE main."Window Source";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Case Internal';
+----
+0

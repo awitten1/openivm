@@ -79,72 +79,81 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 }
 
 ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect) {
-	// The native tokenizer omits comments. Mask their text while retaining all
-	// lexer-recognized string/identifier tokens, then remove only real delimiters.
+	// The native tokenizer omits comments and can combine newline-separated
+	// literals into one token. Inspect each complete token interval, masking only
+	// comments and real delimiters; retain literal contents and newline separators.
 	auto cleaned = query;
 	auto tokens = Parser::Tokenize(query);
 	idx_t cursor = 0;
 	for (idx_t i = 0; i <= tokens.size(); i++) {
-		auto next = i < tokens.size() ? tokens[i].start : query.size();
-		// Only gaps between native tokens can contain comments. Mask the gap
-		// after consuming the preceding token's complete quoted spelling.
-		if (cursor < next) {
-			cleaned.replace(cursor, next - cursor, next - cursor, ' ');
-		}
-		if (i == tokens.size()) {
-			break;
-		}
-		cursor = next;
-		auto &token = tokens[i];
-		if (token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_STRING_CONSTANT && query[cursor] == '$') {
+		auto end = i < tokens.size() ? tokens[i].start : query.size();
+		auto token = i > 0 ? &tokens[i - 1] : nullptr;
+		bool string_constant = token && token->type == SimplifiedTokenType::SIMPLIFIED_TOKEN_STRING_CONSTANT;
+		bool escaped = string_constant && (query[token->start] == 'e' || query[token->start] == 'E');
+		if (string_constant && query[cursor] == '$') {
 			auto tag_end = query.find('$', cursor + 1);
 			auto tag = query.substr(cursor, tag_end - cursor + 1);
 			auto close = query.find(tag, tag_end + 1);
 			cursor = close == string::npos ? query.size() : close + tag.size();
-		} else if (token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_STRING_CONSTANT || query[cursor] == '"') {
-			// E/B/X-prefixed literals have their location at the prefix.
-			bool escaped = query[cursor] == 'e' || query[cursor] == 'E';
-			while (cursor < query.size() && query[cursor] != '\'' && query[cursor] != '"') {
-				cursor++;
-			}
-			if (cursor == query.size()) {
-				break;
-			}
-			auto quote = query[cursor++];
-			while (cursor < query.size()) {
-				auto c = query[cursor++];
-				if (escaped && c == '\\' && cursor < query.size()) {
-					cursor++;
-				} else if (c == quote) {
-					if (cursor < query.size() && query[cursor] == quote) {
+		}
+		while (cursor < end) {
+			if (query[cursor] == '\'' || query[cursor] == '"') {
+				auto quote = query[cursor++];
+				while (cursor < end) {
+					auto c = query[cursor++];
+					if (escaped && c == '\\' && cursor < end) {
 						cursor++;
-					} else {
-						break;
+					} else if (c == quote) {
+						if (cursor < end && query[cursor] == quote) {
+							cursor++;
+						} else {
+							break;
+						}
 					}
 				}
+				continue;
 			}
-		} else {
-			// Comments may follow an unquoted token without whitespace. The
-			// next token offset gives its upper bound; trim only that suffix.
-			auto end = i + 1 < tokens.size() ? tokens[i + 1].start : query.size();
-			while (cursor < end) {
-				if (cursor + 1 < end && ((query[cursor] == '-' && query[cursor + 1] == '-') ||
-				                         (query[cursor] == '/' && query[cursor + 1] == '*'))) {
-					break;
+			auto comment_start = cursor;
+			if (cursor + 1 < end && query[cursor] == '-' && query[cursor + 1] == '-') {
+				while (cursor < end && query[cursor] != '\n' && query[cursor] != '\r') {
+					cursor++;
 				}
+			} else if (cursor + 1 < end && query[cursor] == '/' && query[cursor + 1] == '*') {
+				cursor += 2;
+				idx_t depth = 1;
+				while (cursor < end && depth > 0) {
+					if (cursor + 1 < end && query[cursor] == '/' && query[cursor + 1] == '*') {
+						depth++;
+						cursor += 2;
+					} else if (cursor + 1 < end && query[cursor] == '*' && query[cursor + 1] == '/') {
+						depth--;
+						cursor += 2;
+					} else {
+						cursor++;
+					}
+				}
+			} else {
 				cursor++;
+				continue;
+			}
+			for (auto pos = comment_start; pos < cursor; pos++) {
+				if (cleaned[pos] != '\n' && cleaned[pos] != '\r') {
+					cleaned[pos] = ' ';
+				}
 			}
 		}
-		if (token.type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR && query[token.start] == ';') {
-			cleaned[token.start] = ' ';
+		if (token && token->type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR && query[token->start] == ';') {
+			cleaned[token->start] = ' ';
 		}
 	}
 	auto query_lower = SqlUtils::SQLToLowercase(cleaned);
 	StringUtil::Trim(query_lower);
-	SqlUtils::RemoveRedundantWhitespaces(query_lower);
+	// Collapse whitespace only for keyword detection, never in the AS query.
+	auto header = query_lower;
+	SqlUtils::RemoveRedundantWhitespaces(header);
 
 	// Handle ALTER MATERIALIZED VIEW <name> SET REFRESH EVERY '<interval>' | SET REFRESH MANUAL
-	if (StringUtil::StartsWith(query_lower, "alter materialized view ")) {
+	if (StringUtil::StartsWith(header, "alter materialized view ")) {
 		const string identifier = "(?:\"(?:[^\"]|\"\")*\"|[a-zA-Z_][a-zA-Z0-9_$]*)";
 		const string qualified_identifier = identifier + "(?:\\s*\\.\\s*" + identifier + "){0,2}";
 		std::regex alter_re("^alter\\s+materialized\\s+view\\s+(" + qualified_identifier +
@@ -181,8 +190,8 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 		return ParserExtensionParseResult(std::move(parse_data));
 	}
 
-	if (!StringUtil::StartsWith(query_lower, "create materialized view ") &&
-	    !StringUtil::StartsWith(query_lower, "create or replace materialized view ")) {
+	if (!StringUtil::StartsWith(header, "create materialized view ") &&
+	    !StringUtil::StartsWith(header, "create or replace materialized view ")) {
 		return ParserExtensionParseResult();
 	}
 
@@ -195,7 +204,6 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 		is_replace = true;
 		// Strip "or replace" so the rest of the pipeline sees "create materialized view"
 		query_lower = std::regex_replace(query_lower, std::regex("\\bor\\s+replace\\s+"), "");
-		SqlUtils::RemoveRedundantWhitespaces(query_lower);
 	}
 
 	// Extract REFRESH EVERY clause before structural rewrite (strips it from the query)

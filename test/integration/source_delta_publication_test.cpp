@@ -1122,8 +1122,14 @@ static void TestMixedLifecycleBatch(bool explicit_transaction, bool commit) {
 	               "CREATE SCHEMA \"Public;Space\"; CREATE TABLE source(i INTEGER); "
 	               "INSERT INTO source VALUES (1),(1),(2);");
 	const string view = "\"Public;Space\".\"Mixed;MV\"";
-	const string base_query = "SELECT i, 'value;--literal' AS label FROM source";
-	Execute(owner, "CREATE MATERIALIZED VIEW " + view + " AS " + base_query + ";");
+	// DuckDB tokenizes newline-concatenated literals as one token. Comments
+	// between their segments must be removed without erasing either segment.
+	const string base_query = "SELECT i, 'a'\n'b' AS label, 'c' /* nested /* ; */ comment */\n'd' AS joined, "
+	                          "'value;--literal' AS comment_label, $$dollar;/*literal*/$$ AS dollar_label FROM source";
+	Execute(owner, "CREATE MATERIALIZED VIEW " + view + " REFRESH EVERY '1 hour' AS " + base_query + ";");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + base_query + ") OR EXISTS (" +
+	                   base_query + " EXCEPT ALL SELECT * FROM " + view +
+	                   ") THEN error('Scheduled lifecycle changed literal contents') ELSE true END;");
 	Execute(owner, "CREATE MATERIALIZED VIEW sibling AS SELECT * FROM source;");
 	if (explicit_transaction) {
 		Execute(owner, "BEGIN;");

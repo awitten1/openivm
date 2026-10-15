@@ -131,6 +131,14 @@ DML, explicit commit and rollback.
 Metadata replay supplies helper-local ownership visibility without running physical
 programs ahead of their native statement position.
 
+The mixed lifecycle cases also preserve newline-concatenated string literals,
+including intervening nested comments and `REFRESH EVERY`, through replacement,
+commit and rollback. The native and DuckLake internal-schema SQL fixtures select
+existing maintenance schemas with different casing for parent and child MVs,
+then verify publication, pipeline refresh, reopen and final cleanup. Windows over
+`"Window Source"` exercise raw and SQL-quoted lineage with conflicting batched
+writes and bidirectional bag equality.
+
 The fixture also injects a late binder failure after successful lifecycle writes.
 Autocommit rolls back the statement; an explicit transaction must be invalidated
 so COMMIT cannot retain partial writes. Profiling metrics must be restored on

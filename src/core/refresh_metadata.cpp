@@ -621,7 +621,7 @@ vector<string> RefreshMetadata::MetadataCatalogs(Connection &con) {
 }
 
 string RefreshMetadata::SourceTableName(const string &key, const string &catalog, const string &schema) {
-	if (!StringUtil::StartsWith(key, SqlUtils::QualifiedPrefix(catalog, schema))) {
+	if (!StringUtil::CIStartsWith(key, SqlUtils::QualifiedPrefix(catalog, schema))) {
 		return key;
 	}
 	return SqlUtils::ParseQualifiedIdentifier(key).back();
@@ -629,13 +629,13 @@ string RefreshMetadata::SourceTableName(const string &key, const string &catalog
 
 string RefreshMetadata::SourcePredicate(const string &table, const string &catalog, const string &schema) {
 	auto name = SourceTableName(table, catalog, schema);
-	return "table_name IN ('" + SqlUtils::EscapeValue(name) + "', '" +
+	// Settings and stored catalog entries can spell the same physical identifier
+	// differently. Match DuckDB's case-insensitive binding, including legacy rows.
+	return "lower(table_name) IN (lower('" + SqlUtils::EscapeValue(name) + "'), lower('" +
 	       SqlUtils::EscapeValue(SqlUtils::FullName(catalog, schema, name)) +
-	       "') AND "
-	       "COALESCE(source_catalog, '" +
-	       SqlUtils::EscapeValue(catalog) + "') = '" + SqlUtils::EscapeValue(catalog) +
-	       "' AND COALESCE(source_schema, '" + SqlUtils::EscapeValue(schema) + "') = '" +
-	       SqlUtils::EscapeValue(schema) + "'";
+	       "')) AND lower(COALESCE(source_catalog, '" + SqlUtils::EscapeValue(catalog) + "')) = lower('" +
+	       SqlUtils::EscapeValue(catalog) + "') AND lower(COALESCE(source_schema, '" + SqlUtils::EscapeValue(schema) +
+	       "')) = lower('" + SqlUtils::EscapeValue(schema) + "')";
 }
 
 string RefreshMetadata::InternalSourceDeltaName(const string &source_schema, const string &table) {
@@ -1166,9 +1166,10 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 		                 string(openivm::VISIBLE_TABLE_PREFIX) + "' || p.view_name OR d.table_name = '" +
 		                 string(openivm::DELTA_PREFIX) + string(openivm::VISIBLE_TABLE_PREFIX) +
 		                 "' || p.view_name)"
-		                 " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR d.source_catalog=p.view_catalog)"
-		                 " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR d.source_schema=" +
-		                 parent_schema + ")");
+		                 " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR "
+		                 "lower(d.source_catalog)=lower(p.view_catalog))"
+		                 " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR lower(d.source_schema)=lower(" +
+		                 parent_schema + "))");
 	};
 	auto edges = edge_query("COALESCE(p.internal_schema, p.view_schema)");
 	if (edges->HasError()) {

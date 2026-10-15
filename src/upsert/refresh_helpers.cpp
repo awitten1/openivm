@@ -23,6 +23,21 @@
 
 namespace duckdb {
 
+static vector<string> ParseLineageSourceName(const string &table_name, const string &physical_table) {
+	// Single-source lineage can carry a raw catalog name, including embedded
+	// dots. Resolve that spelling before interpreting SQL qualification.
+	if (StringUtil::CIEquals(table_name, physical_table)) {
+		return {physical_table};
+	}
+	try {
+		return SqlUtils::ParseQualifiedIdentifier(table_name);
+	} catch (const ParserException &) {
+		// Other candidates may still match this raw name. Only metadata-backed
+		// identities are used to generate table references below.
+		return {table_name};
+	}
+}
+
 string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
                                const vector<string> &delta_table_names) {
 	vector<string> candidates;
@@ -34,9 +49,9 @@ string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_nam
 	candidates.push_back(IncrementalTableNames::DataTableName(SqlUtils::LastIdentifierPart(table_name)));
 	candidates.push_back(SqlUtils::DeltaName(table_name));
 	candidates.push_back(SqlUtils::DeltaName(SqlUtils::LastIdentifierPart(table_name)));
-	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
 	for (auto &dt : delta_table_names) {
 		auto loc = metadata.GetSourceLocation(view_name, dt);
+		auto parts = ParseLineageSourceName(table_name, BaseTableNameFromDeltaKey(loc.table_name));
 		bool matches = false;
 		for (const auto &candidate : candidates) {
 			matches = matches || StringUtil::CIEquals(loc.table_name, candidate);
@@ -456,7 +471,7 @@ string StripOpenIVMDataPrefix(const string &name) {
 }
 
 static bool ProjectionSourceNameMatches(const DuckLakeSourceSpec &spec, const string &table_name) {
-	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
+	auto parts = ParseLineageSourceName(table_name, spec.loc.table_name);
 	if (parts.size() == 3 && (!StringUtil::CIEquals(parts[0], spec.loc.catalog_name) ||
 	                          !StringUtil::CIEquals(parts[1], spec.loc.schema_name))) {
 		return false;

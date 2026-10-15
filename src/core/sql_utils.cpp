@@ -1035,7 +1035,6 @@ int64_t SqlUtils::ExtractRefreshInterval(string &query) {
 	string interval_str = match[1].str();
 	// Strip the REFRESH EVERY clause from the query
 	query = std::regex_replace(query, refresh_re, "");
-	SqlUtils::RemoveRedundantWhitespaces(query);
 	return ParseRefreshInterval(interval_str);
 }
 
