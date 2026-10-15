@@ -1004,6 +1004,17 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 						// Matches CreateDeltaGetNode's convention: the stored snapshot was already
 						// consumed, so start one past it. Insertions are +1, deletions -1.
 						auto source_location = metadata.GetSourceLocation(view_name, delta_name);
+						if (last_snap >= cur_snap) {
+							// Nothing consumed since the last refresh: snapshot last_snap + 1 does not
+							// exist yet, so avoid the table functions and read a typed empty relation.
+							string base_full =
+							    SqlUtils::FullName(source->catalog_name, source->schema_name, source_location.table_name);
+							result = "(SELECT " + qkey + " AS __k, 1 AS __m FROM " + base_full +
+							         " WHERE false UNION ALL SELECT " + qkey + " AS __k, -1 AS __m FROM " + base_full +
+							         " WHERE false)";
+							lj_delta_source_cache[cache_key] = result;
+							return result;
+						}
 						string ins = SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", source->catalog_name,
 						                                             source->schema_name, source_location.table_name,
 						                                             last_snap + 1, cur_snap);
