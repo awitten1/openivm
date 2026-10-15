@@ -48,6 +48,16 @@ string SqlUtils::TrimSQLFragment(const string &input) {
 	return input.substr(start, end - start);
 }
 
+string SqlUtils::IdentifierEqualsSQL(const string &left, const string &right) {
+	// SQL lower() folds Unicode, whereas StringUtil::CIEquals and catalog lookup
+	// fold only A-Z. Preserve every other code point, including quoted identifiers.
+	auto fold = [](const string &expression) {
+		return "translate(" + expression + ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
+	};
+	// An application collation must not widen physical identifier equality either.
+	return "(" + fold(left) + " COLLATE \"binary\" = " + fold(right) + " COLLATE \"binary\")";
+}
+
 string SqlUtils::BuildCastSpec(const string &target_type, bool try_cast) {
 	if (!try_cast) {
 		return target_type;

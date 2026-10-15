@@ -79,10 +79,11 @@ ParserExtensionParseResult MaterializedViewParserExtension::ParseFunction(Parser
 }
 
 ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect) {
-	// The native tokenizer omits comments and can combine newline-separated
-	// literals into one token. Inspect each complete token interval, masking only
-	// comments and real delimiters; retain literal contents and newline separators.
+	// Mask comments only in the lifecycle header. The AS body must reach the
+	// native parser unchanged: removing a block comment between adjacent string
+	// literals can turn invalid SQL into a valid concatenated literal.
 	auto cleaned = query;
+	string query_body;
 	auto tokens = Parser::Tokenize(query);
 	idx_t cursor = 0;
 	for (idx_t i = 0; i <= tokens.size(); i++) {
@@ -144,6 +145,12 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 		}
 		if (token && token->type == SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR && query[token->start] == ';') {
 			cleaned[token->start] = ' ';
+		}
+		if (token && token->type == SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD &&
+		    StringUtil::CIEquals(SqlUtils::TrimSQLFragment(cleaned.substr(token->start, end - token->start)), "as")) {
+			query_body = query.substr(token->start + 2);
+			cleaned.resize(token->start + 2);
+			break;
 		}
 	}
 	auto query_lower = SqlUtils::SQLToLowercase(cleaned);
@@ -211,6 +218,7 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Refresh interval: %lld seconds\n", (long long)refresh_interval);
 
 	SqlUtils::ReplaceMaterializedView(query_lower);
+	query_lower += query_body;
 	// All other rewrites (DISTINCT, AVG, LEFT JOIN key, aggregate aliases) are done
 	// at the plan level in PlanFunction via PlanRewrite + LPTS.
 	OPENIVM_DEBUG_PRINT("[CREATE MV] After structural rewrite: %s\n", query_lower.c_str());

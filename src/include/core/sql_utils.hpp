@@ -33,6 +33,8 @@ public:
 	static vector<string> ParseQualifiedIdentifier(const string &name);
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
+	/// Compare SQL expressions holding catalog identifiers using DuckDB's ASCII-only case folding.
+	static string IdentifierEqualsSQL(const string &left, const string &right);
 	static string QualifiedPrefix(const string &catalog, const string &schema);
 	static string QuoteQualifiedPrefix(const string &prefix);
 	static string JsonQuote(const string &value);

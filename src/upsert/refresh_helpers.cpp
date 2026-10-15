@@ -1354,8 +1354,8 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 	}
 	if (key.empty() && parts.size() == 1) {
 		auto candidates = con.Query("SELECT table_catalog, table_schema FROM information_schema.tables "
-		                            "WHERE table_type = 'VIEW' AND lower(table_name) = lower(" +
-		                            Value(name).ToSQLString() + ")");
+		                            "WHERE table_type = 'VIEW' AND " +
+		                            SqlUtils::IdentifierEqualsSQL("table_name", Value(name).ToSQLString()));
 		if (!candidates->HasError()) {
 			for (idx_t row = 0; row < candidates->RowCount(); row++) {
 				auto catalog = candidates->GetValue(0, row).ToString();
@@ -1472,19 +1472,8 @@ string BuildDuckLakeSnapshotQuery(RefreshMetadata &metadata, Connection &con, co
 		if (StringUtil::StartsWith(source_name, openivm::DATA_TABLE_PREFIX)) {
 			source_name = source_name.substr(strlen(openivm::DATA_TABLE_PREFIX));
 		}
-		string visible_cols;
-		auto cols = con.Query("SELECT column_name FROM information_schema.columns WHERE table_catalog = '" +
-		                      SqlUtils::EscapeValue(loc.catalog_name) + "' AND table_schema = '" +
-		                      SqlUtils::EscapeValue(loc.schema_name) + "' AND table_name = '" +
-		                      SqlUtils::EscapeValue(source_name) + "' ORDER BY ordinal_position");
-		if (!cols->HasError()) {
-			for (idx_t i = 0; i < cols->RowCount(); i++) {
-				if (!visible_cols.empty()) {
-					visible_cols += ", ";
-				}
-				visible_cols += SqlUtils::QuoteIdentifier(cols->GetValue(0, i).ToString());
-			}
-		}
+		auto visible_cols =
+		    SqlUtils::JoinQuotedColumns(metadata.GetTableColumns(loc.catalog_name, loc.schema_name, source_name));
 		if (visible_cols.empty()) {
 			visible_cols = "*";
 		}

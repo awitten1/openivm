@@ -136,6 +136,10 @@ delta tables that may still be invisible outside the caller transaction.
 name (`delta_table_name`), and, for moved deltas, the internal schema (`delta_schema`).
 Older rows without a stored physical name retain their original naming rule.
 `openivm_views.internal_schema` records where a view's internal tables live.
+Metadata identity comparisons follow DuckDB's ASCII-only identifier case folding:
+`items` and `ITEMS` identify the same table, while quoted schemas `"Ä"` and `"ä"`
+remain distinct. Unicode string case folding and application collations must not
+combine their ownership or CASCADE cleanup.
 
 Stored original-SQL definitions qualify each source using the CREATE caller's
 catalog lookup and search path. This includes public parent-MV names, which differ

@@ -79,9 +79,8 @@ string ResolveMetadataCatalog(ClientContext &context, Connection &con, const str
 		catalog = ClientData::Get(context).catalog_search_path->GetDefault().catalog;
 	}
 	if (!catalog.empty()) {
-		auto type = con.Query("SELECT database_name, type FROM duckdb_databases() WHERE NOT internal AND "
-		                      "lower(database_name) = lower(" +
-		                      Value(catalog).ToSQLString() + ")");
+		auto type = con.Query("SELECT database_name, type FROM duckdb_databases() WHERE NOT internal AND " +
+		                      SqlUtils::IdentifierEqualsSQL("database_name", Value(catalog).ToSQLString()));
 		if (type->HasError()) {
 			throw CatalogException("OpenIVM could not resolve metadata catalog: %s", type->GetError());
 		}
@@ -429,10 +428,12 @@ string RefreshMetadata::GetViewSQLName(const string &view_key) {
 
 string RefreshMetadata::FindViewKey(const string &catalog, const string &schema, const string &name) {
 	auto query = [&](const string &name_expression) {
-		return con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE lower(" + name_expression +
-		                 ") = lower(" + Value(name).ToSQLString() + ") AND lower(COALESCE(view_catalog, " +
-		                 Value(catalog).ToSQLString() + ")) = lower(" + Value(catalog).ToSQLString() +
-		                 ") AND lower(COALESCE(view_schema, 'main')) = lower(" + Value(schema).ToSQLString() + ")");
+		return con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
+		                 SqlUtils::IdentifierEqualsSQL(name_expression, Value(name).ToSQLString()) + " AND " +
+		                 SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " + Value(catalog).ToSQLString() + ")",
+		                                               Value(catalog).ToSQLString()) +
+		                 " AND " +
+		                 SqlUtils::IdentifierEqualsSQL("COALESCE(view_schema, 'main')", Value(schema).ToSQLString()));
 	};
 	auto result = query("COALESCE(view_sql_name, view_name)");
 	if (result->HasError()) {
@@ -480,11 +481,11 @@ string RefreshMetadata::ResolveViewName(const string &view_name, const string &c
 		}
 	}
 	auto matches =
-	    con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
-	              " WHERE lower(COALESCE(view_sql_name, view_name)) = lower(" + Value(view_name).ToSQLString() + ")");
+	    con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
+	              SqlUtils::IdentifierEqualsSQL("COALESCE(view_sql_name, view_name)", Value(view_name).ToSQLString()));
 	if (matches->HasError()) {
-		matches = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) +
-		                    " WHERE lower(view_name) = lower(" + Value(view_name).ToSQLString() + ")");
+		matches = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE " +
+		                    SqlUtils::IdentifierEqualsSQL("view_name", Value(view_name).ToSQLString()));
 	}
 	if (!matches->HasError() && matches->RowCount() > 1) {
 		throw CatalogException("Ambiguous materialized view '%s'; use catalog.schema.view", view_name);
@@ -629,13 +630,15 @@ string RefreshMetadata::SourceTableName(const string &key, const string &catalog
 
 string RefreshMetadata::SourcePredicate(const string &table, const string &catalog, const string &schema) {
 	auto name = SourceTableName(table, catalog, schema);
-	// Settings and stored catalog entries can spell the same physical identifier
-	// differently. Match DuckDB's case-insensitive binding, including legacy rows.
-	return "lower(table_name) IN (lower('" + SqlUtils::EscapeValue(name) + "'), lower('" +
-	       SqlUtils::EscapeValue(SqlUtils::FullName(catalog, schema, name)) +
-	       "')) AND lower(COALESCE(source_catalog, '" + SqlUtils::EscapeValue(catalog) + "')) = lower('" +
-	       SqlUtils::EscapeValue(catalog) + "') AND lower(COALESCE(source_schema, '" + SqlUtils::EscapeValue(schema) +
-	       "')) = lower('" + SqlUtils::EscapeValue(schema) + "')";
+	// Match both legacy bare keys and qualified keys with catalog identifier rules.
+	return "(" + SqlUtils::IdentifierEqualsSQL("table_name", Value(name).ToSQLString()) + " OR " +
+	       SqlUtils::IdentifierEqualsSQL("table_name", Value(SqlUtils::FullName(catalog, schema, name)).ToSQLString()) +
+	       ") AND " +
+	       SqlUtils::IdentifierEqualsSQL("COALESCE(source_catalog, " + Value(catalog).ToSQLString() + ")",
+	                                     Value(catalog).ToSQLString()) +
+	       " AND " +
+	       SqlUtils::IdentifierEqualsSQL("COALESCE(source_schema, " + Value(schema).ToSQLString() + ")",
+	                                     Value(schema).ToSQLString());
 }
 
 string RefreshMetadata::InternalSourceDeltaName(const string &source_schema, const string &table) {
@@ -903,10 +906,14 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source,
 		// An MV owns its deltas even when no child consumes them.
 		auto query = [&](const string &schema_expression) {
 			return reader.Query("SELECT 1 FROM " + views_table + " WHERE view_name=" + Value(owner).ToSQLString() +
-			                    " AND lower(COALESCE(view_catalog," + Value(location.catalog_name).ToSQLString() +
-			                    "))=lower(" + Value(source.catalog_name).ToSQLString() + ") AND lower(COALESCE(" +
-			                    schema_expression + "," + Value(source.schema_name).ToSQLString() + "))=lower(" +
-			                    Value(source.schema_name).ToSQLString() + ")");
+			                    " AND " +
+			                    SqlUtils::IdentifierEqualsSQL("COALESCE(view_catalog, " +
+			                                                      Value(location.catalog_name).ToSQLString() + ")",
+			                                                  Value(source.catalog_name).ToSQLString()) +
+			                    " AND " +
+			                    SqlUtils::IdentifierEqualsSQL("COALESCE(" + schema_expression + ", " +
+			                                                      Value(source.schema_name).ToSQLString() + ")",
+			                                                  Value(source.schema_name).ToSQLString()));
 		};
 		auto result = query("internal_schema, view_schema");
 		if (result->HasError()) {
@@ -1013,12 +1020,12 @@ RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(c
 
 static string InformationSchemaRelationFilter(const string &catalog_name, const string &schema_name,
                                               const string &table_name) {
-	string filter = "table_name = '" + SqlUtils::EscapeValue(table_name) + "'";
+	string filter = SqlUtils::IdentifierEqualsSQL("table_name", Value(table_name).ToSQLString());
 	if (!catalog_name.empty()) {
-		filter += " AND table_catalog = '" + SqlUtils::EscapeValue(catalog_name) + "'";
+		filter += " AND " + SqlUtils::IdentifierEqualsSQL("table_catalog", Value(catalog_name).ToSQLString());
 	}
 	if (!schema_name.empty()) {
-		filter += " AND table_schema = '" + SqlUtils::EscapeValue(schema_name) + "'";
+		filter += " AND " + SqlUtils::IdentifierEqualsSQL("table_schema", Value(schema_name).ToSQLString());
 	}
 	return filter;
 }
@@ -1166,10 +1173,10 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 		                 string(openivm::VISIBLE_TABLE_PREFIX) + "' || p.view_name OR d.table_name = '" +
 		                 string(openivm::DELTA_PREFIX) + string(openivm::VISIBLE_TABLE_PREFIX) +
 		                 "' || p.view_name)"
-		                 " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR "
-		                 "lower(d.source_catalog)=lower(p.view_catalog))"
-		                 " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR lower(d.source_schema)=lower(" +
-		                 parent_schema + "))");
+		                 " AND (d.source_catalog IS NULL OR p.view_catalog IS NULL OR " +
+		                 SqlUtils::IdentifierEqualsSQL("d.source_catalog", "p.view_catalog") + ")" +
+		                 " AND (d.source_schema IS NULL OR p.view_schema IS NULL OR " +
+		                 SqlUtils::IdentifierEqualsSQL("d.source_schema", parent_schema) + ")");
 	};
 	auto edges = edge_query("COALESCE(p.internal_schema, p.view_schema)");
 	if (edges->HasError()) {
@@ -1425,8 +1432,9 @@ bool RefreshMetadata::IsDuckLakeCatalog(const string &catalog_name) {
 	if (catalog_name.empty()) {
 		return false;
 	}
-	auto result = con.Query("SELECT type FROM duckdb_databases() WHERE lower(database_name) = lower(" +
-	                        Value(catalog_name).ToSQLString() + ") LIMIT 1");
+	auto result =
+	    con.Query("SELECT type FROM duckdb_databases() WHERE " +
+	              SqlUtils::IdentifierEqualsSQL("database_name", Value(catalog_name).ToSQLString()) + " LIMIT 1");
 	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
 	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
 }

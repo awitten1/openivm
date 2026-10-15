@@ -55,8 +55,8 @@ void WarnSnapshotHistoryDeletion(ClientContext &context, LogicalOperator &plan) 
 		// Publications live in the MV's internal location; report the user-facing name.
 		auto query = [&](const string &internal_expression) {
 			return con.Query("SELECT view_name, view_schema, COALESCE(view_sql_name, view_name), " +
-			                 internal_expression + " FROM " + views_table + " WHERE lower(view_catalog) = lower('" +
-			                 SqlUtils::EscapeValue(catalog) + "')");
+			                 internal_expression + " FROM " + views_table + " WHERE " +
+			                 SqlUtils::IdentifierEqualsSQL("view_catalog", Value(catalog).ToSQLString()));
 		};
 		auto views = query("COALESCE(internal_schema, view_schema)");
 		if (views->HasError()) {

@@ -97,6 +97,15 @@ all maintenance tables. A cross-catalog source consumer and an exclusion list co
 also verify that direct CASCADE exclusions and staged final DROP retain the
 consumer's catalog/schema identity.
 
+Unicode CASCADE cases keep `"Ä".items` and `"ä".items`, plus same-named MVs,
+distinct with separate metadata and maintenance schemas. Replacement followed by
+direct or mixed-batch CASCADE covers autocommit, explicit commit/rollback, and
+staged cleanup across distinct quoted native catalogs. Surviving views receive
+conflicting batched writes and bidirectional bag checks before final-consumer
+cleanup. Identifier comparison cases also verify ASCII case equivalence, Unicode
+distinction and NULL behavior under binary and Unicode case-insensitive string
+collations.
+
 Publication-owner cases remove a native parent's last child in the same or another
 catalog, using separate quoted control/internal schemas and a non-default search
 path. DROP and replacement commit/rollback must retain both parent delta
@@ -131,13 +140,19 @@ DML, explicit commit and rollback.
 Metadata replay supplies helper-local ownership visibility without running physical
 programs ahead of their native statement position.
 
-The mixed lifecycle cases also preserve newline-concatenated string literals,
-including intervening nested comments and `REFRESH EVERY`, through replacement,
-commit and rollback. The native and DuckLake internal-schema SQL fixtures select
-existing maintenance schemas with different casing for parent and child MVs,
+The mixed lifecycle cases preserve newline/line-comment-concatenated string literals,
+nested block comments, dollar-quoted case and literal lifecycle keywords through
+`REFRESH EVERY`, replacement, commit and rollback. Their expected results use
+explicit literal values. Header normalization leaves the AS body unchanged;
+native and lifecycle parsing must both reject block comments between adjacent
+literals rather than silently concatenate them. The native and DuckLake
+internal-schema SQL fixtures select existing maintenance schemas with different casing for parent and child MVs,
 then verify publication, pipeline refresh, reopen and final cleanup. Windows over
 `"Window Source"` exercise raw and SQL-quoted lineage with conflicting batched
 writes and bidirectional bag equality.
+The native lifecycle executable also checks column lookup with ASCII spelling
+differences in catalog, schema and table names, preserving column order and
+distinct Unicode identities under binary and case-insensitive string collations.
 
 The fixture also injects a late binder failure after successful lifecycle writes.
 Autocommit rolls back the statement; an explicit transaction must be invalidated

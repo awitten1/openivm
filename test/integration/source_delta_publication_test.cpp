@@ -10,6 +10,7 @@
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/logical_plan_statement.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "rules/column_hider.hpp"
@@ -63,6 +64,27 @@ static void TestQuotedNamespaceNormalization() {
 	if (SqlUtils::SQLToLowercase(sql) != expected) {
 		throw InvalidInputException("CREATE normalization changed a quoted namespace or literal");
 	}
+	// Native literal continuation permits whitespace and line comments, but not
+	// block comments. Header normalization must not silently accept invalid bodies.
+	Parser native_parser;
+	bool native_rejected = false;
+	try {
+		native_parser.ParseQuery("SELECT 'c' /* nested /* ; */ comment */\n'd' AS joined");
+	} catch (const ParserException &) {
+		native_rejected = true;
+	}
+	bool lifecycle_rejected = false;
+	try {
+		ParseMaterializedViewStatement("CREATE MATERIALIZED VIEW mv AS SELECT 'c' /* nested /* ; */ comment */\n"
+		                               "'d' AS joined",
+		                               SqlDialect::DUCKDB);
+	} catch (const ParserException &) {
+		lifecycle_rejected = true;
+	}
+	if (!native_rejected || !lifecycle_rejected) {
+		throw InvalidInputException(
+		    "Lifecycle parsing must preserve native rejection of block-comment literal continuation");
+	}
 }
 
 static void TestQualifiedTableReferences() {
@@ -99,6 +121,64 @@ static void TestQualifiedTableReferences() {
 	        "lake.main.\"Table.Name\"" ||
 	    !SqlUtils::FindTableReference(dotted_query, "Table.Name").empty()) {
 		throw InvalidInputException("Table-reference matching confused a quoted table name with qualification");
+	}
+}
+
+static void TestIdentifierComparisons() {
+	std::cerr << "CASE ASCII-only identifier comparisons" << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	for (const auto &collation : vector<string> {"binary", "nocase"}) {
+		Execute(owner, "SET default_collation=" + Value(collation).ToSQLString() + ";");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT 1 FROM (VALUES "
+		               "('Items','iTEMS',true), ('Ä','Ä',true), ('Ä','ä',false), "
+		               "('ÄItems','ÄiTEMS',true), ('ÄItems','äiTEMS',false), "
+		               "('Schema\"Name','sCHEMA\"nAME',true), (NULL,'items',NULL)) v(l,r,expected) WHERE " +
+		                   SqlUtils::IdentifierEqualsSQL("l", "r") +
+		                   " IS DISTINCT FROM expected) THEN error('Identifier comparison differs from catalog rules') "
+		                   "ELSE true END;");
+		const auto qualified_key = SqlUtils::FullName("ÄCatalog", "ÄSchema", "openivm_delta_ÄItems");
+		for (const auto &key : vector<string> {"openivm_delta_ÄItems", qualified_key}) {
+			Execute(owner,
+			        "SELECT CASE WHEN EXISTS (SELECT 1 FROM (VALUES "
+			        "('openivm_delta_ÄItems','ÄCatalog','ÄSchema',true), "
+			        "('OPENIVM_DELTA_ÄITEMS','ÄCATALOG','ÄSCHEMA',true), "
+			        "('openivm_delta_äItems','ÄCatalog','ÄSchema',false), "
+			        "('openivm_delta_ÄItems','äCatalog','ÄSchema',false), "
+			        "('openivm_delta_ÄItems','ÄCatalog','äSchema',false), "
+			        "('openivm_delta_ÄItems',NULL,NULL,true), (" +
+			            Value(qualified_key).ToSQLString() +
+			            ",'ÄCatalog','ÄSchema',true)) v(table_name,source_catalog,source_schema,expected) WHERE (" +
+			            RefreshMetadata::SourcePredicate(key, "ÄCatalog", "ÄSchema") +
+			            ") IS DISTINCT FROM expected) THEN error('Source predicate merged distinct identifiers') "
+			            "ELSE true END;");
+		}
+	}
+}
+
+static void TestTableColumnIdentity() {
+	std::cerr << "CASE table-column lookup preserves physical identifier identity" << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "ATTACH ':memory:' AS \"ÄCatalog\"; ATTACH ':memory:' AS \"äCatalog\"; "
+	               "CREATE SCHEMA \"ÄCatalog\".\"ÄSchema\"; CREATE SCHEMA \"ÄCatalog\".\"äSchema\"; "
+	               "CREATE SCHEMA \"äCatalog\".\"ÄSchema\"; "
+	               "CREATE TABLE \"ÄCatalog\".\"ÄSchema\".\"ÄItems\"(first INTEGER, second INTEGER); "
+	               "CREATE TABLE \"ÄCatalog\".\"ÄSchema\".\"äItems\"(other_table INTEGER); "
+	               "CREATE TABLE \"ÄCatalog\".\"äSchema\".\"ÄItems\"(other_schema INTEGER); "
+	               "CREATE TABLE \"äCatalog\".\"ÄSchema\".\"ÄItems\"(other_catalog INTEGER);");
+	RefreshMetadata metadata(owner);
+	for (const auto &collation : vector<string> {"binary", "nocase"}) {
+		Execute(owner, "SET default_collation=" + Value(collation).ToSQLString() + ";");
+		// ASCII spelling differences bind to the same object; Unicode case and
+		// an application collation must not merge distinct physical identities.
+		if (metadata.GetTableColumns("ÄcATALOG", "ÄsCHEMA", "ÄiTEMS") != vector<string> {"first", "second"} ||
+		    metadata.GetTableColumns("ÄcATALOG", "ÄsCHEMA", "äiTEMS") != vector<string> {"other_table"} ||
+		    metadata.GetTableColumns("ÄcATALOG", "äsCHEMA", "ÄiTEMS") != vector<string> {"other_schema"} ||
+		    metadata.GetTableColumns("äcATALOG", "ÄsCHEMA", "ÄiTEMS") != vector<string> {"other_catalog"} ||
+		    !metadata.GetTableColumns("ÄcATALOG", "ÄsCHEMA", "missing").empty()) {
+			throw InvalidInputException("Table-column lookup changed physical identity or column order");
+		}
 	}
 }
 
@@ -966,6 +1046,88 @@ static void TestSourceCascadeConsumerLocations(const string &mutation, bool comm
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
 }
 
+// SQL lower() merges these sources; DuckDB's catalog keeps them distinct.
+static void TestUnicodeSourceCascade(bool explicit_transaction, bool commit, bool cross_catalog, bool batched_drop) {
+	std::cerr << "CASE Unicode source cascade explicit_transaction=" << explicit_transaction << " commit=" << commit
+	          << " cross_catalog=" << cross_catalog << " batched_drop=" << batched_drop << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Ä\"; CREATE SCHEMA \"ä\"; "
+	               "CREATE TABLE \"Ä\".items(i INTEGER); CREATE TABLE \"ä\".items(i INTEGER); "
+	               "INSERT INTO \"Ä\".items VALUES (1),(1),(2); INSERT INTO \"ä\".items VALUES (8),(8),(9);");
+	// Separate metadata catalogs exercise staged cleanup as well as catalog lookup:
+	// these quoted catalog names, like the source schemas, are distinct in DuckDB.
+	const string upper_catalog = cross_catalog ? "ÄCatalog" : "memory";
+	const string lower_catalog = cross_catalog ? "äCatalog" : "memory";
+	if (cross_catalog) {
+		Execute(owner, "ATTACH ':memory:' AS \"ÄCatalog\"; ATTACH ':memory:' AS \"äCatalog\"; "
+		               "CREATE SCHEMA \"ÄCatalog\".\"Ä\"; CREATE SCHEMA \"äCatalog\".\"ä\";");
+	}
+	const auto upper_view = SqlUtils::FullName(upper_catalog, "Ä", "mv");
+	const auto lower_view = SqlUtils::FullName(lower_catalog, "ä", "mv");
+	const auto upper_metadata = SqlUtils::FullName(upper_catalog, "Control.Space", openivm::VIEWS_TABLE);
+	const auto lower_metadata = SqlUtils::FullName(lower_catalog, "Control.Space", openivm::VIEWS_TABLE);
+	Execute(owner, "CREATE MATERIALIZED VIEW " + upper_view +
+	                   " AS SELECT * FROM memory.\"Ä\".items; "
+	                   "CREATE MATERIALIZED VIEW " +
+	                   lower_view + " AS SELECT * FROM memory.\"ä\".items;");
+	Execute(owner, "SELECT CASE WHEN "
+	               "(SELECT count(*) FROM " +
+	                   upper_metadata + " WHERE view_catalog=" + Value(upper_catalog).ToSQLString() +
+	                   " AND view_schema='Ä')=1 AND "
+	                   "(SELECT count(*) FROM " +
+	                   lower_metadata + " WHERE view_catalog=" + Value(lower_catalog).ToSQLString() +
+	                   " AND view_schema='ä')=1 AND "
+	                   "(SELECT count(DISTINCT table_name) FROM duckdb_tables() WHERE database_name='memory' "
+	                   "AND schema_name='Internal Space' AND table_name IN (" +
+	                   Value(RefreshMetadata::InternalSourceDeltaName("Ä", "items")).ToSQLString() + "," +
+	                   Value(RefreshMetadata::InternalSourceDeltaName("ä", "items")).ToSQLString() +
+	                   "))=2 "
+	                   "THEN true ELSE error('Unicode namespaces lost physical placement') END;");
+	Execute(owner, "USE " + SqlUtils::QuoteIdentifier(lower_catalog) + ".\"Control.Space\";");
+	if (explicit_transaction) {
+		Execute(owner, "BEGIN;");
+	}
+	// Replacing only one same-named view must retain both qualified owners. Its
+	// metadata mutations also exercise replay before CASCADE inside BEGIN.
+	Execute(owner, "CREATE OR REPLACE MATERIALIZED VIEW " + upper_view + " AS SELECT * FROM memory.\"Ä\".items;");
+	Execute(owner, "DROP TABLE memory.\"Ä\".iTEMS CASCADE;" + string(batched_drop ? " /* keep ä */ SELECT 1;" : ""));
+	if (explicit_transaction) {
+		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	}
+	Execute(owner, "SELECT CASE WHEN (SELECT count(*) FROM " + upper_metadata + " WHERE view_schema='Ä')=" +
+	                   string(commit ? "0" : "1") + " AND (SELECT count(*) FROM " + lower_metadata +
+	                   " WHERE view_schema='ä')=1 THEN true ELSE error('Unicode CASCADE selected unrelated MV') END;");
+	Execute(owner, "SELECT CASE WHEN count(*)=" + string(commit ? "1" : "2") +
+	                   " THEN true ELSE error('Unicode CASCADE removed or leaked source delta') END "
+	                   "FROM duckdb_tables() WHERE database_name='memory' AND schema_name='Internal Space' "
+	                   "AND table_name IN (" +
+	                   Value(RefreshMetadata::InternalSourceDeltaName("Ä", "items")).ToSQLString() + "," +
+	                   Value(RefreshMetadata::InternalSourceDeltaName("ä", "items")).ToSQLString() + ");");
+	vector<pair<string, string>> survivors = {{lower_view, "memory.\"ä\".items"}};
+	if (!commit) {
+		survivors.emplace_back(upper_view, "memory.\"Ä\".items");
+	}
+	for (const auto &survivor : survivors) {
+		const auto &source = survivor.second;
+		Execute(owner, "INSERT INTO " + source + " VALUES (1),(2),(3),(3); DELETE FROM " + source +
+		                   " WHERE i IN (1,8); UPDATE " + source + " SET i=4 WHERE i IN (2,9); INSERT INTO " + source +
+		                   " VALUES (1),(4),(5); DELETE FROM " + source + " WHERE i=5; UPDATE " + source +
+		                   " SET i=2 WHERE i=4;");
+		RefreshAndCheckBag(owner, survivor.first, "SELECT * FROM " + source);
+		Execute(owner, "DROP VIEW " + survivor.first + ";");
+	}
+	Execute(owner, "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM " + upper_metadata +
+	                   ") "
+	                   "AND NOT EXISTS (SELECT 1 FROM " +
+	                   lower_metadata +
+	                   ") "
+	                   "AND NOT EXISTS (SELECT 1 FROM duckdb_tables() WHERE schema_name='Internal Space') "
+	                   "THEN true ELSE error('Unicode final-consumer cleanup leaked') END;");
+}
+
 // Legacy view keys may repeat across metadata locations. Exclusions must name
 // their metadata table even when the excluded key also appears elsewhere.
 static void TestStagedCascadeConsumerIdentity() {
@@ -1122,13 +1284,19 @@ static void TestMixedLifecycleBatch(bool explicit_transaction, bool commit) {
 	               "CREATE SCHEMA \"Public;Space\"; CREATE TABLE source(i INTEGER); "
 	               "INSERT INTO source VALUES (1),(1),(2);");
 	const string view = "\"Public;Space\".\"Mixed;MV\"";
-	// DuckDB tokenizes newline-concatenated literals as one token. Comments
-	// between their segments must be removed without erasing either segment.
-	const string base_query = "SELECT i, 'a'\n'b' AS label, 'c' /* nested /* ; */ comment */\n'd' AS joined, "
-	                          "'value;--literal' AS comment_label, $$dollar;/*literal*/$$ AS dollar_label FROM source";
+	// DuckDB tokenizes newline/line-comment-concatenated literals as one token.
+	// Keep nested block comments outside the continuation, as required by its lexer.
+	const string base_query = "SELECT i, 'a'\n'b' AS label, 'c' -- continuation ;\n'd' "
+	                          "/* nested /* ; */ comment */ AS joined, 'value;--literal' AS comment_label, "
+	                          "$$Dollar;/*Literal*/$$ AS dollar_label, 'materialized view' AS keyword_label, "
+	                          "'or replace' AS replace_label, 'refresh every ''1 hour''' AS refresh_label FROM source";
+	const string expected_query =
+	    "SELECT i, 'ab' AS label, 'cd' AS joined, 'value;--literal' AS comment_label, "
+	    "'Dollar;/*Literal*/' AS dollar_label, 'materialized view' AS keyword_label, "
+	    "'or replace' AS replace_label, 'refresh every ''1 hour''' AS refresh_label FROM source";
 	Execute(owner, "CREATE MATERIALIZED VIEW " + view + " REFRESH EVERY '1 hour' AS " + base_query + ";");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + base_query + ") OR EXISTS (" +
-	                   base_query + " EXCEPT ALL SELECT * FROM " + view +
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + expected_query +
+	                   ") OR EXISTS (" + expected_query + " EXCEPT ALL SELECT * FROM " + view +
 	                   ") THEN error('Scheduled lifecycle changed literal contents') ELSE true END;");
 	Execute(owner, "CREATE MATERIALIZED VIEW sibling AS SELECT * FROM source;");
 	if (explicit_transaction) {
@@ -1143,8 +1311,8 @@ static void TestMixedLifecycleBatch(bool explicit_transaction, bool commit) {
 	                   "; CREATE /* keyword comment ; */ OR REPLACE MATERIALIZED VIEW " + view + " AS " + base_query +
 	                   "; SELECT CASE WHEN count(*)=5 THEN true ELSE error('Mixed batch reordered DML') END FROM " +
 	                   view + ";");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + base_query + ") OR EXISTS (" +
-	                   base_query + " EXCEPT ALL SELECT * FROM " + view +
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + expected_query +
+	                   ") OR EXISTS (" + expected_query + " EXCEPT ALL SELECT * FROM " + view +
 	                   ") THEN error('Mixed lifecycle initial load bag mismatch') ELSE true END;");
 	if (explicit_transaction) {
 		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
@@ -1152,7 +1320,7 @@ static void TestMixedLifecycleBatch(bool explicit_transaction, bool commit) {
 	Execute(owner, "INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
 	               "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (1),(5),(5); "
 	               "DELETE FROM source WHERE i=5; UPDATE source SET i=2 WHERE i=4;");
-	for (auto &survivor : vector<pair<string, string>> {{view, base_query}, {"sibling", "SELECT * FROM source"}}) {
+	for (auto &survivor : vector<pair<string, string>> {{view, expected_query}, {"sibling", "SELECT * FROM source"}}) {
 		Execute(owner, "PRAGMA refresh('" + survivor.first + "');");
 		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + survivor.first + " EXCEPT ALL " + survivor.second +
 		                   ") OR EXISTS (" + survivor.second + " EXCEPT ALL SELECT * FROM " + survivor.first +
@@ -1269,6 +1437,8 @@ int main(int argc, char **argv) {
 	try {
 		TestQuotedNamespaceNormalization();
 		TestQualifiedTableReferences();
+		TestIdentifierComparisons();
+		TestTableColumnIdentity();
 		TestInternalSchemaReopen(argv[1]);
 		TestSourceDeltaLookup();
 		TestSharedMetadataUpgrade(false, true);
@@ -1310,6 +1480,13 @@ int main(int argc, char **argv) {
 			}
 		}
 		TestStagedCascadeConsumerIdentity();
+		for (bool batched_drop : {false, true}) {
+			TestUnicodeSourceCascade(false, true, false, batched_drop);
+			TestUnicodeSourceCascade(true, true, false, batched_drop);
+			TestUnicodeSourceCascade(true, false, false, batched_drop);
+			// Writes spanning native catalogs use the autocommit staged route.
+			TestUnicodeSourceCascade(false, true, true, batched_drop);
+		}
 		for (bool disable_optimizer : {false, true}) {
 			TestBatchedViewDrop(false, true, disable_optimizer);
 			TestBatchedViewDrop(true, true, disable_optimizer);
