@@ -133,6 +133,54 @@ string MetadataOwnershipTable(Connection &con, const string &table) {
 	return RefreshMetadata::MetadataTable(con, table);
 }
 
+// Owners and consumers can be registered outside the selected metadata catalog.
+// Inspect the complete inventory, including locations created in this transaction.
+bool AnyMetadataOwnership(
+    Connection &con, const string &table, optional_ptr<TransactionalMVMetadataState> transaction_state,
+    const std::function<bool(Connection &, const RefreshMetadata::MetadataLocation &, const string &)> &matches) {
+	auto current = RefreshMetadata::CurrentLocation(con);
+	auto locations = RefreshMetadata::MetadataLocations(con, table);
+	auto include_location = [&](const RefreshMetadata::MetadataLocation &candidate) {
+		for (auto &location : locations) {
+			if (StringUtil::CIEquals(location.catalog_name, candidate.catalog_name) &&
+			    StringUtil::CIEquals(location.schema_name, candidate.schema_name)) {
+				return;
+			}
+		}
+		locations.push_back(candidate);
+	};
+	if (transaction_state) {
+		for (auto &location : transaction_state->MetadataLocations()) {
+			include_location({location.first, location.second});
+		}
+	} else if (con.TableInfo(table)) {
+		include_location(current);
+	}
+	// Replay replaces TEMP shadows. Keep it on a separate helper so ownership
+	// checks never change the compiler's selected location or transaction snapshot.
+	unique_ptr<Connection> replay;
+	if (transaction_state) {
+		replay = make_uniq<Connection>(*con.context->db);
+	}
+	for (auto &location : locations) {
+		auto target = SqlUtils::FullName(location.catalog_name, location.schema_name, table);
+		auto reader = &con;
+		if (replay) {
+			RefreshMetadata::UseLocation(*replay, location);
+			transaction_state->Apply(*replay);
+			reader = replay.get();
+			target = MetadataOwnershipTable(*reader, table);
+		} else if (StringUtil::CIEquals(location.catalog_name, current.catalog_name) &&
+		           StringUtil::CIEquals(location.schema_name, current.schema_name)) {
+			target = MetadataOwnershipTable(*reader, table);
+		}
+		if (matches(*reader, location, target)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 } // namespace
 
 string RefreshMetadata::ConfiguredMetadataSchema(ClientContext &context) {
@@ -844,28 +892,34 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
 	return loc;
 }
 
-bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source) {
-	if (!SqlUtils::IsDelta(source.table_name)) {
+bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source,
+                                              optional_ptr<TransactionalMVMetadataState> transaction_state) {
+	auto table_name = SourceTableName(source.table_name, source.catalog_name, source.schema_name);
+	if (!SqlUtils::IsDelta(table_name)) {
 		return false;
 	}
-	auto owner = PublishedSourceViewName(source.table_name);
-	auto views_table = MetadataOwnershipTable(con, openivm::VIEWS_TABLE);
-	// An MV's own deltas live in its internal location, which may differ from the view's schema.
-	auto query = [&](const string &schema_expression) {
-		return con.Query("SELECT 1 FROM " + views_table + " WHERE view_name='" + SqlUtils::EscapeValue(owner) +
-		                 "' AND COALESCE(view_catalog,'" + SqlUtils::EscapeValue(source.catalog_name) + "')='" +
-		                 SqlUtils::EscapeValue(source.catalog_name) + "' AND COALESCE(" + schema_expression + ",'" +
-		                 SqlUtils::EscapeValue(source.schema_name) + "')='" +
-		                 SqlUtils::EscapeValue(source.schema_name) + "'");
+	auto owner = PublishedSourceViewName(table_name);
+	auto matches = [&](Connection &reader, const MetadataLocation &location, const string &views_table) {
+		// An MV owns its deltas even when no child consumes them.
+		auto query = [&](const string &schema_expression) {
+			return reader.Query("SELECT 1 FROM " + views_table + " WHERE view_name=" + Value(owner).ToSQLString() +
+			                    " AND lower(COALESCE(view_catalog," + Value(location.catalog_name).ToSQLString() +
+			                    "))=lower(" + Value(source.catalog_name).ToSQLString() + ") AND lower(COALESCE(" +
+			                    schema_expression + "," + Value(source.schema_name).ToSQLString() + "))=lower(" +
+			                    Value(source.schema_name).ToSQLString() + ")");
+		};
+		auto result = query("internal_schema, view_schema");
+		if (result->HasError()) {
+			result = query("view_schema"); // Metadata written before internal schemas existed.
+		}
+		if (result->HasError()) {
+			throw CatalogException("Cannot resolve delta owner for '%s': %s", source.table_name, result->GetError());
+		}
+		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Checked MV owner in %s with transaction replay=%d\n",
+		                    views_table.c_str(), transaction_state ? 1 : 0);
+		return result->RowCount() != 0;
 	};
-	auto result = query("internal_schema, view_schema");
-	if (result->HasError()) {
-		result = query("view_schema"); // Metadata written before internal schemas existed.
-	}
-	if (result->HasError()) {
-		throw CatalogException("Cannot resolve delta owner for '%s': %s", source.table_name, result->GetError());
-	}
-	return result->RowCount() != 0;
+	return AnyMetadataOwnership(con, openivm::VIEWS_TABLE, transaction_state, matches);
 }
 
 vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
@@ -906,62 +960,24 @@ vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const stri
 bool RefreshMetadata::HasSourceDeltaConsumers(Connection &con, const DeltaSource &source,
                                               optional_ptr<TransactionalMVMetadataState> transaction_state,
                                               const unordered_map<string, string> &excluded_consumers) {
-	auto current = CurrentLocation(con);
-	auto current_table = SqlUtils::FullName(current.catalog_name, current.schema_name, openivm::DELTA_TABLES_TABLE);
-	auto locations = MetadataLocations(con, openivm::DELTA_TABLES_TABLE);
-	auto include_location = [&](const MetadataLocation &candidate) {
-		for (auto &location : locations) {
-			if (StringUtil::CIEquals(location.catalog_name, candidate.catalog_name) &&
-			    StringUtil::CIEquals(location.schema_name, candidate.schema_name)) {
-				return;
-			}
-		}
-		locations.push_back(candidate);
-	};
-	if (transaction_state) {
-		for (auto &location : transaction_state->MetadataLocations()) {
-			include_location({location.first, location.second});
-		}
-	} else if (con.TableInfo(openivm::DELTA_TABLES_TABLE)) {
-		include_location(current);
-	}
-	// Replaying another location drops the helper's prior TEMP shadows. Keep
-	// ownership inspection on its own connection so compiling DROP/REPLACE does
-	// not change the caller's metadata location or its transaction snapshot.
-	unique_ptr<Connection> replay;
-	if (transaction_state) {
-		replay = make_uniq<Connection>(*con.context->db);
-	}
-	for (auto &location : locations) {
+	auto matches = [&](Connection &reader, const MetadataLocation &location, const string &target) {
 		auto table = SqlUtils::FullName(location.catalog_name, location.schema_name, openivm::DELTA_TABLES_TABLE);
-		auto target = table;
-		auto reader = &con;
-		if (replay) {
-			UseLocation(*replay, location);
-			transaction_state->Apply(*replay);
-			reader = replay.get();
-			target = MetadataOwnershipTable(*reader, openivm::DELTA_TABLES_TABLE);
-		} else if (StringUtil::CIEquals(table, current_table)) {
-			target = MetadataOwnershipTable(*reader, openivm::DELTA_TABLES_TABLE);
-		}
 		auto query = "SELECT count(*) FROM " + target + " WHERE " +
 		             SourcePredicate(source.table_name, source.catalog_name, source.schema_name);
 		auto consumers = excluded_consumers.find(table);
 		if (consumers != excluded_consumers.end() && !consumers->second.empty()) {
 			query += " AND view_name NOT IN (" + consumers->second + ")";
 		}
-		auto remaining = reader->Query(query);
+		auto remaining = reader.Query(query);
 		if (remaining->HasError()) {
 			throw CatalogException("OpenIVM could not verify delta-table consumers for '%s': %s", source.table_name,
 			                       remaining->GetError());
 		}
 		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Checked %s with transaction replay=%d\n", table.c_str(),
 		                    transaction_state ? 1 : 0);
-		if (remaining->GetValue(0, 0).GetValue<int64_t>() != 0) {
-			return true;
-		}
-	}
-	return false;
+		return remaining->GetValue(0, 0).GetValue<int64_t>() != 0;
+	};
+	return AnyMetadataOwnership(con, openivm::DELTA_TABLES_TABLE, transaction_state, matches);
 }
 
 string RefreshMetadata::ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
@@ -1217,15 +1233,26 @@ vector<string> RefreshMetadata::GetPipelineRefreshOrder(const vector<string> &ta
 	return order;
 }
 
-bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_published) {
-	string predicate = "table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(view_name)) + "'";
+bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_published,
+                                         optional_ptr<TransactionalMVMetadataState> transaction_state) {
+	auto internal = GetInternalLocation(view_name);
+	auto predicate =
+	    "(" + SourcePredicate(SqlUtils::DeltaName(view_name), internal.catalog_name, internal.schema_name) + ")";
 	if (include_published) {
-		predicate += " OR table_name = '" + SqlUtils::EscapeValue(SqlUtils::DeltaName(PublishedViewName(view_name))) +
-		             "' OR table_name = '" + SqlUtils::EscapeValue(PublishedViewName(view_name)) + "'";
+		for (auto &source : {SqlUtils::DeltaName(PublishedViewName(view_name)), PublishedViewName(view_name)}) {
+			predicate += " OR (" + SourcePredicate(source, internal.catalog_name, internal.schema_name) + ")";
+		}
 	}
-	auto result =
-	    con.Query("SELECT 1 FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " + predicate + " LIMIT 1");
-	return !result->HasError() && result->RowCount() > 0;
+	auto matches = [&](Connection &reader, const MetadataLocation &, const string &target) {
+		auto result = reader.Query("SELECT 1 FROM " + target + " WHERE " + predicate + " LIMIT 1");
+		if (result->HasError()) {
+			throw CatalogException("Cannot resolve downstream consumers for '%s': %s", view_name, result->GetError());
+		}
+		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Downstream consumers for %s in %s: %d\n", view_name.c_str(),
+		                    target.c_str(), result->RowCount() != 0);
+		return result->RowCount() != 0;
+	};
+	return AnyMetadataOwnership(con, openivm::DELTA_TABLES_TABLE, transaction_state, matches);
 }
 
 vector<string> RefreshMetadata::ReadViewList(const string &view_name, const string &column) {
@@ -1331,10 +1358,10 @@ void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_prog
 	          (in_progress ? "true" : "false") + " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
 }
 
-string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
-                                             const string &delta_metadata_table, vector<string> *deferred_cleanup,
-                                             const vector<string> &delta_metadata_tables, const string &source_catalog,
-                                             const string &source_schema) {
+string RefreshMetadata::BuildDeltaConsumersSQL(const string &target, const string &metadata_key,
+                                               const string &delta_metadata_table,
+                                               const vector<string> &delta_metadata_tables,
+                                               const string &source_catalog, const string &source_schema) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
@@ -1351,9 +1378,21 @@ string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string 
 			}
 		}
 	}
+	return consumers;
+}
+
+string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
+                                             const string &delta_metadata_table, vector<string> *deferred_cleanup,
+                                             const vector<string> &delta_metadata_tables, const string &source_catalog,
+                                             const string &source_schema) {
+	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
+	auto consumers = BuildDeltaConsumersSQL(qtarget, metadata_key, delta_metadata_table, delta_metadata_tables,
+	                                        source_catalog, source_schema);
 	auto sql = "DELETE FROM " + qtarget + " WHERE NOT EXISTS (" + consumers + ") OR " + string(openivm::TIMESTAMP_COL) +
 	           " < (SELECT MIN(last_update) FROM (" + consumers + ") consumers);\n";
+	auto parts = SqlUtils::ParseQualifiedIdentifier(qtarget);
 	if (deferred_cleanup && parts.size() == 3) {
+		auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 		auto metadata_parts = SqlUtils::ParseQualifiedIdentifier(metadata_table);
 		if (metadata_parts.size() == 3 && !StringUtil::CIEquals(parts[0], metadata_parts[0])) {
 			// Only housekeeping crosses the native write boundary. MV state and its

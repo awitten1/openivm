@@ -126,6 +126,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 	auto visible = prefix + quote(PublishedViewName(view_name));
 	auto delta_name = SqlUtils::DeltaName(PublishedViewName(view_name));
 	auto delta = prefix + quote(delta_name);
+	auto consumers = RefreshMetadata::BuildDeltaConsumersSQL(delta, delta_name, metadata_table, delta_metadata_tables);
 	auto next = (dialect == SqlDialect::SPARK ? prefix : "") + quote("openivm_publish_next_" + view_name);
 	auto changes = (dialect == SqlDialect::SPARK ? prefix : "") + quote("openivm_publish_changes_" + view_name);
 	vector<string> quoted_columns;
@@ -148,8 +149,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 			auto timestamp = timestamp_sql.empty() ? openivm::UTC_NOW_SQL : timestamp_sql;
 			sql += "INSERT INTO " + delta + " (" + column_list +
 			       ", openivm_multiplicity, openivm_timestamp) SELECT *, 1::INTEGER, " + timestamp + " FROM (" + rows +
-			       ") published_rows WHERE EXISTS (SELECT 1 FROM " + metadata_table + " WHERE table_name = '" +
-			       SqlUtils::EscapeValue(delta_name) + "');\n";
+			       ") published_rows WHERE EXISTS (" + consumers + ");\n";
 			sql += RefreshMetadata::BuildDeltaCleanupSQL(delta, delta_name, metadata_table, nullptr,
 			                                             delta_metadata_tables);
 		}
@@ -207,8 +207,7 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 		                     : " CROSS JOIN UNNEST(range(CAST(abs(c." + weight + ") AS BIGINT))) repetitions";
 		sql += "INSERT INTO " + delta + " (" + column_list + ", openivm_multiplicity, openivm_timestamp) SELECT " +
 		       StringUtil::Join(delta_columns, ", ") + ", CAST(sign(c." + weight + ") AS INTEGER), " + timestamp +
-		       " FROM " + changes + " c" + expansion + " WHERE EXISTS (SELECT 1 FROM " + metadata_table +
-		       " WHERE table_name = '" + SqlUtils::EscapeValue(delta_name) + "');\n";
+		       " FROM " + changes + " c" + expansion + " WHERE EXISTS (" + consumers + ");\n";
 	}
 	// Replace only changed bags. DuckLake keeps its table identity and records the
 	// modifications in snapshots; native consumers read the explicit signed delta.

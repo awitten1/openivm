@@ -626,6 +626,199 @@ static void TestCrossCatalogSharedDelta(bool dedicated_schema, bool commit) {
 	               "AND schema_name IN ('Source.Space','Internal Space') AND starts_with(table_name,'openivm_');");
 }
 
+static void RefreshAndCheckBag(Connection &owner, const string &view, const string &query) {
+	Execute(owner, "PRAGMA refresh(" + Value(view).ToSQLString() + ");");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + query + ") OR EXISTS (" + query +
+	                   " EXCEPT ALL SELECT * FROM " + view +
+	                   ") THEN error('Publication owner survivor bag mismatch') ELSE true END;");
+}
+
+// Removing the last child must not remove either of its parent's delta companions.
+// Native DROP and staged cross-catalog DROP share the replacement cleanup path.
+static void TestPublicationOwnerCleanup(bool cross_catalog, bool replace, bool explicit_transaction, bool commit) {
+	std::cerr << "CASE publication owner cleanup cross_catalog=" << cross_catalog << " replace=" << replace
+	          << " explicit_transaction=" << explicit_transaction << " commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db), helper(db);
+	const string child_catalog = cross_catalog ? "Consumer.Catalog" : "memory";
+	const string parent = "memory.\"Parent.Space\".\"Parent;MV\"";
+	const string child = SqlUtils::FullName(child_catalog, "Child.Space", "Child;MV");
+	const string local_source = SqlUtils::FullName(child_catalog, "Child.Space", "source");
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Parent.Space\"; CREATE TABLE main.source(i INTEGER); "
+	               "INSERT INTO main.source VALUES (1),(1),(2); CREATE MATERIALIZED VIEW " +
+	                   parent + " AS SELECT * FROM memory.main.source;");
+	if (cross_catalog) {
+		Execute(owner, "ATTACH ':memory:' AS \"Consumer.Catalog\";");
+	}
+	Execute(owner, "CREATE SCHEMA " + SqlUtils::QuoteIdentifier(child_catalog) + ".\"Child.Space\"; CREATE TABLE " +
+	                   local_source + "(i INTEGER); INSERT INTO " + local_source +
+	                   " VALUES (7),(7),(8); CREATE MATERIALIZED VIEW " + child + " AS SELECT * FROM " + parent + ";");
+	RefreshMetadata::UseCatalog(*owner.context, helper, "memory");
+	auto key = RefreshMetadata(helper).FindViewKey("memory", "Parent.Space", "Parent;MV");
+	if (key.empty()) {
+		throw InvalidInputException("Publication owner fixture is missing parent metadata");
+	}
+	auto companions = "FROM duckdb_tables() WHERE database_name='memory' AND schema_name='Internal Space' "
+	                  "AND table_name IN (" +
+	                  Value(SqlUtils::DeltaName(key)).ToSQLString() + "," +
+	                  Value(SqlUtils::DeltaName(PublishedViewName(key))).ToSQLString() + ")";
+	auto check_companions = [&]() {
+		Execute(owner, "SELECT CASE WHEN count(*)=2 THEN true ELSE error('Child cleanup removed parent delta') END " +
+		                   companions + ";");
+	};
+	check_companions();
+	// Use a search path that cannot resolve the parent's user-facing schema.
+	Execute(owner, "USE " + SqlUtils::QuoteIdentifier(child_catalog) + ".\"Control.Space\";");
+	if (explicit_transaction) {
+		Execute(owner, "BEGIN;");
+	}
+	Execute(owner, replace ? "CREATE OR REPLACE MATERIALIZED VIEW " + child + " AS SELECT * FROM " + local_source + ";"
+	                       : "SELECT 'before;drop'; /* quoted child; */ DROP VIEW " + child + "; SELECT 1;");
+	if (explicit_transaction) {
+		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	}
+	check_companions();
+	for (const auto &source : vector<string> {"memory.main.source", local_source}) {
+		Execute(owner, "INSERT INTO " + source + " VALUES (1),(2),(3),(3); DELETE FROM " + source +
+		                   " WHERE i=1; UPDATE " + source + " SET i=4 WHERE i=2; INSERT INTO " + source +
+		                   " VALUES (1),(4),(5); DELETE FROM " + source + " WHERE i=5;");
+	}
+	RefreshAndCheckBag(owner, parent, "SELECT * FROM memory.main.source");
+	if (replace || !commit) {
+		RefreshAndCheckBag(owner, child, "SELECT * FROM " + (replace && commit ? local_source : parent));
+		Execute(owner, "DROP VIEW " + child + ";");
+		check_companions();
+		Execute(owner, "INSERT INTO memory.main.source VALUES (4),(4),(6); DELETE FROM memory.main.source WHERE i=4; "
+		               "UPDATE memory.main.source SET i=7 WHERE i=6;");
+		RefreshAndCheckBag(owner, parent, "SELECT * FROM memory.main.source");
+	}
+	Execute(owner, "DROP VIEW " + parent + ";");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Parent DROP retained its companions') END " +
+	                   companions + ";");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Publication owner cleanup leaked state') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
+static void TestCrossCatalogPublicationConsumers(bool commit) {
+	std::cerr << "CASE cross-catalog publication consumers replacement_commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	const string source = "memory.\"Source.Space\".items";
+	const string replacement = "memory.\"Other.Source\".items";
+	const string parent = "memory.\"Parent.Space\".\"Parent;MV\"";
+	const string fast = "\"Consumer.Catalog\".\"Child.Space\".\"Fast;MV\"";
+	const string slow = "\"Consumer.Catalog\".\"Other.Child\".\"Slow;MV\"";
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Source.Space\"; CREATE SCHEMA \"Other.Source\"; "
+	               "CREATE SCHEMA \"Parent.Space\"; CREATE TABLE " +
+	                   source + "(i INTEGER); CREATE TABLE " + replacement + "(i INTEGER); INSERT INTO " + source +
+	                   " VALUES (1),(1),(2); INSERT INTO " + replacement +
+	                   " VALUES (20),(20),(30); CREATE MATERIALIZED VIEW " + parent + " AS SELECT * FROM " + source +
+	                   "; ATTACH ':memory:' AS \"Consumer.Catalog\"; "
+	                   "CREATE SCHEMA \"Consumer.Catalog\".\"Child.Space\"; "
+	                   "CREATE SCHEMA \"Consumer.Catalog\".\"Other.Child\"; CREATE MATERIALIZED VIEW " +
+	                   fast + " AS SELECT * FROM " + parent + "; CREATE MATERIALIZED VIEW " + slow +
+	                   " AS SELECT * FROM " + parent + "; USE \"Consumer.Catalog\".\"Control.Space\";");
+	// No consumer is registered in the parent's catalog. Cover both publication
+	// programs, keeping one child behind so cleanup must retain its earlier rows.
+	Execute(owner, "INSERT INTO " + source + " VALUES (9),(9);");
+	RefreshAndCheckBag(owner, parent, "SELECT * FROM " + source);
+	RefreshAndCheckBag(owner, fast, "SELECT * FROM " + parent);
+	Execute(owner, "INSERT INTO " + source + " VALUES (1),(2),(3),(3); DELETE FROM " + source +
+	                   " WHERE i=1 OR i=9; UPDATE " + source + " SET i=4 WHERE i=2; INSERT INTO " + source +
+	                   " VALUES (1),(4),(5); DELETE FROM " + source + " WHERE i=5;");
+	RefreshAndCheckBag(owner, parent, "SELECT * FROM " + source);
+	RefreshAndCheckBag(owner, fast, "SELECT * FROM " + parent);
+	RefreshAndCheckBag(owner, slow, "SELECT * FROM " + parent);
+	// Replacement must retain the parent's publication and emit its signed diff
+	// for consumers in another metadata catalog. Rollback must retain the old source.
+	Execute(owner, "BEGIN; CREATE OR REPLACE MATERIALIZED VIEW " + parent + " AS SELECT * FROM " + replacement + ";");
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	const auto &active_source = commit ? replacement : source;
+	RefreshAndCheckBag(owner, fast, "SELECT * FROM " + active_source);
+	RefreshAndCheckBag(owner, slow, "SELECT * FROM " + active_source);
+	Execute(owner, "INSERT INTO " + active_source + " VALUES (1),(2),(3),(3); DELETE FROM " + active_source +
+	                   " WHERE i=1; UPDATE " + active_source + " SET i=4 WHERE i=2; INSERT INTO " + active_source +
+	                   " VALUES (1),(4),(5); DELETE FROM " + active_source + " WHERE i=5;");
+	RefreshAndCheckBag(owner, parent, "SELECT * FROM " + active_source);
+	RefreshAndCheckBag(owner, fast, "SELECT * FROM " + parent);
+	RefreshAndCheckBag(owner, slow, "SELECT * FROM " + parent);
+	Execute(owner, "DROP VIEW " + fast + "; DROP VIEW " + slow + "; DROP VIEW " + parent + ";");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Cross-catalog publication cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
+static void TestPublicationOwnerReplay(bool commit) {
+	std::cerr << "CASE publication owner replay commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db), helper(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Parent.Space\"; CREATE TABLE main.source(i INTEGER); "
+	               "INSERT INTO main.source VALUES (1),(1),(2); ATTACH ':memory:' AS \"Consumer.Catalog\"; "
+	               "CREATE TABLE \"Consumer.Catalog\".main.source(i INTEGER); "
+	               "CREATE MATERIALIZED VIEW \"Consumer.Catalog\".main.sentinel "
+	               "AS SELECT * FROM \"Consumer.Catalog\".main.source;");
+	RefreshMetadata::UseCatalog(*owner.context, helper, "Consumer.Catalog");
+	Execute(owner, "BEGIN; CREATE MATERIALIZED VIEW \"Parent.Space\".\"Parent;MV\" AS SELECT * FROM main.source;");
+	auto keys =
+	    owner.Query("SELECT view_name FROM memory.\"Control.Space\".openivm_views WHERE view_sql_name='Parent;MV'");
+	if (keys->HasError() || keys->RowCount() != 1) {
+		throw InvalidInputException("Publication replay fixture is missing transaction-local parent metadata");
+	}
+	RefreshMetadata::DeltaSource source;
+	source.table_name = SqlUtils::DeltaName(PublishedViewName(keys->GetValue(0, 0).ToString()));
+	source.catalog_name = "memory";
+	source.schema_name = "Internal Space";
+	auto &state = TransactionalMVMetadataState::Get(*owner.context);
+	if (RefreshMetadata(helper).IsMaterializedViewDelta(source) ||
+	    !RefreshMetadata(helper).IsMaterializedViewDelta(source, &state)) {
+		throw InvalidInputException("Publication owner lookup missed the transaction's new metadata location");
+	}
+	// Qualified source keys and a different selected registry must keep the same owner.
+	source.table_name = SqlUtils::FullName(source.catalog_name, source.schema_name, source.table_name);
+	if (!RefreshMetadata(helper).IsMaterializedViewDelta(source, &state)) {
+		throw InvalidInputException("Publication owner replay lost qualified source identity");
+	}
+	Execute(owner, "CREATE MATERIALIZED VIEW main.\"Child;MV\" AS SELECT * FROM \"Parent.Space\".\"Parent;MV\"; "
+	               "DROP VIEW main.\"Child;MV\";");
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	if (RefreshMetadata(helper).IsMaterializedViewDelta(source) != commit) {
+		throw InvalidInputException("Publication owner lookup retained rolled-back or lost committed ownership");
+	}
+	if (!commit) {
+		Execute(owner, "CREATE MATERIALIZED VIEW \"Parent.Space\".\"Parent;MV\" AS SELECT * FROM main.source;");
+	}
+	Execute(owner, "INSERT INTO main.source VALUES (1),(2),(3),(3); DELETE FROM main.source WHERE i=1; "
+	               "UPDATE main.source SET i=4 WHERE i=2;");
+	RefreshAndCheckBag(owner, "memory.\"Parent.Space\".\"Parent;MV\"", "SELECT * FROM memory.main.source");
+	Execute(owner, "BEGIN; DROP VIEW \"Parent.Space\".\"Parent;MV\";");
+	if (!RefreshMetadata(helper).IsMaterializedViewDelta(source) ||
+	    RefreshMetadata(helper).IsMaterializedViewDelta(source, &state)) {
+		throw InvalidInputException("Publication owner replay retained a transaction-local DROP");
+	}
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	if (!commit) {
+		Execute(owner, "INSERT INTO main.source VALUES (4),(4),(6); DELETE FROM main.source WHERE i=4; "
+		               "UPDATE main.source SET i=7 WHERE i=6;");
+		RefreshAndCheckBag(owner, "memory.\"Parent.Space\".\"Parent;MV\"", "SELECT * FROM memory.main.source");
+		Execute(owner, "DROP VIEW \"Parent.Space\".\"Parent;MV\";");
+	}
+	if (RefreshMetadata(helper).IsMaterializedViewDelta(source)) {
+		throw InvalidInputException("Publication owner lookup retained a dropped parent");
+	}
+	Execute(helper, "SELECT CASE WHEN current_database()='Consumer.Catalog' AND current_schema()='Control.Space' "
+	                "THEN true ELSE error('Publication owner replay changed the selected metadata location') END;");
+	Execute(owner, "INSERT INTO \"Consumer.Catalog\".main.source VALUES (1),(2),(3),(3); "
+	               "DELETE FROM \"Consumer.Catalog\".main.source WHERE i=1; "
+	               "UPDATE \"Consumer.Catalog\".main.source SET i=4 WHERE i=2;");
+	RefreshAndCheckBag(owner, "\"Consumer.Catalog\".main.sentinel", "SELECT * FROM \"Consumer.Catalog\".main.source");
+	Execute(owner, "DROP VIEW \"Consumer.Catalog\".main.sentinel;");
+}
+
 static void CheckSourceWatermarkReplay(Connection &owner, DatabaseInstance &db) {
 	Connection helper(db);
 	RefreshMetadata::UseCatalog(*owner.context, helper, "memory");
@@ -1090,6 +1283,17 @@ int main(int argc, char **argv) {
 			TestCrossCatalogSharedDelta(dedicated_schema, false);
 			TestCrossCatalogSharedDelta(dedicated_schema, true);
 		}
+		for (bool cross_catalog : {false, true}) {
+			TestPublicationOwnerCleanup(cross_catalog, false, false, true);
+			TestPublicationOwnerCleanup(cross_catalog, true, true, false);
+			TestPublicationOwnerCleanup(cross_catalog, true, true, true);
+		}
+		TestPublicationOwnerCleanup(false, false, true, false);
+		TestPublicationOwnerCleanup(false, false, true, true);
+		TestCrossCatalogPublicationConsumers(false);
+		TestCrossCatalogPublicationConsumers(true);
+		TestPublicationOwnerReplay(false);
+		TestPublicationOwnerReplay(true);
 		TestDeltaOwnershipSearchPath(false);
 		TestDeltaOwnershipSearchPath(true);
 		for (const auto &mutation : vector<string> {"create", "drop", "replace", "recreate"}) {

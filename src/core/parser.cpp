@@ -1104,8 +1104,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		RefreshMetadata::UseCatalog(context, dependency_con, view_target_catalog);
 		RefreshMetadata dependency_metadata(dependency_con);
 		dependency_metadata.SnapshotTransaction(context);
-		has_downstream_views = dependency_metadata.HasDownstreamViews(view_name);
-		preserve_consumer_deltas = !target_is_ducklake && dependency_metadata.HasDownstreamViews(view_name, false);
+		auto transaction_state = TransactionalMVMetadataState::TryGet(context);
+		has_downstream_views = dependency_metadata.HasDownstreamViews(view_name, true, transaction_state);
+		preserve_consumer_deltas =
+		    !target_is_ducklake && dependency_metadata.HasDownstreamViews(view_name, false, transaction_state);
 	}
 	vector<string> replacement_delta_projection;
 	string preserved_delta = SqlUtils::QuoteIdentifier("openivm_replace_delta_" + view_name);
@@ -2039,7 +2041,8 @@ static void AppendUnusedSourceDropProgram(ClientContext &context, Connection &co
                                           const unordered_map<string, string> &excluded_consumers) {
 	unordered_set<string> checked_sources;
 	for (auto &source : sources) {
-		if (source.catalog_type == "ducklake" || RefreshMetadata(con).IsMaterializedViewDelta(source)) {
+		if (source.catalog_type == "ducklake" ||
+		    RefreshMetadata(con).IsMaterializedViewDelta(source, TransactionalMVMetadataState::TryGet(context))) {
 			continue;
 		}
 		auto identity = source.catalog_name + "\n" + source.schema_name + "\n" + source.table_name;

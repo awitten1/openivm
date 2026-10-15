@@ -146,7 +146,9 @@ public:
 	string GetInternalSchema(const string &view_name);
 	StoredViewLocation GetInternalLocation(const string &view_name, const string &fallback_catalog = "",
 	                                       const string &fallback_schema = "");
-	bool IsMaterializedViewDelta(const DeltaSource &source);
+	// MV companions remain owned without consumers, across metadata locations and replay.
+	bool IsMaterializedViewDelta(const DeltaSource &source,
+	                             optional_ptr<TransactionalMVMetadataState> transaction_state = nullptr);
 	vector<DeltaSource> GetDeltaSources(const string &view_name, const string &fallback_catalog = "",
 	                                    const string &fallback_schema = "");
 	string ResolveDeltaQualifiedName(const string &view_name, const string &delta_table_name,
@@ -172,7 +174,8 @@ public:
 	// For table→mv1→mv2→mv3, GetDownstreamViews("mv1") returns ["mv2", "mv3"].
 	vector<string> GetDownstreamViews(const string &view_name);
 	vector<string> GetDownstreamViewsStrict(const string &view_name);
-	bool HasDownstreamViews(const string &view_name, bool include_published = true);
+	bool HasDownstreamViews(const string &view_name, bool include_published = true,
+	                        optional_ptr<TransactionalMVMetadataState> transaction_state = nullptr);
 
 	// Select a multi-target pipeline and topologically order its induced dependency graph.
 	vector<string> GetPipelineRefreshOrder(const vector<string> &targets, const string &cascade_mode);
@@ -194,6 +197,13 @@ public:
 
 	// Set/clear the refresh_in_progress flag for crash safety.
 	void SetRefreshInProgress(const string &view_name, bool in_progress);
+
+	// Watermarks of every consumer of this physical delta, across metadata locations.
+	// Publication and cleanup must use the same qualified source identity and inventory.
+	static string BuildDeltaConsumersSQL(const string &target, const string &metadata_key,
+	                                     const string &delta_metadata_table = "",
+	                                     const vector<string> &delta_metadata_tables = {},
+	                                     const string &source_catalog = "", const string &source_schema = "");
 
 	// Build SQL to delete old delta rows that all dependent views have already consumed.
 	// Execute after advancing the refreshing consumer's watermark, or defer until commit

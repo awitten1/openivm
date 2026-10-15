@@ -164,7 +164,14 @@ nothing has to be moved by hand:
   metadata catalog consumes them. Native cleanup in the caller's catalog rolls
   back with replacement. Cleanup in another native catalog runs after commit,
   re-checks committed ownership, and is discarded on rollback.
-- Deltas of OpenIVM's own tables (a parent MV's publication) stay beside them.
+- Deltas of OpenIVM's own tables (a parent MV's publication) stay beside them and
+  belong to that MV until it is dropped, even after its last child is dropped or
+  replaced. Cleanup checks owners and consumers across all metadata locations,
+  including transaction-local metadata replay.
+- Publication emits signed deltas for consumers in every metadata catalog, using
+  the same qualified source identity and consumer watermarks as cleanup. A slower
+  consumer keeps its pending deltas when another consumer refreshes. Replacement
+  also discovers consumers across catalogs before preserving publication state.
 
 An MV in an external catalog other than DuckLake keeps its internal objects in the
 `main` schema of the native frontend database, never in the metadata schema.

@@ -118,7 +118,8 @@ void TransactionalMVLockState::TransactionCommit(MetaTransaction &transaction, C
 			// A later CREATE in the same transaction may have reused a delta that
 			// replacement scheduled for cleanup. Check committed ownership again.
 			for (auto &source : source_cleanup) {
-				if (!RefreshMetadata::HasSourceDeltaConsumers(con, source)) {
+				if (!RefreshMetadata(con).IsMaterializedViewDelta(source) &&
+				    !RefreshMetadata::HasSourceDeltaConsumers(con, source)) {
 					cleanup.push_back("DROP TABLE IF EXISTS " + SqlUtils::FullName(source.catalog_name,
 					                                                               source.delta_schema_name,
 					                                                               source.delta_table_name));

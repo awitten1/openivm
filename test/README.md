@@ -97,6 +97,18 @@ all maintenance tables. A cross-catalog source consumer and an exclusion list co
 also verify that direct CASCADE exclusions and staged final DROP retain the
 consumer's catalog/schema identity.
 
+Publication-owner cases remove a native parent's last child in the same or another
+catalog, using separate quoted control/internal schemas and a non-default search
+path. DROP and replacement commit/rollback must retain both parent delta
+companions; conflicting batched DML must still refresh each surviving MV to
+bidirectional bag equality. A helper selected in another catalog also checks
+uncommitted parent creation and deletion through metadata replay, including a new
+metadata location, qualified source keys, commit, rollback and final-owner cleanup.
+Cross-catalog publication cases keep every child outside the parent's metadata
+catalog, exercise append-only and conflicting batched DML, and let one child lag
+across refreshes. Parent replacement commit/rollback and subsequent DML must
+preserve both children's bag equality and final cleanup.
+
 Before that matrix starts, quoted mixed-case catalog placement is checked in
 both native metadata registries. CREATE normalization must preserve quoted
 identifiers (including escaped quotes and embedded apostrophes); selecting the
