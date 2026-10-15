@@ -328,12 +328,14 @@ public:
 		AddStep("create_mv_total", total_start);
 	}
 
-	void Flush(DatabaseInstance &db) {
+	void Flush() {
 		if (!enabled || flushed || view_name.empty() || profile_table.empty() || steps.empty()) {
 			return;
 		}
 		flushed = true;
-		Connection profile_con(db);
+		Connection profile_con(*context.db);
+		TransactionalMVLockState::Get(*profile_con.context)
+		    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 		// The CREATE planner resolved the metadata owner before staged execution.
 		// The caller's active catalog may instead be an unrelated attached database.
 		OPENIVM_DEBUG_PRINT("[PROFILE] Recording CREATE MV profile in %s\n", profile_table.c_str());
@@ -506,7 +508,8 @@ DeltaSchemaDDL BuildCreateDeltaFromDataSQL(Connection &conn, const string &delta
 class StagedSourceDeltaCleanup {
 public:
 	explicit StagedSourceDeltaCleanup(ClientContext &context)
-	    : owner(TransactionalMVLockState::Get(context)), allocations(owner.TakeSourceDeltaAllocations()) {
+	    : owner(TransactionalMVLockState::Get(context)), allocations(owner.TakeSourceDeltaAllocations()),
+	      publication_locks(owner.TakeSourcePublicationLocks()) {
 	}
 	~StagedSourceDeltaCleanup() {
 		owner.CleanupSourceDeltaAllocations(allocations);
@@ -515,6 +518,9 @@ public:
 private:
 	TransactionalMVLockState &owner;
 	vector<RefreshMetadata::DeltaSource> allocations;
+	// Staged execution suspends the planning transaction. Keep source exclusion
+	// until its helper publishes ownership or reclaims the unowned allocations.
+	vector<unique_ptr<SourceAdmissionGuard>> publication_locks;
 };
 
 void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
@@ -562,7 +568,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	auto fail_ddl = [&](const string &message) {
 		run_cleanup();
 		profiler.AddTotal();
-		profiler.Flush(db);
+		profiler.Flush();
 		restore_outer_transaction();
 		throw CatalogException("Failed to execute IVM DDL: " + message);
 	};
@@ -701,7 +707,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	}
 	flush_pending();
 	profiler.AddTotal();
-	profiler.Flush(db);
+	profiler.Flush();
 	restore_outer_transaction();
 }
 

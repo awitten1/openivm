@@ -252,6 +252,8 @@ string RefreshMetadata::ResolveMetadataSchema(Connection &con, const string &cat
 }
 
 void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
+	TransactionalMVLockState::Get(*con.context)
+	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	auto catalog = ResolveMetadataCatalog(context, con, view_catalog);
 	auto preferred = PreferredMetadataSchema(context, catalog);
 	auto transaction_schemas = TransactionMetadataSchemas(context, catalog);
@@ -261,6 +263,8 @@ void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const 
 }
 
 void RefreshMetadata::UseSameLocation(ClientContext &context, Connection &con) {
+	TransactionalMVLockState::Get(*con.context)
+	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	auto state = TryGetLocationState(context);
 	if (!state || state->catalog_name.empty()) {
 		UseCatalog(context, con);
@@ -837,12 +841,13 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDelta(ClientContext &
 	return delta;
 }
 
-optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForCreate(ClientContext &context, const string &catalog,
-                                                                          const string &schema, const string &table) {
+optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForMutation(ClientContext &context,
+                                                                            const string &catalog, const string &schema,
+                                                                            const string &table) {
 	auto local = FindSourceDelta(context, catalog, schema, table);
-	// The mutation gate serializes publication, but does not advance an explicit
+	// Admission protects publication, but does not advance an explicit
 	// transaction's snapshot. Reconcile a fresh committed read with its own writes
-	// before treating an occupied physical name as an unrelated naming collision.
+	// before allocating a delta or deciding whether native DML needs capture.
 	Connection committed(*context.db);
 	optional_ptr<TableCatalogEntry> delta = local;
 	committed.context->RunFunctionInTransaction([&]() {
@@ -864,7 +869,7 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForCreate(Client
 		// successful DROP explains the difference, never for a stale snapshot.
 		if (TransactionalMVLockState::Get(context).HasDroppedSourceDelta(catalog, existing->schema.name,
 		                                                                 existing->name)) {
-			OPENIVM_DEBUG_PRINT("[CREATE MV] Ignoring locally removed committed source delta %s\n",
+			OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Ignoring locally removed committed source delta %s\n",
 			                    SqlUtils::FullName(catalog, existing->schema.name, existing->name).c_str());
 			return;
 		}
@@ -883,7 +888,7 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForCreate(Client
 			throw TransactionException("OpenIVM source delta for '%s' is not visible; retry the transaction",
 			                           SqlUtils::FullName(catalog, schema, table));
 		}
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Reconciled committed source delta %s\n",
+		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Reconciled committed source delta %s\n",
 		                    SqlUtils::FullName(catalog, delta->schema.name, delta->name).c_str());
 	});
 	return delta;

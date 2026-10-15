@@ -23,21 +23,28 @@
 namespace duckdb {
 
 // Observe the actual gate wait, rather than assuming a launched worker reached
-// DROP's ownership lookup. The deadline only bounds a broken test's wait.
+// an ownership lookup. The deadline only bounds a broken test's wait.
 class MutationGateTestAccess {
 public:
-	static void WaitForBlockedOwner(MutationGate &gate) {
+	static void WaitForBlockedOwner(MutationGate &gate, const string &source = "", bool publication = false) {
 		auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
 		while (std::chrono::steady_clock::now() < deadline) {
 			{
 				std::lock_guard<mutex> guard(gate.lock);
-				if (gate.waiting_owners != 0) {
+				if (source.empty() && gate.waiting_owners != 0) {
 					return;
+				}
+				for (auto &catalog : gate.sources) {
+					auto entry = catalog.second.find(StringUtil::Lower(source));
+					if (entry != catalog.second.end() &&
+					    (publication ? entry->second->waiting_publishers : entry->second->waiting_readers)) {
+						return;
+					}
 				}
 			}
 			std::this_thread::yield();
 		}
-		throw InvalidInputException("Competing DROP did not wait on the mutation gate");
+		throw InvalidInputException("Competing mutation did not wait on its admission gate: %s", source);
 	}
 };
 
@@ -54,6 +61,13 @@ static void Execute(Connection &con, const string &sql) {
 		throw InvalidInputException("Lifecycle SQL failed: %s\nSQL: %s", result->GetError(), sql);
 	}
 	std::cerr << "DONE " << SqlUtils::SQLStatementPreview(sql) << std::endl;
+}
+
+static void RefreshAndCheckBag(Connection &owner, const string &view, const string &query) {
+	Execute(owner, "PRAGMA refresh(" + Value(view).ToSQLString() + ");");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + query + ") OR EXISTS (" + query +
+	                   " EXCEPT ALL SELECT * FROM " + view +
+	                   ") THEN error('Publication owner survivor bag mismatch') ELSE true END;");
 }
 
 static void TestQuotedNamespaceNormalization() {
@@ -320,6 +334,463 @@ static void TestPublication(bool explicit_transaction) {
 	}
 }
 
+// A writer must not decide that a source is untracked between its physical
+// delta allocation and its first committed ownership row. Pin the writer's
+// metadata snapshot in that interval, then wait for its actual admission wait.
+static void TestDMLDuringPublication(bool dedicated_schema, const string &first_operation, bool explicit_transaction,
+                                     bool commit, bool publish = true) {
+	std::cerr << "CASE DML during publication dedicated_schema=" << dedicated_schema
+	          << " first_operation=" << first_operation << " explicit_transaction=" << explicit_transaction
+	          << " commit=" << commit << " publish=" << publish << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), writer(db), observer(db);
+	const string source = "\"Source.Space\".\"Items;Table\"";
+	const string view = "\"Source.Space\".\"MV;View\"";
+	const string internal_schema = dedicated_schema ? "Internal Space" : "Source.Space";
+	const string delta_name = RefreshMetadata::SourceDeltaTableName("Source.Space", "Items;Table", internal_schema);
+	const string delta = SqlUtils::FullName("memory", internal_schema, delta_name);
+	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_profile_refresh=true; "
+	                 "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema=" +
+	                     Value(dedicated_schema ? "Internal Space" : "").ToSQLString() +
+	                     "; CREATE SCHEMA \"Source.Space\"; CREATE TABLE " + source + "(i INTEGER); INSERT INTO " +
+	                     source + " VALUES (1),(1),(2),(3);");
+	creator.context->transaction.BeginTransaction();
+	auto parsed = ParseMaterializedViewStatement(
+	    "CREATE MATERIALIZED VIEW " + view + " AS SELECT * FROM " + source + ";", SqlDialect::DUCKDB);
+	auto planned =
+	    MaterializedViewParserExtension::PlanFunction(nullptr, *creator.context, std::move(parsed.parse_data));
+	Execute(observer, "SELECT CASE WHEN (SELECT count(*) FROM duckdb_tables() WHERE schema_name=" +
+	                      Value(internal_schema).ToSQLString() + " AND table_name=" + Value(delta_name).ToSQLString() +
+	                      ")=1 AND NOT EXISTS (SELECT 1 FROM \"Control.Space\".openivm_delta_tables) "
+	                      "THEN true ELSE error('DML fixture missed the allocation/publication interval') END;");
+	Execute(writer, "USE memory.\"Control.Space\";");
+	if (explicit_transaction) {
+		Execute(writer, "BEGIN; SELECT * FROM openivm_delta_tables;");
+	}
+	const string insert = "INSERT INTO " + source + " VALUES (1),(2),(3),(3),(5); ";
+	const string remove = "DELETE FROM " + source + " WHERE i=1 OR i=5; ";
+	const string update = "UPDATE " + source + " SET i=4 WHERE i=2; ";
+	const string batch = (first_operation == "insert"   ? insert + remove + update
+	                      : first_operation == "delete" ? remove + insert + update
+	                                                    : update + insert + remove) +
+	                     "INSERT INTO " + source + " VALUES (4),(6),(6); DELETE FROM " + source + " WHERE i=6;";
+	auto gate = RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(*creator.context));
+	auto competing = std::async(std::launch::async, [&]() { Execute(writer, batch); });
+	try {
+		MutationGateTestAccess::WaitForBlockedOwner(*gate, SqlUtils::FullName("memory", "Source.Space", "Items;Table"));
+		if (publish) {
+			ExecuteStagedDDL(*creator.context, planned.parameters);
+			creator.context->transaction.Commit();
+		} else {
+			creator.context->transaction.Rollback(nullptr);
+		}
+	} catch (const std::exception &) {
+		if (creator.context->transaction.HasActiveTransaction()) {
+			creator.context->transaction.Rollback(nullptr);
+		}
+		competing.wait();
+		if (writer.context->transaction.HasActiveTransaction()) {
+			writer.context->transaction.Rollback(nullptr);
+		}
+		throw;
+	}
+	competing.get();
+	if (explicit_transaction) {
+		if (publish) {
+			Execute(writer, "SELECT CASE WHEN count(*) FILTER (WHERE openivm_multiplicity=1)>0 "
+			                "AND count(*) FILTER (WHERE openivm_multiplicity=-1)>0 "
+			                "THEN true ELSE error('Admitted DML missed signed capture') END FROM " +
+			                    delta + ";");
+		}
+		Execute(writer, commit ? "COMMIT;" : "ROLLBACK;");
+	}
+	if (!publish) {
+		// Failed publication must release admission and reclaim the unowned
+		// allocation. The next CREATE loads the writer's committed source rows.
+		Execute(creator, "CREATE MATERIALIZED VIEW " + view + " AS SELECT * FROM " + source + ";");
+	} else if (!explicit_transaction || commit) {
+		Execute(observer, "SELECT CASE WHEN count(*) FILTER (WHERE openivm_multiplicity=1)>0 "
+		                  "AND count(*) FILTER (WHERE openivm_multiplicity=-1)>0 "
+		                  "THEN true ELSE error('Committed DML missed signed capture') END FROM " +
+		                      delta + ";");
+	} else {
+		Execute(observer, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Rolled-back capture survived') END FROM " +
+		                      delta + ";");
+	}
+	RefreshAndCheckBag(observer, view, "SELECT * FROM " + source);
+	Execute(observer, "DROP VIEW " + view + ";");
+	Execute(observer, "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM duckdb_tables() WHERE schema_name=" +
+	                      Value(internal_schema).ToSQLString() + " AND table_name=" + Value(delta_name).ToSQLString() +
+	                      ") THEN true ELSE error('Admitted DML retained the final source delta') END;");
+}
+
+static void TestDMLBeforePublication(bool dedicated_schema, bool commit) {
+	std::cerr << "CASE DML before publication dedicated_schema=" << dedicated_schema << " commit=" << commit
+	          << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), writer(db), observer(db);
+	const string delta_schema = dedicated_schema ? "Internal Space" : "main";
+	const string unowned_name = RefreshMetadata::SourceDeltaTableName("main", "source", delta_schema);
+	const string unowned = SqlUtils::FullName("memory", delta_schema, unowned_name);
+	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; "
+	                 "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema=" +
+	                     Value(dedicated_schema ? "Internal Space" : "").ToSQLString() +
+	                     "; CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1),(1),(2); "
+	                     "CREATE SCHEMA IF NOT EXISTS " +
+	                     SqlUtils::QuoteIdentifier(delta_schema) + "; CREATE TABLE " + unowned +
+	                     "(i INTEGER, openivm_multiplicity INTEGER, openivm_timestamp TIMESTAMP); "
+	                     "INSERT INTO " +
+	                     unowned + " VALUES (99,1,TIMESTAMP '2000-01-01');");
+	Execute(writer, "BEGIN; INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
+	                "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (5),(5); "
+	                "DELETE FROM source WHERE i=5;");
+	auto gate = RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(*creator.context));
+	auto competing = std::async(std::launch::async,
+	                            [&]() { Execute(creator, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;"); });
+	try {
+		MutationGateTestAccess::WaitForBlockedOwner(*gate, SqlUtils::FullName("memory", "main", "source"), true);
+		Execute(writer, commit ? "COMMIT;" : "ROLLBACK;");
+	} catch (const std::exception &) {
+		if (writer.context->transaction.HasActiveTransaction()) {
+			writer.context->transaction.Rollback(nullptr);
+		}
+		competing.wait();
+		throw;
+	}
+	competing.get();
+	Execute(observer, "SELECT CASE WHEN count(*)=1 AND min(i)=99 AND min(openivm_multiplicity)=1 "
+	                  "AND min(openivm_timestamp)=TIMESTAMP '2000-01-01' "
+	                  "THEN true ELSE error('Unowned namesake adopted as a source delta') END FROM " +
+	                      unowned + ";");
+	Execute(observer, "SELECT CASE WHEN count(*)=1 AND min(delta_table_name)<>" + Value(unowned_name).ToSQLString() +
+	                      " THEN true ELSE error('First CREATE did not allocate an owned source delta') END "
+	                      "FROM \"Control.Space\".openivm_delta_tables;");
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, "INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
+	                  "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (5),(5); "
+	                  "DELETE FROM source WHERE i=5;");
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, "DROP VIEW mv;");
+	Execute(observer, "SELECT CASE WHEN count(*)=1 AND min(table_name)=" + Value(unowned_name).ToSQLString() +
+	                      " THEN true ELSE error('Final cleanup removed the unowned table or leaked a delta') END "
+	                      "FROM duckdb_tables() WHERE schema_name=" +
+	                      Value(delta_schema).ToSQLString() + " AND starts_with(table_name,'openivm_delta_');");
+}
+
+static void TestDMLWithInvisibleDelta(bool dedicated_schema) {
+	std::cerr << "CASE DML with invisible delta dedicated_schema=" << dedicated_schema << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), writer(db), observer(db);
+	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; "
+	                 "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema=" +
+	                     Value(dedicated_schema ? "Internal Space" : "").ToSQLString() +
+	                     "; CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1),(1),(2);");
+	Execute(writer, "BEGIN; SELECT * FROM source;");
+	Execute(creator, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	auto failed = writer.Query("INSERT INTO source VALUES (77);");
+	if (!failed->HasError() || failed->GetError().find("retry the transaction") == string::npos) {
+		throw InvalidInputException("DML with an invisible committed delta must request a transaction retry");
+	}
+	Execute(writer, "ROLLBACK;");
+	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM (VALUES (1),(1),(2))) "
+	                  "OR EXISTS (SELECT * FROM (VALUES (1),(1),(2)) EXCEPT ALL SELECT * FROM source) "
+	                  "THEN error('Rejected DML changed its source') ELSE true END;");
+	Execute(writer, "BEGIN; INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
+	                "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (5),(5); "
+	                "DELETE FROM source WHERE i=5; COMMIT;");
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, "DROP VIEW mv;");
+}
+
+static string ConflictingSourceDML(const string &source) {
+	return "INSERT INTO " + source + " VALUES (1),(2),(3),(3); DELETE FROM " + source + " WHERE i=1; UPDATE " + source +
+	       " SET i=4 WHERE i=2; INSERT INTO " + source + " VALUES (5),(5); DELETE FROM " + source + " WHERE i=5;";
+}
+
+static void TestFirstCreateWithOldSourceSnapshot(bool dedicated_schema, bool commit, bool pending_writer = false) {
+	std::cerr << "CASE first CREATE with old source snapshot dedicated_schema=" << dedicated_schema
+	          << " commit=" << commit << " pending_writer=" << pending_writer << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), writer(db), observer(db);
+	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_metadata_schema='Control.Space'; "
+	                 "SET openivm_internal_schema=" +
+	                     Value(dedicated_schema ? "Internal Space" : "").ToSQLString() +
+	                     "; CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1),(1),(2);");
+	Execute(creator, "BEGIN; SELECT * FROM source;");
+	Execute(writer, "BEGIN; " + ConflictingSourceDML("source"));
+	unique_ptr<MaterializedQueryResult> created;
+	if (pending_writer) {
+		auto gate = RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(*creator.context));
+		auto creating = std::async(std::launch::async, [&]() {
+			return creator.Query("CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+		});
+		try {
+			MutationGateTestAccess::WaitForBlockedOwner(*gate, SqlUtils::FullName("memory", "main", "source"), true);
+			Execute(writer, commit ? "COMMIT;" : "ROLLBACK;");
+		} catch (const std::exception &) {
+			if (writer.context->transaction.HasActiveTransaction()) {
+				writer.context->transaction.Rollback(nullptr);
+			}
+			creating.wait();
+			throw;
+		}
+		created = creating.get();
+	} else {
+		Execute(writer, commit ? "COMMIT;" : "ROLLBACK;");
+		created = creator.Query("CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	}
+	if (commit) {
+		if (!created->HasError() || created->GetError().find("retry the transaction") == string::npos) {
+			throw InvalidInputException("First CREATE silently accepted uncaptured commits newer than its snapshot");
+		}
+		Execute(creator, "ROLLBACK; CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	} else {
+		if (created->HasError()) {
+			throw InvalidInputException("Rolled-back untracked DML prevented first CREATE: %s", created->GetError());
+		}
+		Execute(creator, "COMMIT;");
+	}
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, ConflictingSourceDML("source"));
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, "DROP VIEW mv;");
+}
+
+static void TestFirstCreateAfterNonSourceCommits(bool dedicated_schema, bool commit) {
+	std::cerr << "CASE first CREATE after non-source commits dedicated_schema=" << dedicated_schema
+	          << " commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), writer(db), observer(db);
+	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_metadata_schema='Control.Space'; "
+	                 "SET openivm_internal_schema=" +
+	                     Value(dedicated_schema ? "Internal Space" : "").ToSQLString() +
+	                     "; CREATE SCHEMA \"Other.Space\"; CREATE TABLE source(i INTEGER); "
+	                     "CREATE TABLE \"Other.Space\".source(i INTEGER); "
+	                     "INSERT INTO source VALUES (1),(1),(2); "
+	                     "INSERT INTO \"Other.Space\".source VALUES (1),(1),(2);");
+	// A native source snapshot must survive read-only helper commits and writes
+	// to a different qualified source in the same catalog. Neither needs capture
+	// for this MV, even though DuckDB's catalog commit counter advances.
+	Execute(creator, "BEGIN; SELECT * FROM source;");
+	Execute(observer, "SELECT * FROM source;");
+	Execute(writer, "BEGIN; " + ConflictingSourceDML("\"Other.Space\".source") + (commit ? " COMMIT;" : " ROLLBACK;"));
+	Execute(creator, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source; COMMIT;");
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, ConflictingSourceDML("source"));
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, "DROP VIEW mv;");
+}
+
+static void TestFirstCreateAfterTrackedConsumerDrop(bool dedicated_schema, bool commit) {
+	std::cerr << "CASE first CREATE after tracked consumer drop dedicated_schema=" << dedicated_schema
+	          << " commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), writer(db), observer(db);
+	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_metadata_schema='Control.Space'; "
+	                 "SET openivm_internal_schema=" +
+	                     Value(dedicated_schema ? "Internal Space" : "").ToSQLString() +
+	                     "; CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1),(1),(2); "
+	                     "CREATE SCHEMA \"Prior Internal\"; CREATE TABLE seed(i INTEGER); "
+	                     "CREATE MATERIALIZED VIEW bootstrap AS SELECT * FROM seed; DROP VIEW bootstrap;");
+	Execute(writer, "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Prior Internal';");
+	// This snapshot predates all ownership of source, so after final DROP neither
+	// its local registry nor a committed probe can reveal the intervening writes.
+	// Different maintenance locations avoid a separate native catalog conflict
+	// when the older transaction allocates after that DROP's newer tombstone.
+	Execute(creator, "BEGIN; SELECT * FROM source;");
+	Execute(writer, "CREATE MATERIALIZED VIEW prior_mv AS SELECT * FROM source;");
+	Execute(writer, "BEGIN; " + ConflictingSourceDML("source") + (commit ? " COMMIT;" : " ROLLBACK;"));
+	RefreshAndCheckBag(writer, "prior_mv", "SELECT * FROM source");
+	Execute(writer, "DROP VIEW prior_mv;");
+	auto created = creator.Query("CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	if (commit) {
+		if (!created->HasError() || created->GetError().find("retry the transaction") == string::npos) {
+			throw InvalidInputException("Final-consumer cleanup hid committed source writes from stale CREATE");
+		}
+		Execute(creator, "ROLLBACK; CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	} else {
+		if (created->HasError()) {
+			throw InvalidInputException("Final-consumer cleanup rejected unchanged source snapshot: %s",
+			                            created->GetError());
+		}
+		Execute(creator, "COMMIT;");
+	}
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, ConflictingSourceDML("source"));
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, "DROP VIEW mv;");
+}
+
+static pair<string, string> CreateIndependentSources(Connection &con, bool dedicated_schema, bool cross_catalog) {
+	const string source = "memory.\"Source.Space\".\"Items;Table\"";
+	const string independent =
+	    cross_catalog ? "peer.\"Source.Space\".\"Items;Table\"" : "memory.\"Other.Space\".\"Items;Table\"";
+	Execute(con, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_metadata_schema='Control.Space'; "
+	             "SET openivm_internal_schema=" +
+	                 Value(dedicated_schema ? "Internal Space" : "").ToSQLString() +
+	                 "; ATTACH ':memory:' AS peer; CREATE SCHEMA \"Source.Space\"; "
+	                 "CREATE SCHEMA \"Other.Space\"; CREATE SCHEMA peer.\"Source.Space\"; CREATE TABLE " +
+	                 source + "(i INTEGER); CREATE TABLE " + independent + "(i INTEGER); INSERT INTO " + source +
+	                 " VALUES (1),(1),(2); INSERT INTO " + independent + " VALUES (1),(1),(2);");
+	return {source, independent};
+}
+
+static void TestIndependentUntrackedWriters(bool cross_catalog, bool commit) {
+	std::cerr << "CASE independent untracked writers cross_catalog=" << cross_catalog << " commit=" << commit
+	          << std::endl;
+	DuckDB db(nullptr);
+	Connection first(db), second(db), observer(db);
+	auto sources = CreateIndependentSources(first, true, cross_catalog);
+	const auto &source = sources.first;
+	const auto &independent = sources.second;
+	Execute(first, "BEGIN; " + ConflictingSourceDML(source));
+	auto competing = std::async(std::launch::async,
+	                            [&]() { Execute(second, "BEGIN; " + ConflictingSourceDML(independent) + " COMMIT;"); });
+	// Completion must precede release of the first transaction. The deadline
+	// only bounds failure when a regression serializes these independent writers.
+	bool completed = competing.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+	Execute(first, commit && completed ? "COMMIT;" : "ROLLBACK;");
+	competing.get();
+	if (!completed) {
+		throw InvalidInputException("Independent untracked writer could not commit while another remained open");
+	}
+	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM " + independent +
+	                      " EXCEPT ALL SELECT * FROM (VALUES (3),(3),(4),(4))) OR EXISTS "
+	                      "(SELECT * FROM (VALUES (3),(3),(4),(4)) EXCEPT ALL SELECT * FROM " +
+	                      independent + ") THEN error('Independent writer lost committed rows') ELSE true END;");
+	const string expected = commit ? "(VALUES (3),(3),(4),(4))" : "(VALUES (1),(1),(2))";
+	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM " + source + " EXCEPT ALL SELECT * FROM " + expected +
+	                      ") OR EXISTS (SELECT * FROM " + expected + " EXCEPT ALL SELECT * FROM " + source +
+	                      ") THEN error('Open untracked writer lost commit/rollback isolation') ELSE true END;");
+	Execute(first, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM " + source + ";");
+	Execute(observer, ConflictingSourceDML(source) + ConflictingSourceDML(independent));
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM " + source);
+	Execute(observer, "DROP VIEW mv;");
+}
+
+static void TestIndependentWriterDuringPublication(bool dedicated_schema, bool cross_catalog) {
+	std::cerr << "CASE independent writer during publication dedicated_schema=" << dedicated_schema
+	          << " cross_catalog=" << cross_catalog << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), writer(db), observer(db);
+	auto sources = CreateIndependentSources(creator, dedicated_schema, cross_catalog);
+	const auto &source = sources.first;
+	const auto &independent = sources.second;
+	creator.context->transaction.BeginTransaction();
+	auto parsed = ParseMaterializedViewStatement("CREATE MATERIALIZED VIEW mv AS SELECT * FROM " + source + ";",
+	                                             SqlDialect::DUCKDB);
+	auto planned =
+	    MaterializedViewParserExtension::PlanFunction(nullptr, *creator.context, std::move(parsed.parse_data));
+	auto competing = std::async(std::launch::async,
+	                            [&]() { Execute(writer, "BEGIN; " + ConflictingSourceDML(independent) + " COMMIT;"); });
+	bool completed = competing.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+	if (!completed) {
+		creator.context->transaction.Rollback(nullptr);
+		competing.get();
+		throw InvalidInputException("First MV publication blocked a writer of an independent qualified source");
+	}
+	competing.get();
+	ExecuteStagedDDL(*creator.context, planned.parameters);
+	creator.context->transaction.Commit();
+	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM " + independent +
+	                      " EXCEPT ALL SELECT * FROM (VALUES (3),(3),(4),(4))) OR EXISTS "
+	                      "(SELECT * FROM (VALUES (3),(3),(4),(4)) EXCEPT ALL SELECT * FROM " +
+	                      independent +
+	                      ") THEN error('Independent publication writer lost committed rows') ELSE true END;");
+	Execute(observer, ConflictingSourceDML(source));
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM " + source);
+	Execute(observer, "DROP VIEW mv;");
+}
+
+static void TestConcurrentUntrackedAppends() {
+	std::cerr << "CASE concurrent untracked appends to one source" << std::endl;
+	DuckDB db(nullptr);
+	Connection first(db), second(db), observer(db);
+	Execute(first, "LOAD openivm; SET openivm_disable_daemon=true; CREATE TABLE source(i INTEGER); "
+	               "INSERT INTO source VALUES (1),(1),(2); BEGIN; INSERT INTO source VALUES (10),(10),(11); "
+	               "UPDATE source SET i=12 WHERE i=11; DELETE FROM source WHERE i=12;");
+	auto competing = std::async(std::launch::async, [&]() {
+		Execute(second, "BEGIN; INSERT INTO source VALUES (20),(20),(21); "
+		                "UPDATE source SET i=22 WHERE i=21; DELETE FROM source WHERE i=22; COMMIT;");
+	});
+	bool completed = competing.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+	Execute(first, completed ? "COMMIT;" : "ROLLBACK;");
+	competing.get();
+	if (!completed) {
+		throw InvalidInputException("Source admission serialized nonconflicting writers of one untracked source");
+	}
+	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM source EXCEPT ALL "
+	                  "SELECT * FROM (VALUES (1),(1),(2),(10),(10),(20),(20))) OR EXISTS "
+	                  "(SELECT * FROM (VALUES (1),(1),(2),(10),(10),(20),(20)) EXCEPT ALL SELECT * FROM source) "
+	                  "THEN error('Concurrent untracked appends lost rows') ELSE true END;");
+	Execute(observer, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source; " + ConflictingSourceDML("source"));
+	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
+	Execute(observer, "DROP VIEW mv;");
+}
+
+static void TestSourceAdmissionLockOrder(bool dedicated_schema, bool tracked) {
+	std::cerr << "CASE source admission lock order dedicated_schema=" << dedicated_schema << " tracked=" << tracked
+	          << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), writer(db), observer(db);
+	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_metadata_schema='Control.Space'; "
+	                 "SET openivm_internal_schema=" +
+	                     Value(dedicated_schema ? "Internal Space" : "").ToSQLString() +
+	                     "; CREATE TABLE a(i INTEGER); CREATE TABLE b(i INTEGER); "
+	                     "INSERT INTO a VALUES (1),(1),(2); INSERT INTO b VALUES (1),(1),(2);");
+	if (tracked) {
+		Execute(creator, "CREATE MATERIALIZED VIEW mv_b AS SELECT * FROM b;");
+	}
+	Execute(writer, "BEGIN; " + ConflictingSourceDML("a"));
+	auto gate = RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(*creator.context));
+	std::future<void> creating;
+	ParserExtensionPlanResult planned;
+	if (tracked) {
+		creating = std::async(std::launch::async,
+		                      [&]() { Execute(creator, "CREATE MATERIALIZED VIEW mv_a AS SELECT * FROM a;"); });
+		try {
+			MutationGateTestAccess::WaitForBlockedOwner(*gate, SqlUtils::FullName("memory", "main", "a"), true);
+		} catch (const std::exception &) {
+			Execute(writer, "ROLLBACK;");
+			creating.wait();
+			throw;
+		}
+	} else {
+		creator.context->transaction.BeginTransaction();
+		auto parsed =
+		    ParseMaterializedViewStatement("CREATE MATERIALIZED VIEW mv_b AS SELECT * FROM b;", SqlDialect::DUCKDB);
+		planned =
+		    MaterializedViewParserExtension::PlanFunction(nullptr, *creator.context, std::move(parsed.parse_data));
+	}
+	// A has already been written without capture. Waiting for the publisher of B
+	// (or its global gate) could form a lock-order cycle; this statement must fail
+	// before changing B, and rollback must unblock publication of A.
+	auto result = writer.Query("INSERT INTO b VALUES (77);");
+	bool retry = result->HasError() && result->GetError().find("retry the transaction") != string::npos;
+	Execute(writer, "ROLLBACK;");
+	if (tracked) {
+		creating.get();
+	} else {
+		ExecuteStagedDDL(*creator.context, planned.parameters);
+		creator.context->transaction.Commit();
+	}
+	if (!retry) {
+		throw InvalidInputException("Source admission lock-order conflict did not request a transaction retry");
+	}
+	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM a EXCEPT ALL SELECT * FROM (VALUES (1),(1),(2))) "
+	                  "OR EXISTS (SELECT * FROM (VALUES (1),(1),(2)) EXCEPT ALL SELECT * FROM a) "
+	                  "OR EXISTS (SELECT * FROM b EXCEPT ALL SELECT * FROM (VALUES (1),(1),(2))) "
+	                  "OR EXISTS (SELECT * FROM (VALUES (1),(1),(2)) EXCEPT ALL SELECT * FROM b) "
+	                  "THEN error('Admission retry committed partial DML') ELSE true END;");
+	Execute(observer, ConflictingSourceDML("a") + ConflictingSourceDML("b"));
+	RefreshAndCheckBag(observer, "mv_b", "SELECT * FROM b");
+	if (tracked) {
+		RefreshAndCheckBag(observer, "mv_a", "SELECT * FROM a");
+		Execute(observer, "DROP VIEW mv_a;");
+	}
+	Execute(observer, "DROP VIEW mv_b;");
+}
+
 static void TestDropDuringPublication(bool explicit_transaction, bool staged_drop, bool schema_drop = false) {
 	std::cerr << "CASE drop during publication explicit_transaction=" << explicit_transaction
 	          << " staged_drop=" << staged_drop << " schema_drop=" << schema_drop << std::endl;
@@ -450,7 +921,9 @@ static void TestSharedMetadataUpgrade(bool explicit_transaction, bool commit) {
 	Execute(owner, CreateMetadataTableSQL(openivm::VIEWS_TABLE, registry) + "; ALTER TABLE " + registry +
 	                   " DROP COLUMN internal_schema;");
 	if (explicit_transaction) {
-		Execute(owner, "BEGIN;");
+		// Keep a source snapshot open while OpenIVM probes the legacy registry.
+		// Those helper commits must not look like uncaptured source writes.
+		Execute(owner, "BEGIN; SELECT * FROM source;");
 	}
 	Execute(owner, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
 	if (explicit_transaction) {
@@ -771,13 +1244,6 @@ static void TestCrossCatalogSharedDelta(bool dedicated_schema, bool commit) {
 	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Cross-catalog final cleanup leaked') END "
 	               "FROM duckdb_tables() WHERE database_name='memory' "
 	               "AND schema_name IN ('Source.Space','Internal Space') AND starts_with(table_name,'openivm_');");
-}
-
-static void RefreshAndCheckBag(Connection &owner, const string &view, const string &query) {
-	Execute(owner, "PRAGMA refresh(" + Value(view).ToSQLString() + ");");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + query + ") OR EXISTS (" + query +
-	                   " EXCEPT ALL SELECT * FROM " + view +
-	                   ") THEN error('Publication owner survivor bag mismatch') ELSE true END;");
 }
 
 static void TestCreateAfterCommittedDeltaRemoval(bool dedicated_schema, bool peer_view, bool republished) {
@@ -2448,6 +2914,34 @@ int main(int argc, char **argv) {
 		}
 		TestPublication(false);
 		TestPublication(true);
+		TestConcurrentUntrackedAppends();
+		for (bool cross_catalog : {false, true}) {
+			TestIndependentUntrackedWriters(cross_catalog, false);
+			TestIndependentUntrackedWriters(cross_catalog, true);
+		}
+		for (bool dedicated_schema : {false, true}) {
+			TestFirstCreateWithOldSourceSnapshot(dedicated_schema, false);
+			TestFirstCreateWithOldSourceSnapshot(dedicated_schema, true);
+			TestFirstCreateWithOldSourceSnapshot(dedicated_schema, false, true);
+			TestFirstCreateWithOldSourceSnapshot(dedicated_schema, true, true);
+			TestFirstCreateAfterNonSourceCommits(dedicated_schema, false);
+			TestFirstCreateAfterNonSourceCommits(dedicated_schema, true);
+			TestFirstCreateAfterTrackedConsumerDrop(dedicated_schema, false);
+			TestFirstCreateAfterTrackedConsumerDrop(dedicated_schema, true);
+			TestIndependentWriterDuringPublication(dedicated_schema, false);
+			TestIndependentWriterDuringPublication(dedicated_schema, true);
+			TestSourceAdmissionLockOrder(dedicated_schema, false);
+			TestSourceAdmissionLockOrder(dedicated_schema, true);
+			for (const auto &first_operation : vector<string> {"insert", "delete", "update"}) {
+				TestDMLDuringPublication(dedicated_schema, first_operation, false, true);
+				TestDMLDuringPublication(dedicated_schema, first_operation, true, true);
+			}
+			TestDMLDuringPublication(dedicated_schema, "insert", true, false);
+			TestDMLDuringPublication(dedicated_schema, "insert", false, true, false);
+			TestDMLBeforePublication(dedicated_schema, true);
+			TestDMLBeforePublication(dedicated_schema, false);
+			TestDMLWithInvisibleDelta(dedicated_schema);
+		}
 		for (bool dedicated_schema : {false, true}) {
 			for (bool peer_view : {false, true}) {
 				TestCreateAfterCommittedDeltaRemoval(dedicated_schema, peer_view, false);

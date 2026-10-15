@@ -91,6 +91,38 @@ When a preferred name is occupied (including by a legacy colocated delta),
 OpenIVM allocates a free name with an `__openivm_<number>` suffix. It checks source
 ownership before reusing an existing delta rather than adopting a table by name.
 CREATE holds the database mutation gate through ownership publication and commit.
+Native writers first take shared admission for their qualified source. If no
+owned delta exists, admission stays with the writer until commit or rollback;
+independent untracked writers can run and commit together. CREATE takes exclusive
+publication admission for its sources before allocating deltas. A writer arriving
+between allocation and publication therefore waits, then reconciles ownership
+against both its own snapshot and a fresh committed read before choosing capture.
+Tracked writers release their temporary source admission before taking the
+existing mutation gate, then reserve the source again and recheck ownership under
+that gate. Both writer paths retain their source admission through commit, so a
+later final-consumer DROP cannot hide intervening source writes from old snapshots.
+
+Autocommit CREATE discovers sources through a read-only bind in the caller
+context, including its temporary tables and search path. It retains those source
+guards while ending the discovery snapshot and starting the transaction that
+compiles and executes creation. No lifecycle writes run in the discovery phase.
+This prevents initial loading from an older snapshot after waiting for an
+uncaptured writer. The staged executor retains the same source guards while
+suspending the planning transaction, through publication or allocation cleanup.
+An explicit transaction keeps its snapshot: first-source capture requires a retry
+if an admitted writer committed changes to that qualified source after
+the snapshot and there is no existing delta to cover them. Admission records a
+source commit marker only after a successful commit; rollback, read-only metadata
+probes and commits to other sources do not mark that source. The marker uses the
+native manager's latest commit ID as a conservative upper bound, because the
+writer's transaction object may already be reclaimed before the commit callback.
+It remains protected by admission until recorded. Admission release discards idle
+markers when no native snapshot can predate them; a new attachment with the same
+catalog name has a distinct catalog identity and does not inherit the old markers.
+Transactions that already hold untracked-write admission also receive a retry
+error if a later statement would wait on a conflicting lifecycle gate, avoiding
+a cycle between publication and pending writes.
+
 In autocommit, shared metadata initialization inspects and updates the helper's
 catalog snapshot. The native target's internal schema is also initialized before
 source planning opens the caller's snapshot. Newly allocated, empty source deltas

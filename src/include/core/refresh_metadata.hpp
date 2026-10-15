@@ -135,10 +135,13 @@ public:
 	// Requires an active transaction on `context`.
 	static optional_ptr<TableCatalogEntry> FindSourceDelta(ClientContext &context, const string &catalog,
 	                                                       const string &schema, const string &table);
-	// Allocation must also see ownership committed after the caller's snapshot began.
-	// Requires the caller to hold the database mutation gate through publication/commit.
-	static optional_ptr<TableCatalogEntry> FindSourceDeltaForCreate(ClientContext &context, const string &catalog,
-	                                                                const string &schema, const string &table);
+	// Allocation and native DML admission must also see ownership committed after
+	// the caller's snapshot began; an invisible/replaced delta requires a retry.
+	// Allocation/ALTER and the final DML lookup require the database mutation gate.
+	// The initial DML probe instead holds source admission, which excludes first
+	// publication; tracked writers must recheck after acquiring the mutation gate.
+	static optional_ptr<TableCatalogEntry> FindSourceDeltaForMutation(ClientContext &context, const string &catalog,
+	                                                                  const string &schema, const string &table);
 
 	SourceLocation GetSourceLocation(const string &view_name, const string &table_name,
 	                                 const string &fallback_catalog = "", const string &fallback_schema = "");

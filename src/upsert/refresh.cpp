@@ -78,12 +78,12 @@ public:
 		AddStep("total_refresh", total_start);
 	}
 
-	void Flush(DatabaseInstance &db) {
+	void Flush(ClientContext &context) {
 		if (!enabled || steps.empty()) {
 			return;
 		}
-		Connection profile_con(db);
-		RefreshMetadata::UseCatalog(*profile_con.context, profile_con, view_catalog);
+		Connection profile_con(*context.db);
+		RefreshMetadata::UseCatalog(context, profile_con, view_catalog);
 		// Persist all steps together instead of synchronizing the WAL for every row.
 		profile_con.BeginTransaction();
 		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
@@ -148,7 +148,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		if (TrySkipEmptyRefresh(context, probe_meta, probe_con, view_catalog_name, view_schema_name, vn,
 		                        attached_db_catalog_name, attached_db_schema_name, &delta_activity)) {
 			profiler.AddTotal();
-			profiler.Flush(*context.db.get());
+			profiler.Flush(context);
 			return;
 		}
 		if (!delta_activity.active_delta_table_names.empty() || delta_activity.requires_full_refresh) {
@@ -223,6 +223,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 		if (cross_system && !meta_pre_sql.empty()) {
 			auto meta_pre_start = std::chrono::steady_clock::now();
 			Connection meta_con(*context.db.get());
+			TransactionalMVLockState::Get(*meta_con.context)
+			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 			auto meta_result = meta_con.Query(meta_pre_sql);
 			if (meta_result->HasError()) {
 				throw Exception(ExceptionType::EXECUTOR,
@@ -397,6 +399,8 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 				}
 			}
 			Connection meta_con(*context.db.get());
+			TransactionalMVLockState::Get(*meta_con.context)
+			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 			auto meta_result = meta_con.Query(meta_post_sql);
 			if (meta_result->HasError()) {
 				throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
@@ -433,7 +437,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			profiler.AddStep("record_refresh_history", history_start, method);
 		}
 		profiler.AddTotal();
-		profiler.Flush(*context.db.get());
+		profiler.Flush(context);
 		return;
 	} catch (...) {
 		// Ensure the transaction is rolled back before we propagate the exception.
@@ -450,7 +454,7 @@ static void RefreshViewSerialized(ClientContext &context, const string &view_cat
 			tx_open = false;
 		}
 		profiler.AddTotal();
-		profiler.Flush(*context.db.get());
+		profiler.Flush(context);
 		throw;
 	}
 }

@@ -3,8 +3,11 @@
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
+#include "duckdb/transaction/duck_transaction.hpp"
+#include "duckdb/transaction/duck_transaction_manager.hpp"
 
 #include <cstdio>
 
@@ -15,6 +18,12 @@ void MutationGate::Lock(const void *owner) {
 	if (active_owner == owner) {
 		depth++;
 		return;
+	}
+	// A lifecycle owner may be waiting for this transaction's untracked writes.
+	// Never wait in the opposite order when a later statement needs the global
+	// gate (tracked DML, refresh, or DDL); roll back and retry that transaction.
+	if (active_owner && admitted_writers.count(owner)) {
+		throw TransactionException("OpenIVM lifecycle conflicts with pending source writes; retry the transaction");
 	}
 	waiting_owners++;
 	condition.wait(guard, [&]() { return active_owner == nullptr; });
@@ -38,7 +47,8 @@ void MutationGate::Unlock(const void *owner) {
 	depth--;
 	if (depth == 0) {
 		active_owner = nullptr;
-		condition.notify_one();
+		// Global and source waiters share this condition variable.
+		condition.notify_all();
 	}
 }
 
@@ -52,6 +62,86 @@ bool MutationGate::TryLock(const void *owner) {
 	return true;
 }
 
+void MutationGate::LockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication) {
+	std::unique_lock<mutex> guard(lock);
+	auto &entry = sources[catalog_oid][source];
+	if (!entry) {
+		entry = make_uniq<SourceAdmission>();
+	}
+	auto &admission = *entry;
+	if (publication) {
+		D_ASSERT(active_owner == owner);
+		if (admission.publisher == owner) {
+			admission.publication_depth++;
+			return;
+		}
+		auto ready = [&]() {
+			return !admission.publisher &&
+			       (admission.readers.empty() || (admission.readers.size() == 1 && admission.readers.count(owner)));
+		};
+		admission.waiting_publishers++;
+		condition.wait(guard, ready);
+		admission.waiting_publishers--;
+		admission.publisher = owner;
+		admission.publication_depth = 1;
+		return;
+	}
+	auto ready = [&]() {
+		return admission.publisher == owner ||
+		       (!admission.publisher && (!admission.waiting_publishers || admission.readers.count(owner)));
+	};
+	bool waited = !ready();
+	if (waited && admitted_writers.count(owner)) {
+		// The publisher can need a different source already held by this writer.
+		throw TransactionException("OpenIVM source publication conflicts with pending writes; retry the transaction");
+	}
+	admission.waiting_readers++;
+	condition.wait(guard, ready);
+	admission.waiting_readers--;
+	admission.readers[owner]++;
+	admitted_writers[owner]++;
+}
+
+void MutationGate::RecordSourceCommit(const string &source, idx_t catalog_oid, transaction_t commit_id) {
+	std::lock_guard<mutex> guard(lock);
+	auto &admission = *sources.at(catalog_oid).at(source);
+	admission.last_write_commit = MaxValue(admission.last_write_commit, commit_id);
+}
+
+bool MutationGate::HasSourceCommitAfter(const string &source, idx_t catalog_oid, transaction_t snapshot) {
+	std::lock_guard<mutex> guard(lock);
+	return sources.at(catalog_oid).at(source)->last_write_commit >= snapshot;
+}
+
+void MutationGate::UnlockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication,
+                                transaction_t oldest_snapshot) {
+	std::lock_guard<mutex> guard(lock);
+	auto &catalog_sources = sources.at(catalog_oid);
+	auto &admission = *catalog_sources.at(source);
+	if (publication) {
+		D_ASSERT(admission.publisher == owner && admission.publication_depth > 0);
+		if (--admission.publication_depth == 0) {
+			admission.publisher = nullptr;
+		}
+	} else {
+		auto &readers = admission.readers.at(owner);
+		if (--readers == 0) {
+			admission.readers.erase(owner);
+		}
+		if (--admitted_writers.at(owner) == 0) {
+			admitted_writers.erase(owner);
+		}
+	}
+	if (!admission.publisher && admission.readers.empty() && !admission.waiting_readers &&
+	    !admission.waiting_publishers && admission.last_write_commit < oldest_snapshot) {
+		catalog_sources.erase(source);
+		if (catalog_sources.empty()) {
+			sources.erase(catalog_oid);
+		}
+	}
+	condition.notify_all();
+}
+
 shared_ptr<MutationGate> RefreshLocks::AcquireGate(DatabaseInstance &db) {
 	return db.GetObjectCache().GetOrCreate<MutationGate>(MutationGate::ObjectType());
 }
@@ -59,6 +149,38 @@ shared_ptr<MutationGate> RefreshLocks::AcquireGate(DatabaseInstance &db) {
 MutationLockGuard::MutationLockGuard(ClientContext &context)
     : MutationLockGuard(DatabaseInstance::GetDatabase(context),
                         TransactionalMVLockState::Get(context).GetMutationOwner()) {
+}
+
+SourceAdmissionGuard::SourceAdmissionGuard(DatabaseInstance &db, const void *owner_p, Catalog &catalog, string source_p,
+                                           bool publication_p)
+    : gate(RefreshLocks::AcquireGate(db)), owner(owner_p), source(std::move(source_p)), publication(publication_p),
+      source_database(catalog.GetAttached().shared_from_this()) {
+	gate->LockSource(owner, source, catalog.GetOid(), publication);
+}
+
+SourceAdmissionGuard::~SourceAdmissionGuard() {
+	auto oldest_snapshot = source_database->GetCatalog().IsDuckCatalog()
+	                           ? DuckTransactionManager::Get(*source_database).LowestActiveStart()
+	                           : MAX_TRANSACTION_ID;
+	gate->UnlockSource(owner, source, source_database->GetCatalog().GetOid(), publication, oldest_snapshot);
+}
+
+void SourceAdmissionGuard::RecordCommit() {
+	D_ASSERT(!publication);
+	if (source_database->GetCatalog().IsDuckCatalog()) {
+		// Native transaction objects may already have been reclaimed when the
+		// commit callback runs. The manager supplies a safe upper bound instead.
+		// Record it before releasing admission, so publication cannot miss a writer.
+		auto commit_id = DuckTransactionManager::Get(*source_database).GetLastCommit();
+		gate->RecordSourceCommit(source, source_database->GetCatalog().GetOid(), commit_id);
+		OPENIVM_DEBUG_PRINT("[SOURCE ADMISSION] Recorded commit upper bound %llu for %s\n",
+		                    static_cast<unsigned long long>(commit_id), source.c_str());
+	}
+}
+
+bool SourceAdmissionGuard::HasCommitAfter(transaction_t snapshot) {
+	D_ASSERT(publication);
+	return gate->HasSourceCommitAfter(source, source_database->GetCatalog().GetOid(), snapshot);
 }
 
 const void *TransactionalMVLockState::GetMutationOwner() {
@@ -82,9 +204,78 @@ void TransactionalMVLockState::AcquireMutationLock() {
 	}
 }
 
+unique_ptr<SourceAdmissionGuard> TransactionalMVLockState::AcquireSourceWriteAdmission(const string &catalog,
+                                                                                       const string &schema,
+                                                                                       const string &table) {
+	auto source = StringUtil::Lower(SqlUtils::FullName(catalog, schema, table));
+	lock_guard<mutex> guard(state_lock);
+	if (source_write_admissions.count(source)) {
+		return nullptr;
+	}
+	return make_uniq<SourceAdmissionGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner,
+	                                       Catalog::GetCatalog(owner, catalog), std::move(source), false);
+}
+
+void TransactionalMVLockState::RetainSourceWriteAdmission(unique_ptr<SourceAdmissionGuard> admission) {
+	if (!admission) {
+		return;
+	}
+	lock_guard<mutex> guard(state_lock);
+	auto source = admission->Source();
+	source_write_admissions.emplace(std::move(source), std::move(admission));
+}
+
+void TransactionalMVLockState::AcquireSourcePublicationLock(const string &catalog, const string &schema,
+                                                            const string &table) {
+	auto source = StringUtil::Lower(SqlUtils::FullName(catalog, schema, table));
+	lock_guard<mutex> guard(state_lock);
+	if (source_publication_locks.count(source)) {
+		return;
+	}
+	auto admission = make_uniq<SourceAdmissionGuard>(DatabaseInstance::GetDatabase(owner), mutation_owner,
+	                                                 Catalog::GetCatalog(owner, catalog), source, true);
+	OPENIVM_DEBUG_PRINT("[LOCK] acquired source publication lock %s owner=%p\n", source.c_str(), mutation_owner);
+	source_publication_locks.emplace(std::move(source), std::move(admission));
+}
+
+void TransactionalMVLockState::VerifySourceSnapshot(const string &catalog, const string &schema, const string &table) {
+	auto &source_catalog = Catalog::GetCatalog(owner, catalog);
+	if (!source_catalog.IsDuckCatalog()) {
+		return;
+	}
+	auto snapshot = DuckTransaction::Get(owner, source_catalog).start_time;
+	auto source = StringUtil::Lower(SqlUtils::FullName(catalog, schema, table));
+	lock_guard<mutex> guard(state_lock);
+	if (source_publication_locks.at(source)->HasCommitAfter(snapshot)) {
+		throw TransactionException("OpenIVM cannot establish source capture from an older source snapshot for "
+		                           "'%s'; retry the transaction",
+		                           SqlUtils::FullName(catalog, schema, table));
+	}
+}
+
+vector<unique_ptr<SourceAdmissionGuard>> TransactionalMVLockState::TakeSourcePublicationLocks() {
+	lock_guard<mutex> guard(state_lock);
+	vector<unique_ptr<SourceAdmissionGuard>> locks;
+	for (auto &entry : source_publication_locks) {
+		locks.push_back(std::move(entry.second));
+	}
+	source_publication_locks.clear();
+	return locks;
+}
+
+void TransactionalMVLockState::RestoreSourcePublicationLocks(vector<unique_ptr<SourceAdmissionGuard>> locks) {
+	lock_guard<mutex> guard(state_lock);
+	D_ASSERT(source_publication_locks.empty());
+	for (auto &admission : locks) {
+		auto source = admission->Source();
+		source_publication_locks.emplace(std::move(source), std::move(admission));
+	}
+}
+
 void TransactionalMVLockState::SetMutationOwner(const void *owner_token) {
 	lock_guard<mutex> guard(state_lock);
-	if (mutation_guard && mutation_owner != owner_token) {
+	if ((mutation_guard || !source_write_admissions.empty() || !source_publication_locks.empty()) &&
+	    mutation_owner != owner_token) {
 		throw InternalException("OpenIVM cannot change mutation ownership after acquiring the mutation lock");
 	}
 	mutation_owner = owner_token;
@@ -105,6 +296,9 @@ void TransactionalMVLockState::TransactionCommit(MetaTransaction &transaction, C
 	vector<RefreshMetadata::DeltaSource> source_cleanup;
 	{
 		lock_guard<mutex> guard(state_lock);
+		for (auto &entry : source_write_admissions) {
+			entry.second->RecordCommit();
+		}
 		cleanup.swap(deferred_delta_cleanup);
 		source_cleanup.swap(deferred_source_delta_cleanup);
 		source_cleanup.insert(source_cleanup.end(), allocated_source_deltas.begin(), allocated_source_deltas.end());
@@ -209,6 +403,8 @@ void TransactionalMVLockState::Release() {
 	deferred_source_delta_cleanup.clear();
 	allocated_source_deltas.clear();
 	dropped_source_deltas.clear();
+	source_write_admissions.clear();
+	source_publication_locks.clear();
 	mutation_guard.reset();
 }
 

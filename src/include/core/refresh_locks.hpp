@@ -8,9 +8,13 @@
 
 #include <condition_variable>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace duckdb {
+
+class AttachedDatabase;
+class Catalog;
 
 // Serializes OpenIVM mutations for one database. The gate is re-entrant for one
 // logical owner because helper connections can execute on different worker threads.
@@ -32,12 +36,30 @@ public:
 
 private:
 	friend class MutationGateTestAccess;
+	friend class SourceAdmissionGuard;
+	// Readers are admitted native writers, tracked or untracked.
+	// Publication excludes them only for the qualified source being published.
+	struct SourceAdmission {
+		transaction_t last_write_commit = 0;
+		unordered_map<const void *, idx_t> readers;
+		const void *publisher = nullptr;
+		idx_t publication_depth = 0;
+		idx_t waiting_readers = 0;
+		idx_t waiting_publishers = 0;
+	};
+	void LockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication);
+	void UnlockSource(const void *owner, const string &source, idx_t catalog_oid, bool publication,
+	                  transaction_t oldest_snapshot);
+	void RecordSourceCommit(const string &source, idx_t catalog_oid, transaction_t commit_id);
+	bool HasSourceCommitAfter(const string &source, idx_t catalog_oid, transaction_t snapshot);
 	mutex lock;
 	std::condition_variable condition;
 	const void *active_owner = nullptr;
 	idx_t depth = 0;
 	// Integration tests synchronize on an actual wait without timing the caller.
 	idx_t waiting_owners = 0;
+	unordered_map<idx_t, unordered_map<string, unique_ptr<SourceAdmission>>> sources;
+	unordered_map<const void *, idx_t> admitted_writers;
 };
 
 class RefreshLocks {
@@ -66,6 +88,26 @@ public:
 	MutationLockGuard &operator=(MutationLockGuard &&) = delete;
 };
 
+class SourceAdmissionGuard {
+public:
+	SourceAdmissionGuard(DatabaseInstance &db, const void *owner, Catalog &catalog, string source, bool publication);
+	~SourceAdmissionGuard();
+	SourceAdmissionGuard(const SourceAdmissionGuard &) = delete;
+	SourceAdmissionGuard &operator=(const SourceAdmissionGuard &) = delete;
+	const string &Source() const {
+		return source;
+	}
+	void RecordCommit();
+	bool HasCommitAfter(transaction_t snapshot);
+
+private:
+	shared_ptr<MutationGate> gate;
+	const void *owner;
+	string source;
+	bool publication;
+	shared_ptr<AttachedDatabase> source_database;
+};
+
 // Native lifecycle and refresh programs are returned as multiple DuckDB
 // statements. Retain the mutation gate until the caller transaction ends.
 class TransactionalMVLockState : public ClientContextState {
@@ -74,6 +116,16 @@ public:
 	static TransactionalMVLockState &Get(ClientContext &context);
 
 	void AcquireMutationLock();
+	// Untracked writers retain source admission through commit. Tracked writers
+	// release temporary admission before entering the mutation gate, then recheck
+	// ownership and retain admission again under that gate.
+	unique_ptr<SourceAdmissionGuard> AcquireSourceWriteAdmission(const string &catalog, const string &schema,
+	                                                             const string &table);
+	void RetainSourceWriteAdmission(unique_ptr<SourceAdmissionGuard> admission);
+	void AcquireSourcePublicationLock(const string &catalog, const string &schema, const string &table);
+	void VerifySourceSnapshot(const string &catalog, const string &schema, const string &table);
+	vector<unique_ptr<SourceAdmissionGuard>> TakeSourcePublicationLocks();
+	void RestoreSourcePublicationLocks(vector<unique_ptr<SourceAdmissionGuard>> locks);
 	void DeferDeltaCleanup(vector<string> statements);
 	void DeferUnusedSourceDeltaCleanup(const RefreshMetadata::DeltaSource &source);
 	// Helper-committed allocations must be reclaimed if the caller fails to publish ownership.
@@ -98,6 +150,8 @@ private:
 
 	mutex state_lock;
 	unique_ptr<MutationLockGuard> mutation_guard;
+	unordered_map<string, unique_ptr<SourceAdmissionGuard>> source_write_admissions;
+	unordered_map<string, unique_ptr<SourceAdmissionGuard>> source_publication_locks;
 	ClientContext &owner;
 	const void *mutation_owner;
 	vector<string> deferred_delta_cleanup;

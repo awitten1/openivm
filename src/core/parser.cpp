@@ -178,7 +178,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
                                                       string *metadata_catalog = nullptr,
                                                       string *metadata_schema = nullptr) {
 	// Allocation commits shared source deltas before the lifecycle program publishes
-	// ownership. Keep other CREATEs out of that interval, including explicit transactions.
+	// ownership. Keep other lifecycle operations out of that interval. Source-scoped
+	// publication locks below also exclude untracked writers of each native source.
 	// Native programs retain this gate until commit/rollback; the staged executor acquires
 	// its re-entrant guard before suspending the caller transaction.
 	TransactionalMVLockState::Get(context).AcquireMutationLock();
@@ -1393,9 +1394,15 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			continue;
 		}
 		const auto &source = source_entry.second;
+		TransactionalMVLockState::Get(context).AcquireSourcePublicationLock(source.catalog_name, source.schema_name,
+		                                                                    source.table_name);
 		SourceDeltaPlacement placement;
-		auto existing = RefreshMetadata::FindSourceDeltaForCreate(context, source.catalog_name, source.schema_name,
-		                                                          source.table_name);
+		auto existing = RefreshMetadata::FindSourceDeltaForMutation(context, source.catalog_name, source.schema_name,
+		                                                            source.table_name);
+		if (!existing && !context.transaction.IsAutoCommit()) {
+			TransactionalMVLockState::Get(context).VerifySourceSnapshot(source.catalog_name, source.schema_name,
+			                                                            source.table_name);
+		}
 		// Change capture looks for moved deltas only in native catalogs.
 		bool internal_relation = SqlUtils::IsDelta(source.table_name) ||
 		                         IncrementalTableNames::IsDataTable(source.table_name) ||
@@ -1966,9 +1973,58 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	return result;
 }
 
+// Bind only to discover sources, then start the autocommit write transaction
+// AFTER admission. Otherwise an untracked writer can commit while CREATE waits
+// for its source, leaving the initial load on a snapshot without that write.
+// Explicit transactions retain their snapshot and use the retry checks above.
+static void AdmitAutocommitCreateSources(ClientContext &context, MaterializedViewParseData &parse_data) {
+	if (!context.transaction.IsAutoCommit() || !parse_data.alter_sql.empty()) {
+		return;
+	}
+	auto &locks = TransactionalMVLockState::Get(context);
+	{
+		auto statement = parse_data.statement->Copy();
+		openivm::TimeTravelPins::Peel(context, *statement);
+		auto &select = *statement->Cast<CreateStatement>().info->Cast<CreateTableInfo>().query;
+		Planner planner(context);
+		planner.CreatePlan(select.Copy());
+		InlineCtesIfPresent(context, *planner.binder, planner.plan);
+		const auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+		auto current_catalog =
+		    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
+		auto facts = BuildCreateMVPlanFacts(planner.plan.get(), current_catalog);
+		for (const auto &entry : facts.source_table_info) {
+			if (!facts.ducklake_table_info.count(entry.first)) {
+				const auto &source = entry.second;
+				locks.AcquireSourcePublicationLock(source.catalog_name, source.schema_name, source.table_name);
+			}
+		}
+	}
+	auto publication_locks = locks.TakeSourcePublicationLocks();
+	if (publication_locks.empty()) {
+		return;
+	}
+	// No physical lifecycle step has run. Do not renew a caller transaction that
+	// has writes (for example if invoked from a containing maintenance program).
+	if (context.transaction.ActiveTransaction().ModifiedDatabase()) {
+		throw TransactionException("OpenIVM source admission requires an unwritten autocommit transaction");
+	}
+	auto query_id = context.transaction.GetActiveQuery();
+	// A read-only commit preserves the enclosing native planner's profiling state;
+	// TransactionContext::Rollback would reset it. The outer mutation guard and
+	// these source guards survive the transaction callbacks, so there is no gap.
+	context.transaction.Commit();
+	context.transaction.BeginTransaction();
+	context.transaction.SetActiveQuery(query_id);
+	locks.RestoreSourcePublicationLocks(std::move(publication_locks));
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Renewed autocommit snapshot after source admission\n");
+}
+
 ParserExtensionPlanResult
 MaterializedViewParserExtension::PlanFunction(ParserExtensionInfo *info, ClientContext &context,
                                               unique_ptr<ParserExtensionParseData> parse_data) {
+	MutationLockGuard admission_guard(context);
+	AdmitAutocommitCreateSources(context, dynamic_cast<MaterializedViewParseData &>(*parse_data));
 	auto lifecycle_info = make_shared_ptr<TransactionalDDLInfo>();
 	auto result = PlanMaterializedView(context, std::move(parse_data), lifecycle_info->view_key,
 	                                   &lifecycle_info->metadata_catalog, &lifecycle_info->metadata_schema);

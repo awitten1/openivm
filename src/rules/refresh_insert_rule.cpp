@@ -49,6 +49,8 @@ public:
 		OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] restoring %zu metadata snapshots\n", restore_sql.size());
 		try {
 			Connection con(*context.db);
+			TransactionalMVLockState::Get(*con.context)
+			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 			auto schema_result = con.Query("SET schema='" + string(DEFAULT_SCHEMA) + "'");
 			if (schema_result->HasError()) {
 				OPENIVM_DEBUG_PRINT("[TRANSACTIONAL DDL] metadata restore setup failed: %s\n",
@@ -152,13 +154,29 @@ static optional_ptr<TableCatalogEntry> TryGetTrackedDeltaTable(ClientContext &co
 	    table.catalog.GetCatalogType() == "ducklake") {
 		return nullptr;
 	}
-	// The delta may live in an internal schema (openivm_internal_schema).
+	// Reserve only this source while deciding whether capture is needed. First
+	// publication excludes untracked writers, without serializing independent DML.
+	auto &locks = TransactionalMVLockState::Get(context);
+	auto admission = locks.AcquireSourceWriteAdmission(table.catalog.GetName(), table.schema.name, table_name);
+	// Waiting does not advance the caller's metadata snapshot. Resolve committed
+	// ownership as well as its own writes, without adopting tables by name.
 	auto delta_table =
-	    RefreshMetadata::FindSourceDelta(context, table.catalog.GetName(), table.schema.name, table_name);
+	    RefreshMetadata::FindSourceDeltaForMutation(context, table.catalog.GetName(), table.schema.name, table_name);
 	if (!delta_table) {
+		locks.RetainSourceWriteAdmission(std::move(admission));
 		return nullptr;
 	}
-	return delta_table;
+	// CREATE holds the global gate before waiting for source admissions. Drop
+	// this temporary admission before waiting on that gate, then recheck because
+	// ownership may have changed in the gap. Prior untracked writes stay reserved.
+	admission.reset();
+	locks.AcquireMutationLock();
+	// Publication cannot start while this gate is held. Retain source admission
+	// again so committed writes remain known even if the final consumer later
+	// drops its delta before an older source snapshot attempts a new CREATE.
+	locks.RetainSourceWriteAdmission(
+	    locks.AcquireSourceWriteAdmission(table.catalog.GetName(), table.schema.name, table_name));
+	return RefreshMetadata::FindSourceDeltaForMutation(context, table.catalog.GetName(), table.schema.name, table_name);
 }
 
 static void ResolveInsertDefaults(OptimizerExtensionInput &input, LogicalInsert &insert) {
@@ -286,8 +304,8 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		// Resolve only the source's delta table in the caller transaction. Scanning
 		// information_schema touches unrelated external catalogs and can silently
 		// skip schema synchronization when one of them is unavailable.
-		auto delta_entry =
-		    RefreshMetadata::FindSourceDelta(input.context, source_locus.first, source_locus.second, table_name);
+		auto delta_entry = RefreshMetadata::FindSourceDeltaForMutation(input.context, source_locus.first,
+		                                                               source_locus.second, table_name);
 		if (!delta_entry) {
 			return; // not an IVM-tracked table
 		}

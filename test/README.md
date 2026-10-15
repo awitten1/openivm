@@ -18,6 +18,20 @@ ownership reuse, and refresh bag equality. `make test` builds and runs it throug
 `test_release_internal`; `make test_source_delta_publication` runs it on its own.
 Together with `test/sql/internal_schema.test` and
 `test/sql/internal_schema_ducklake.test`, it covers namespace lifecycle regressions.
+The native fixture also pauses first-view publication and synchronizes on actual
+source-admission waits for competing INSERT, DELETE and UPDATE batches. Colocated
+and dedicated schemas cover autocommit, an older explicit metadata snapshot,
+writer rollback, failed publication and retry of an invisible delta. The reverse
+ordering holds uncaptured source DML open before CREATE, so its initial load must
+use the snapshot established after that writer commits or rolls back.
+Independent untracked writers must commit while another transaction remains open,
+and an independent source must remain writable while CREATE retains publication
+admission. Nonconflicting append/update/delete batches on one untracked source
+also retain native writer concurrency. Equal bare names in different quoted schemas and catalogs exercise
+admission scope. Lock-order conflicts and first CREATE from a stale source
+snapshot require an explicit transaction retry; rollback must leave no partial
+writes. Each surviving MV captures another conflicting batch and is checked with
+bidirectional `EXCEPT ALL` after refresh.
 The DuckLake fixture also verifies snapshot-backed auxiliary refresh and repair
 for COUNT(DISTINCT), inner DISTINCT and filtered-group counts: repeated refreshes
 must not replay a consumed snapshot, unrelated lake snapshots permit repair, and
@@ -234,3 +248,15 @@ generated SQL for affected-key pushdown (native) or hybrid transition maintenanc
 (DuckLake), so bag equality cannot hide a lost maintenance path. Both sources
 receive conflicting INSERT/DELETE/UPDATE batches, including duplicate rows and
 NULL keys, with commit/rollback and bidirectional `EXCEPT ALL` checks before cleanup.
+
+Source-publication admission also distinguishes committed untracked writes from
+read-only helper commits and writes to a same-named table in another schema.
+Explicit first-MV creation with a pinned source snapshot must accept those
+unrelated commits and rolled-back source writes, while requesting a transaction
+retry for uncaptured committed source writes, including after waiting for a writer.
+A snapshot predating another consumer's ownership must still detect source commits
+after that consumer refreshes and drops its final delta; rollback keeps the source
+unchanged and permits allocation in another maintenance schema. Legacy-registry upgrade retains a
+pinned source snapshot through CREATE and commit/rollback. These cases run for
+colocated and dedicated maintenance schemas alongside the deterministic concurrent
+CREATE/DML and independent-writer cases; refreshes check both `EXCEPT ALL` directions.
