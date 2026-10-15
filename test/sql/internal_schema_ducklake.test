@@ -14,8 +14,11 @@ INSTALL ducklake;
 statement ok
 LOAD ducklake;
 
+# Keep the data root short: encoded maintenance names plus DuckLake's schema
+# UUID and parquet filename otherwise exceed Windows MAX_PATH in the CI tempdir.
+# Reuse this root after every restart so reopen still reads the same lake files.
 statement ok
-ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake, DATA_PATH '__TEST_DIR__/ns');
 
 statement ok
 SET openivm_metadata_schema = 'Control Space';
@@ -409,7 +412,7 @@ statement ok
 LOAD ducklake;
 
 statement ok
-ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake, DATA_PATH '__TEST_DIR__/ns');
 
 statement ok
 SET openivm_cascade_refresh = 'off';
@@ -652,7 +655,7 @@ statement ok
 LOAD ducklake;
 
 statement ok
-ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake, DATA_PATH '__TEST_DIR__/ns');
 
 statement ok
 SET openivm_cascade_refresh = 'off';
@@ -985,7 +988,7 @@ statement ok
 LOAD ducklake;
 
 statement ok
-ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake, DATA_PATH '__TEST_DIR__/ns');
 
 statement ok
 SET openivm_cascade_refresh = 'off';
@@ -1227,7 +1230,7 @@ restart
 
 statement ok
 LOAD ducklake;
-ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake, DATA_PATH '__TEST_DIR__/ns');
 SET openivm_cascade_refresh='off';
 SET openivm_internal_schema='';
 SET openivm_metadata_schema='';
@@ -1356,7 +1359,7 @@ restart
 
 statement ok
 LOAD ducklake;
-ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake);
+ATTACH '__TEST_DIR__/internal_schema_lake.db' AS dl (TYPE ducklake, DATA_PATH '__TEST_DIR__/ns');
 SET openivm_disable_daemon=true;
 SET openivm_cascade_refresh='downstream';
 INSERT INTO dl.main."Window Source" VALUES (1,40),(2,20),(4,50),(4,50);
