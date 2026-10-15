@@ -200,6 +200,12 @@ nothing has to be moved by hand:
 - DROP acquires that gate before resolving ownership or checking remaining
   consumers and retains it through cleanup and commit, including staged cleanup.
   A concurrent CREATE's newly published ownership therefore protects its delta.
+- View, source-table and schema CASCADE follow qualified physical dependencies
+  across every metadata catalog and remove descendants before their parents.
+  Source-delta cleanup excludes removed consumers by their metadata table and
+  view key, preserving unrelated consumers in other registries. Autocommit may
+  stage cross-catalog cleanup; explicit transactions retain native catalog-write
+  checks and rollback, rather than committing cleanup through a helper.
 - Replacement removes deltas of sources no longer used when no view in any
   metadata catalog consumes them. Native cleanup in the caller's catalog rolls
   back with replacement. Cleanup in another native catalog runs after commit,

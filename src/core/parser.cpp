@@ -2146,6 +2146,75 @@ static string ExecuteAutocommitDropProgram(Connection &con, const string &progra
 	return "SELECT true AS Success";
 }
 
+static void SelectDropMetadata(ClientContext &context, Connection &con, const string &catalog) {
+	RefreshMetadata::UseCatalog(context, con, catalog);
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		metadata_state->Apply(con);
+	}
+}
+
+static vector<string> DropMetadataCatalogs(ClientContext &context, Connection &con) {
+	auto catalogs = RefreshMetadata::MetadataCatalogs(con);
+	// Include every transaction-local registry, even if its schema is not yet
+	// discoverable from a helper's committed catalog snapshot.
+	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
+		for (auto &location : metadata_state->MetadataLocations()) {
+			if (std::find(catalogs.begin(), catalogs.end(), location.first) == catalogs.end()) {
+				catalogs.push_back(location.first);
+			}
+		}
+	}
+	return catalogs;
+}
+
+// Physical MV sources preserve catalog/schema identity across registries, unlike
+// a single registry's dependency edges. Return descendants before their parents.
+static vector<pair<string, string>> CollectTrackedViewDropOrder(ClientContext &context, Connection &con,
+                                                                const vector<string> &catalogs,
+                                                                const vector<pair<string, string>> &roots) {
+	vector<pair<string, string>> views;
+	unordered_set<string> seen;
+	std::function<void(const pair<string, string> &)> collect = [&](const pair<string, string> &view) {
+		SelectDropMetadata(context, con, view.first);
+		auto metadata_location = RefreshMetadata::CurrentLocation(con);
+		if (!seen.insert(SqlUtils::FullName(metadata_location.catalog_name, metadata_location.schema_name, view.second))
+		         .second) {
+			return;
+		}
+		auto internal = RefreshMetadata(con).GetInternalLocation(view.second);
+		string predicate;
+		for (auto &source : {SqlUtils::DeltaName(view.second), IncrementalTableNames::DataTableName(view.second),
+		                     PublishedViewName(view.second), SqlUtils::DeltaName(PublishedViewName(view.second))}) {
+			if (!predicate.empty()) {
+				predicate += " OR ";
+			}
+			predicate +=
+			    "(" + RefreshMetadata::SourcePredicate(source, internal.catalog_name, internal.schema_name) + ")";
+		}
+		vector<pair<string, string>> children;
+		for (auto &catalog : catalogs) {
+			SelectDropMetadata(context, con, catalog);
+			auto rows = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
+			                      predicate + " ORDER BY view_name");
+			if (rows->HasError()) {
+				throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view.second,
+				                       rows->GetError());
+			}
+			for (idx_t row = 0; row < rows->RowCount(); row++) {
+				children.emplace_back(catalog, rows->GetValue(0, row).ToString());
+			}
+		}
+		for (auto &child : children) {
+			collect(child);
+		}
+		views.push_back(view);
+	};
+	for (auto &root : roots) {
+		collect(root);
+	}
+	return views;
+}
+
 // TABLE CASCADE and SCHEMA CASCADE remove the same ownership closure. Build one
 // cleanup program before any physical drop, so shared source deltas are tested
 // against the complete set of removed consumers across metadata catalogs.
@@ -2208,30 +2277,15 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 	TransactionalMVLockState::Get(*con.context)
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	RefreshMetadata::UseCatalog(context, con, drop_info.catalog);
-	auto catalogs = RefreshMetadata::MetadataCatalogs(con);
-	// Include every transaction-local registry, even if its schema is not yet
-	// discoverable from a helper's committed catalog snapshot.
-	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
-		for (auto &location : metadata_state->MetadataLocations()) {
-			if (std::find(catalogs.begin(), catalogs.end(), location.first) == catalogs.end()) {
-				catalogs.push_back(location.first);
-			}
-		}
-	}
+	auto catalogs = DropMetadataCatalogs(context, con);
 	vector<pair<string, string>> roots;
 	vector<string> dependent_views;
 	vector<RefreshMetadata::DeltaSource> sources;
 	string program;
 	unordered_map<string, string> excluded_consumers;
 	bool staged_drop = false;
-	auto select_metadata = [&](const string &catalog) {
-		RefreshMetadata::UseCatalog(context, con, catalog);
-		if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
-			metadata_state->Apply(con);
-		}
-	};
 	for (auto &catalog : catalogs) {
-		select_metadata(catalog);
+		SelectDropMetadata(context, con, catalog);
 		if (schema_drop) {
 			auto namespace_matches = [&](const string &catalog_name, const string &schema_name) {
 				return StringUtil::CIEquals(catalog_name, drop_info.catalog) &&
@@ -2288,44 +2342,9 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 			roots.emplace_back(catalog, dependent_rows->GetValue(0, row).ToString());
 		}
 	}
-	// Follow physical MV sources in every metadata catalog. A child in another
-	// catalog reads the parent's maintenance schema, not its public schema, and
-	// would otherwise be invisible to a public-schema CASCADE.
-	unordered_set<string> seen;
-	std::function<void(const pair<string, string> &)> collect = [&](const pair<string, string> &view) {
-		select_metadata(view.first);
+	for (auto &view : CollectTrackedViewDropOrder(context, con, catalogs, roots)) {
+		SelectDropMetadata(context, con, view.first);
 		auto metadata_location = RefreshMetadata::CurrentLocation(con);
-		if (!seen.insert(SqlUtils::FullName(metadata_location.catalog_name, metadata_location.schema_name, view.second))
-		         .second) {
-			return;
-		}
-		auto internal = RefreshMetadata(con).GetInternalLocation(view.second);
-		string predicate;
-		for (auto &source : {SqlUtils::DeltaName(view.second), IncrementalTableNames::DataTableName(view.second),
-		                     PublishedViewName(view.second), SqlUtils::DeltaName(PublishedViewName(view.second))}) {
-			if (!predicate.empty()) {
-				predicate += " OR ";
-			}
-			predicate +=
-			    "(" + RefreshMetadata::SourcePredicate(source, internal.catalog_name, internal.schema_name) + ")";
-		}
-		vector<pair<string, string>> children;
-		for (auto &catalog : catalogs) {
-			select_metadata(catalog);
-			auto rows = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-			                      predicate + " ORDER BY view_name");
-			if (rows->HasError()) {
-				throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view.second,
-				                       rows->GetError());
-			}
-			for (idx_t row = 0; row < rows->RowCount(); row++) {
-				children.emplace_back(catalog, rows->GetValue(0, row).ToString());
-			}
-		}
-		for (auto &child : children) {
-			collect(child);
-		}
-		select_metadata(view.first);
 		RefreshMetadata metadata(con);
 		auto location = metadata.GetStoredViewLocation(view.second);
 		string local_program;
@@ -2342,9 +2361,6 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		staged_drop |= !StringUtil::CIEquals(view.first, drop_info.catalog) ||
 		               !StringUtil::CIEquals(location.catalog_name, drop_info.catalog) ||
 		               metadata.IsDuckLakeCatalog(location.catalog_name);
-	};
-	for (auto &root : roots) {
-		collect(root);
 	}
 	if (dependent_views.empty()) {
 		return drop_statement();
@@ -2467,49 +2483,54 @@ static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo 
 		}
 	}
 
-	RefreshMetadata metadata(con);
+	auto root_metadata_location = RefreshMetadata::CurrentLocation(con);
+	vector<pair<string, string>> drop_views = {{root_metadata_location.catalog_name, view_key}};
+	if (drop_info.cascade) {
+		drop_views = CollectTrackedViewDropOrder(context, con, DropMetadataCatalogs(context, con), drop_views);
+	}
 	program.clear();
 	vector<RefreshMetadata::DeltaSource> delta_sources;
-	vector<string> drop_views;
-	if (drop_info.cascade) {
-		drop_views = metadata.GetDownstreamViewsStrict(view_key);
-		std::reverse(drop_views.begin(), drop_views.end());
-	}
-	drop_views.push_back(view_key);
-	string excluded_views;
+	unordered_map<string, string> excluded_consumers;
 	bool staged_drop = false;
-	for (auto &view_name : drop_views) {
-		auto location = metadata.GetStoredViewLocation(view_name, catalog_name, schema_name);
-		staged_drop |= metadata.IsDuckLakeCatalog(location.catalog_name);
-		AppendTrackedViewDropProgram(context, metadata, view_name, location, program, delta_sources, drop_info.cascade,
-		                             view_name == view_key ? drop_info.if_not_found : OnEntryNotFound::RETURN_NULL);
-		if (!excluded_views.empty()) {
-			excluded_views += ", ";
+	for (auto &view : drop_views) {
+		SelectDropMetadata(context, con, view.first);
+		auto metadata_location = RefreshMetadata::CurrentLocation(con);
+		RefreshMetadata metadata(con);
+		auto location = metadata.GetStoredViewLocation(view.second, catalog_name, schema_name);
+		staged_drop |= !StringUtil::CIEquals(metadata_location.catalog_name, root_metadata_location.catalog_name) ||
+		               metadata.IsDuckLakeCatalog(location.catalog_name);
+		string local_program;
+		AppendTrackedViewDropProgram(context, metadata, view.second, location, local_program, delta_sources,
+		                             drop_info.cascade,
+		                             view.first == root_metadata_location.catalog_name && view.second == view_key
+		                                 ? drop_info.if_not_found
+		                                 : OnEntryNotFound::RETURN_NULL);
+		program += QualifyDropMetadata(local_program, metadata_location);
+		auto &excluded = excluded_consumers[RefreshMetadata::MetadataTable(con, openivm::DELTA_TABLES_TABLE)];
+		if (!excluded.empty()) {
+			excluded += ", ";
 		}
-		excluded_views += "'" + SqlUtils::EscapeValue(view_name) + "'";
+		excluded += Value(view.second).ToSQLString();
 	}
-	AppendUnusedSourceDropProgram(context, con, delta_sources, program,
-	                              {{RefreshMetadata::MetadataTable(con, openivm::DELTA_TABLES_TABLE), excluded_views}});
+	AppendUnusedSourceDropProgram(context, con, delta_sources, program, excluded_consumers);
 	for (auto &source : delta_sources) {
 		staged_drop |= !StringUtil::CIEquals(source.catalog_name, catalog_name);
 	}
-	// Keep metadata ownership explicit: the staged executor uses a fresh connection and
-	// the caller's search path need not include the metadata schema.
-	auto metadata_location = RefreshMetadata::CurrentLocation(con);
-	if (staged_drop) {
-		program = QualifyDropMetadata(program, metadata_location);
-		OPENIVM_DEBUG_PRINT("[DROP] Staging DuckLake view and native metadata cleanup for '%s'\n",
-		                    drop_info.name.c_str());
+	OPENIVM_DEBUG_PRINT("[DROP] Compiled view cleanup for '%s', views=%zu, staged=%d\n", drop_info.name.c_str(),
+	                    drop_views.size(), staged_drop);
+	// An explicit transaction must retain its own writes and native catalog-write
+	// checks, just as source/schema cleanup does. A helper would commit outside it.
+	if (staged_drop && context.transaction.IsAutoCommit()) {
 		ExecuteStagedDDL(context, {Value(program)});
 		return "SELECT true AS Success";
 	}
-	// Replay retains this location before redirecting it to helper-local shadows.
+	// Each mutation retains its registry before helper-local replay shadows it.
 	auto &state = TransactionalMVMetadataState::Get(context);
-	state.RegisterSQL(QualifyDropMetadata(program, metadata_location), view_key);
-	for (auto &view_name : drop_views) {
-		state.RegisterViewDrop(view_name);
+	state.RegisterSQL(program, view_key);
+	for (auto &view : drop_views) {
+		state.RegisterViewDrop(view.second);
 	}
-	return QualifyDropMetadata(program, metadata_location);
+	return program;
 }
 
 // Unlike pragma preprocessing, post-bind runs when this particular statement

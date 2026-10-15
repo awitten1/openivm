@@ -138,6 +138,15 @@ fixture also drops public/source schemas through staged native-metadata cleanup,
 retains a shared native source delta for a lake sibling, and removes it with the
 final public namespace.
 
+Parent-first view CASCADE uses the same cross-registry dependency closure, including
+a child in another native catalog and a grandchild back in the parent's catalog.
+Direct and quoted/commented batch cases cover local replacement replay and
+commit/rollback. Native and DuckLake cases retain unrelated same-named consumers
+and shared source deltas, then check conflicting batched DML with bidirectional
+bag equality and final-consumer cleanup. Explicit cross-native-catalog CASCADE
+retains DuckDB's write restriction; rollback restores any preceding local cleanup
+and replacement, and every restored view still captures conflicting source DML.
+
 Unicode CASCADE cases keep `"Ä".items` and `"ä".items`, plus same-named MVs,
 distinct with separate metadata and maintenance schemas. Replacement followed by
 direct or mixed-batch CASCADE covers autocommit, explicit commit/rollback, and

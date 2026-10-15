@@ -1504,6 +1504,141 @@ static void TestCrossCatalogPublicationConsumers(bool commit) {
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
 }
 
+// Drop the parent first, including descendants whose ownership lives in another
+// registry and a grandchild back in the parent's catalog. Equal SQL names and
+// shared base sources must not pull unrelated consumers into that closure.
+static void TestViewCascade(bool cross_catalog, bool explicit_transaction, bool commit, bool batched_drop) {
+	std::cerr << "CASE view cascade cross_catalog=" << cross_catalog << " explicit_transaction=" << explicit_transaction
+	          << " commit=" << commit << " batched_drop=" << batched_drop << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db), helper(db);
+	const string child_catalog = cross_catalog ? "Consumer.Catalog" : "memory";
+	const string parent = "memory.\"Parent.Space\".\"Same;MV\"";
+	const string child = SqlUtils::FullName(child_catalog, "Child.Space", "Child;MV");
+	const string grandchild = "memory.\"Child.Space\".\"Grand;MV\"";
+	const string source = "memory.main.source";
+	const string child_source = SqlUtils::FullName(child_catalog, "Child.Space", "source");
+	const string sibling = "memory.\"Keep.Space\".\"Same;MV\"";
+	const string child_sibling = SqlUtils::FullName(child_catalog, "Keep.Space", "Same;MV");
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Parent.Space\"; CREATE SCHEMA \"Keep.Space\"; CREATE SCHEMA \"Child.Space\"; "
+	               "CREATE TABLE main.source(i INTEGER); INSERT INTO main.source VALUES (1),(1),(2); "
+	               "CREATE MATERIALIZED VIEW " +
+	                   parent + " AS SELECT * FROM " + source + "; CREATE MATERIALIZED VIEW " + sibling +
+	                   " AS SELECT * FROM " + source + ";");
+	if (cross_catalog) {
+		Execute(owner, "ATTACH ':memory:' AS \"Consumer.Catalog\"; "
+		               "CREATE SCHEMA \"Consumer.Catalog\".\"Child.Space\"; "
+		               "CREATE SCHEMA \"Consumer.Catalog\".\"Keep.Space\";");
+	}
+	// For the local case use another schema so the two unrelated siblings also
+	// retain the same SQL name without sharing a physical identity.
+	const string other_sibling = cross_catalog ? child_sibling : "memory.\"Child.Space\".\"Same;MV\"";
+	Execute(owner, "CREATE TABLE " + child_source + "(i INTEGER); INSERT INTO " + child_source +
+	                   " VALUES (1),(1),(2); CREATE MATERIALIZED VIEW " + child + " AS SELECT p.i FROM " + parent +
+	                   " p JOIN " + child_source + " s USING(i); CREATE MATERIALIZED VIEW " + grandchild +
+	                   " AS SELECT * FROM " + child + "; CREATE MATERIALIZED VIEW " + other_sibling +
+	                   " AS SELECT * FROM " + child_source + ";");
+	const vector<string> catalogs =
+	    cross_catalog ? vector<string> {"memory", child_catalog} : vector<string> {"memory"};
+	const vector<string> removed_names = {"Same;MV", "Child;MV", "Grand;MV"};
+	const vector<string> removed_schemas = {"Parent.Space", "Child.Space", "Child.Space"};
+	const vector<string> removed_catalogs = {"memory", child_catalog, "memory"};
+	string owned_predicate;
+	for (idx_t index = 0; index < removed_names.size(); index++) {
+		RefreshMetadata::UseCatalog(*owner.context, helper, removed_catalogs[index]);
+		RefreshMetadata metadata(helper);
+		auto key = metadata.FindViewKey(removed_catalogs[index], removed_schemas[index], removed_names[index]);
+		if (key.empty()) {
+			throw InvalidInputException("View CASCADE fixture is missing registered ownership");
+		}
+		for (const auto &name : {IncrementalTableNames::DataTableName(key), PublishedViewName(key),
+		                         SqlUtils::DeltaName(key), SqlUtils::DeltaName(PublishedViewName(key))}) {
+			if (!owned_predicate.empty()) {
+				owned_predicate += " OR ";
+			}
+			owned_predicate += "(database_name=" + Value(removed_catalogs[index]).ToSQLString() +
+			                   " AND schema_name='Internal Space' AND table_name=" + Value(name).ToSQLString() + ")";
+		}
+	}
+	auto owned_query = "SELECT database_name, schema_name, table_name FROM duckdb_tables() WHERE " + owned_predicate;
+	auto original = owner.Query(owned_query);
+	if (original->HasError() || original->RowCount() == 0) {
+		throw InvalidInputException("View CASCADE fixture is missing maintenance tables");
+	}
+	const auto original_count = original->RowCount();
+	Execute(owner, "USE " + SqlUtils::QuoteIdentifier(child_catalog) + ".\"Control.Space\";");
+	if (explicit_transaction) {
+		// Replay replacement ownership before following the physical descendants.
+		Execute(owner, "BEGIN; CREATE OR REPLACE MATERIALIZED VIEW " + parent + " AS SELECT * FROM " + source + ";");
+	}
+	const string drop = "DROP VIEW " + parent + " CASCADE;";
+	const string drop_sql = batched_drop ? "SELECT 'before;drop'; /* parent; first */ " + drop + " SELECT 1;" : drop;
+	if (cross_catalog && explicit_transaction) {
+		// The grandchild's local DROP precedes the cross-catalog write. Neither
+		// that partial program nor replacement may escape the caller's rollback.
+		auto result = owner.Query(drop_sql);
+		if (!result->HasError() ||
+		    result->GetError().find("single transaction can only write to a single attached database") ==
+		        string::npos) {
+			throw InvalidInputException("Cross-catalog CASCADE bypassed the caller's native transaction boundary");
+		}
+		Execute(owner, "ROLLBACK;");
+	} else {
+		Execute(owner, drop_sql);
+		Execute(owner, "SELECT CASE WHEN NOT EXISTS (" + owned_query +
+		                   ") THEN true ELSE error('Parent CASCADE leaked descendant maintenance tables') END;");
+		for (const auto &catalog : catalogs) {
+			const auto prefix = SqlUtils::QualifiedPrefix(catalog, "Control.Space");
+			Execute(
+			    owner,
+			    "SELECT CASE WHEN (SELECT count(*) FROM " + prefix +
+			        "openivm_views)=" + to_string(cross_catalog ? 1 : 2) + " AND NOT EXISTS (SELECT 1 FROM " + prefix +
+			        "openivm_delta_tables WHERE view_name NOT IN (SELECT view_name FROM " + prefix +
+			        "openivm_views)) THEN true ELSE error('Parent CASCADE leaked or removed registry ownership') END;");
+		}
+		for (idx_t index = 0; index < removed_names.size(); index++) {
+			Execute(owner,
+			        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Parent CASCADE left a public descendant') END "
+			        "FROM duckdb_views() WHERE database_name=" +
+			            Value(removed_catalogs[index]).ToSQLString() +
+			            " AND schema_name=" + Value(removed_schemas[index]).ToSQLString() +
+			            " AND view_name=" + Value(removed_names[index]).ToSQLString() + ";");
+		}
+		if (explicit_transaction) {
+			Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+		}
+	}
+	const bool retained = explicit_transaction && (cross_catalog || !commit);
+	Execute(owner, "SELECT CASE WHEN (SELECT count(*) FROM (" + owned_query +
+	                   "))=" + to_string(retained ? original_count : 0) +
+	                   " THEN true ELSE error('Parent CASCADE commit/rollback lost maintenance tables') END;");
+	for (const auto &table : {source, child_source}) {
+		Execute(owner, "INSERT INTO " + table + " VALUES (1),(2),(3),(3); DELETE FROM " + table +
+		                   " WHERE i=1; UPDATE " + table + " SET i=4 WHERE i=2; INSERT INTO " + table +
+		                   " VALUES (1),(4),(5); DELETE FROM " + table + " WHERE i=5; UPDATE " + table +
+		                   " SET i=2 WHERE i=4;");
+	}
+	RefreshAndCheckBag(owner, sibling, "SELECT * FROM " + source);
+	RefreshAndCheckBag(owner, other_sibling, "SELECT * FROM " + child_source);
+	if (retained) {
+		RefreshAndCheckBag(owner, parent, "SELECT * FROM " + source);
+		RefreshAndCheckBag(owner, child, "SELECT p.i FROM " + source + " p JOIN " + child_source + " s USING(i)");
+		RefreshAndCheckBag(owner, grandchild, "SELECT p.i FROM " + source + " p JOIN " + child_source + " s USING(i)");
+		Execute(owner, drop);
+	}
+	Execute(owner, "DROP VIEW " + sibling + "; DROP VIEW " + other_sibling + ";");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('View CASCADE final-consumer cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+	for (const auto &catalog : catalogs) {
+		const auto prefix = SqlUtils::QualifiedPrefix(catalog, "Control.Space");
+		Execute(owner, "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM " + prefix +
+		                   "openivm_views) AND NOT EXISTS (SELECT 1 FROM " + prefix +
+		                   "openivm_delta_tables) THEN true ELSE error('View CASCADE final ownership leaked') END;");
+	}
+}
+
 static void TestPublicationOwnerReplay(bool commit) {
 	std::cerr << "CASE publication owner replay commit=" << commit << std::endl;
 	DuckDB db(nullptr);
@@ -2876,6 +3011,13 @@ int main(int argc, char **argv) {
 		TestPublicationOwnerCleanup(false, false, true, true);
 		TestCrossCatalogPublicationConsumers(false);
 		TestCrossCatalogPublicationConsumers(true);
+		for (bool batched_drop : {false, true}) {
+			TestViewCascade(false, false, true, batched_drop);
+			TestViewCascade(true, false, true, batched_drop);
+			TestViewCascade(false, true, true, batched_drop);
+			TestViewCascade(false, true, false, batched_drop);
+			TestViewCascade(true, true, false, batched_drop);
+		}
 		TestPublicationOwnerReplay(false);
 		TestPublicationOwnerReplay(true);
 		TestDeltaOwnershipSearchPath(false);
