@@ -1289,6 +1289,28 @@ SELECT count(*) FROM openivm_delta_tx_atomic_src;
 ----
 8
 
+# Check failures while all eight committed deltas are still pending. Refreshing
+# first would consume them and would no longer test preservation of pending rows.
+statement error
+INSERT INTO tx_atomic_src VALUES (1, 9, 999);
+----
+Duplicate key
+
+query I
+SELECT count(*) FROM openivm_delta_tx_atomic_src;
+----
+8
+
+statement error
+UPDATE tx_atomic_src SET v = NULL WHERE id = 1;
+----
+NOT NULL
+
+query I
+SELECT count(*) FROM openivm_delta_tx_atomic_src;
+----
+8
+
 statement ok
 PRAGMA refresh('tx_atomic_mv');
 
@@ -1310,12 +1332,22 @@ SELECT count(*) FROM (
 ----
 0
 
-# Constraint failures happen after the capture operator has seen input, so these prove
-# that both writes are part of the same transaction and roll back together.
+# The only consumer has refreshed, so its consumed deltas must be gone.
+query I
+SELECT count(*) FROM openivm_delta_tx_atomic_src;
+----
+0
+
+# Repeat with an empty delta table: constraint failures must leave no captured rows.
 statement error
 INSERT INTO tx_atomic_src VALUES (1, 9, 999);
 ----
 Duplicate key
+
+query I
+SELECT count(*) FROM openivm_delta_tx_atomic_src;
+----
+0
 
 statement error
 UPDATE tx_atomic_src SET v = NULL WHERE id = 1;
@@ -1325,7 +1357,7 @@ NOT NULL
 query I
 SELECT count(*) FROM openivm_delta_tx_atomic_src;
 ----
-8
+0
 
 statement ok
 PRAGMA refresh('tx_atomic_mv');
