@@ -72,6 +72,14 @@ competing DROP actually blocks on the mutation gate, then publishes the new view
 before allowing DROP to proceed. Native autocommit, explicit-transaction, and
 cross-catalog staged cleanup must preserve the surviving delta, capture batched
 INSERT/DELETE/UPDATE operations, and refresh to full bag equality in both directions.
+The reverse ordering pins a read-only transaction's metadata and source snapshots,
+then commits the final owner's DROP on another connection. CREATE must require a
+transaction retry instead of adopting the removed delta, including when another
+committed CREATE has reused the exact physical name. The matrix covers colocated
+and dedicated internal schemas, separate source/metadata catalogs, quoted names
+and a non-default search path. After rollback and retry, every surviving MV must
+capture conflicting batched writes and refresh to bidirectional bag equality;
+dropping the final owner must reclaim the delta.
 
 `internal_schema.test` also replaces and drops one of two committed, independent
 views sharing a source within an explicit transaction. With separate metadata and

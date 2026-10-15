@@ -780,6 +780,86 @@ static void RefreshAndCheckBag(Connection &owner, const string &view, const stri
 	                   ") THEN error('Publication owner survivor bag mismatch') ELSE true END;");
 }
 
+static void TestCreateAfterCommittedDeltaRemoval(bool dedicated_schema, bool peer_view, bool republished) {
+	std::cerr << "CASE CREATE after committed delta removal dedicated_schema=" << dedicated_schema
+	          << " peer_view=" << peer_view << " republished=" << republished << std::endl;
+	DuckDB db(nullptr);
+	Connection creator(db), dropper(db), observer(db);
+	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	                 "SET openivm_metadata_schema='Control.Space'; CREATE SCHEMA \"Source.Space\"; "
+	                 "CREATE TABLE \"Source.Space\".\"Items;Name\"(i INTEGER); "
+	                 "INSERT INTO \"Source.Space\".\"Items;Name\" VALUES (1),(1),(2); "
+	                 "ATTACH ':memory:' AS peer;");
+	const string view_catalog = peer_view ? "peer" : "memory";
+	const string view_prefix = SqlUtils::QualifiedPrefix(view_catalog, "View.Space");
+	const string original = view_prefix + "\"Owner;Name\"";
+	const string retried = view_prefix + "\"Retry;Name\"";
+	const string source = "memory.\"Source.Space\".\"Items;Name\"";
+	const string delta_schema = dedicated_schema ? "Internal Space" : "Source.Space";
+	const string delta_name = RefreshMetadata::SourceDeltaTableName("Source.Space", "Items;Name", delta_schema);
+	const string delta = SqlUtils::FullName("memory", delta_schema, delta_name);
+	const string physical_delta =
+	    " FROM duckdb_tables() WHERE database_name='memory' AND schema_name=" + Value(delta_schema).ToSQLString() +
+	    " AND table_name=" + Value(delta_name).ToSQLString();
+	const string registry = SqlUtils::FullName(view_catalog, "Control.Space", openivm::DELTA_TABLES_TABLE);
+	for (auto *con : {&creator, &dropper}) {
+		Execute(*con, "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema=" +
+		                  Value(dedicated_schema ? "Internal Space" : "").ToSQLString() + ";");
+	}
+	Execute(dropper, "CREATE SCHEMA " + SqlUtils::QuoteIdentifier(view_catalog) +
+	                     ".\"View.Space\"; "
+	                     "CREATE MATERIALIZED VIEW " +
+	                     original + " AS SELECT * FROM " + source + ";");
+	Execute(creator, "USE " + SqlUtils::QuoteIdentifier(view_catalog) + ".\"Control.Space\"; BEGIN;");
+	// Pin both the metadata and source-catalog snapshots before the final DROP.
+	// No gate is held by this read-only transaction, so DROP commits first.
+	Execute(creator, "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Missing initial delta owner') END FROM " +
+	                     registry + "; SELECT * FROM " + delta + ";");
+	Execute(dropper, "DROP VIEW " + original + ";");
+	Execute(creator, "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Caller did not retain old ownership snapshot') "
+	                 "END FROM " +
+	                     registry + "; SELECT * FROM " + delta + ";");
+	Execute(observer,
+	        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Final DROP retained delta') END" + physical_delta + ";");
+	if (republished) {
+		// Reuse the exact physical name, so checking names alone cannot detect
+		// that the caller would publish the previous allocation's catalog entry.
+		Execute(dropper, "CREATE MATERIALIZED VIEW " + original + " AS SELECT * FROM " + source + ";");
+		Execute(observer,
+		        "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Delta was not recreated at same name') END" +
+		            physical_delta + ";");
+	}
+	auto failed = creator.Query("CREATE MATERIALIZED VIEW " + retried + " AS SELECT * FROM " + source + ";");
+	if (!failed->HasError() || failed->GetError().find("retry the transaction") == string::npos ||
+	    failed->GetError().find("OpenIVM source delta") == string::npos) {
+		throw InvalidInputException("Stale CREATE must reject the removed delta with a transaction retry: %s",
+		                            failed->HasError() ? failed->GetError() : "CREATE succeeded");
+	}
+	Execute(creator, "ROLLBACK;");
+	Execute(observer, "SELECT CASE WHEN count(*)=" + string(republished ? "1" : "0") +
+	                      " THEN true ELSE error('Failed CREATE published stale ownership') END FROM " + registry +
+	                      ";");
+	Execute(creator, "CREATE MATERIALIZED VIEW " + retried + " AS SELECT * FROM " + source + ";");
+	Execute(observer, "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Retry allocated duplicate deltas') END" +
+	                      physical_delta + ";");
+	Execute(observer, "INSERT INTO " + source + " VALUES (1),(2),(3),(3); DELETE FROM " + source +
+	                      " WHERE i=1; UPDATE " + source + " SET i=4 WHERE i=2; INSERT INTO " + source +
+	                      " VALUES (5),(5); DELETE FROM " + source + " WHERE i=5;");
+	Execute(observer, "SELECT CASE WHEN count(*)>0 THEN true ELSE error('Retry delta missed batched DML') END FROM " +
+	                      delta + ";");
+	for (const auto &view : republished ? vector<string> {original, retried} : vector<string> {retried}) {
+		RefreshAndCheckBag(creator, view, "SELECT * FROM " + source);
+	}
+	Execute(creator, "DROP VIEW " + retried + ";");
+	if (republished) {
+		Execute(observer, "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Retry DROP removed sibling delta') END" +
+		                      physical_delta + ";");
+		Execute(dropper, "DROP VIEW " + original + ";");
+	}
+	Execute(observer, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Retry final DROP leaked delta') END" +
+	                      physical_delta + ";");
+}
+
 static void TestMetadataQueryText(bool explicit_transaction, bool commit) {
 	std::cerr << "CASE metadata qualification preserves query text explicit_transaction=" << explicit_transaction
 	          << " commit=" << commit << std::endl;
@@ -2368,6 +2448,12 @@ int main(int argc, char **argv) {
 		}
 		TestPublication(false);
 		TestPublication(true);
+		for (bool dedicated_schema : {false, true}) {
+			for (bool peer_view : {false, true}) {
+				TestCreateAfterCommittedDeltaRemoval(dedicated_schema, peer_view, false);
+				TestCreateAfterCommittedDeltaRemoval(dedicated_schema, peer_view, true);
+			}
+		}
 		TestDropDuringPublication(false, false);
 		TestDropDuringPublication(true, false);
 		TestDropDuringPublication(false, true);

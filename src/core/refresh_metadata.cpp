@@ -848,6 +848,14 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForCreate(Client
 	committed.context->RunFunctionInTransaction([&]() {
 		auto existing = FindSourceDelta(*committed.context, catalog, schema, table);
 		if (!existing) {
+			// Caller-created native deltas have no committed ownership yet. A
+			// committed delta visible only in the caller's old snapshot instead
+			// lost its final owner: publishing it would reference a dropped table.
+			if (local && local->catalog.IsDuckCatalog() &&
+			    local->timestamp != DuckTransaction::Get(context, local->catalog).transaction_id) {
+				throw TransactionException("OpenIVM source delta ownership changed for '%s'; retry the transaction",
+				                           SqlUtils::FullName(catalog, schema, table));
+			}
 			return;
 		}
 		// A prior DROP/REPLACE in this transaction may have removed the last
@@ -868,7 +876,10 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForCreate(Client
 		// Return an entry belonging to the caller's transaction, never the helper's.
 		delta = Catalog::GetEntry<TableCatalogEntry>(context, catalog, existing->schema.name, existing->name,
 		                                             OnEntryNotFound::RETURN_NULL);
-		if (!delta) {
+		// A concurrent DROP/recreate may use the same physical name. Reject the
+		// old allocation, while retaining catalog changes made by this caller.
+		if (!delta || (delta->catalog.IsDuckCatalog() && delta->oid != existing->oid &&
+		               delta->timestamp != DuckTransaction::Get(context, delta->catalog).transaction_id)) {
 			throw TransactionException("OpenIVM source delta for '%s' is not visible; retry the transaction",
 			                           SqlUtils::FullName(catalog, schema, table));
 		}
