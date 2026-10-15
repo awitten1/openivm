@@ -338,10 +338,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (StringUtil::CIEquals(internal_schema, view_target_schema)) {
 		internal_schema.clear();
 	}
-	string internal_catalog_prefix =
-	    internal_schema.empty() ? view_catalog_prefix : SqlUtils::QualifiedPrefix(view_target_catalog, internal_schema);
 	string internal_target_catalog = view_target_catalog;
 	string internal_target_schema = internal_schema.empty() ? view_target_schema : internal_schema;
+	// Publication and cleanup discover consumers across metadata catalogs from
+	// the physical identity, even when the MV and metadata share the caller's schema.
+	string internal_catalog_prefix = SqlUtils::QualifiedPrefix(internal_target_catalog, internal_target_schema);
 	if (context.transaction.IsAutoCommit() && !internal_schema.empty() &&
 	    StringUtil::CIEquals(view_target_catalog, default_db)) {
 		// Shared source-delta allocation may create this same schema on a helper.

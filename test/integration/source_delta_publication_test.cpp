@@ -1578,22 +1578,27 @@ static void TestPublicationOwnerCleanup(bool cross_catalog, bool replace, bool e
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
 }
 
-static void TestCrossCatalogPublicationConsumers(bool commit) {
-	std::cerr << "CASE cross-catalog publication consumers replacement_commit=" << commit << std::endl;
+static void TestCrossCatalogPublicationConsumers(bool commit, const string &internal_schema, bool unqualified_parent) {
+	std::cerr << "CASE cross-catalog publication consumers replacement_commit=" << commit
+	          << " internal_schema=" << internal_schema << " unqualified_parent=" << unqualified_parent << std::endl;
 	DuckDB db(nullptr);
 	Connection owner(db);
 	const string source = "memory.\"Source.Space\".items";
 	const string replacement = "memory.\"Other.Source\".items";
-	const string parent = "memory.\"Parent.Space\".\"Parent;MV\"";
+	const string parent =
+	    SqlUtils::FullName("memory", unqualified_parent ? "Control.Space" : "Parent.Space", "Parent;MV");
+	const string parent_target = unqualified_parent ? "\"Parent;MV\"" : parent;
 	const string fast = "\"Consumer.Catalog\".\"Child.Space\".\"Fast;MV\"";
 	const string slow = "\"Consumer.Catalog\".\"Other.Child\".\"Slow;MV\"";
 	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
-	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
-	               "CREATE SCHEMA \"Source.Space\"; CREATE SCHEMA \"Other.Source\"; "
-	               "CREATE SCHEMA \"Parent.Space\"; CREATE TABLE " +
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema=" +
+	                   Value(internal_schema).ToSQLString() +
+	                   "; CREATE SCHEMA \"Source.Space\"; CREATE SCHEMA \"Other.Source\"; "
+	                   "CREATE SCHEMA \"Parent.Space\"; CREATE SCHEMA \"Control.Space\"; CREATE TABLE " +
 	                   source + "(i INTEGER); CREATE TABLE " + replacement + "(i INTEGER); INSERT INTO " + source +
-	                   " VALUES (1),(1),(2); INSERT INTO " + replacement +
-	                   " VALUES (20),(20),(30); CREATE MATERIALIZED VIEW " + parent + " AS SELECT * FROM " + source +
+	                   " VALUES (1),(1),(2); INSERT INTO " + replacement + " VALUES (20),(20),(30); " +
+	                   (unqualified_parent ? "USE memory.\"Control.Space\"; " : "") + "CREATE MATERIALIZED VIEW " +
+	                   parent_target + " AS SELECT * FROM " + source +
 	                   "; ATTACH ':memory:' AS \"Consumer.Catalog\"; "
 	                   "CREATE SCHEMA \"Consumer.Catalog\".\"Child.Space\"; "
 	                   "CREATE SCHEMA \"Consumer.Catalog\".\"Other.Child\"; CREATE MATERIALIZED VIEW " +
@@ -1612,7 +1617,11 @@ static void TestCrossCatalogPublicationConsumers(bool commit) {
 	RefreshAndCheckBag(owner, slow, "SELECT * FROM " + parent);
 	// Replacement must retain the parent's publication and emit its signed diff
 	// for consumers in another metadata catalog. Rollback must retain the old source.
-	Execute(owner, "BEGIN; CREATE OR REPLACE MATERIALIZED VIEW " + parent + " AS SELECT * FROM " + replacement + ";");
+	if (unqualified_parent) {
+		Execute(owner, "USE memory.\"Control.Space\";");
+	}
+	Execute(owner,
+	        "BEGIN; CREATE OR REPLACE MATERIALIZED VIEW " + parent_target + " AS SELECT * FROM " + replacement + ";");
 	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
 	const auto &active_source = commit ? replacement : source;
 	RefreshAndCheckBag(owner, fast, "SELECT * FROM " + active_source);
@@ -1626,6 +1635,10 @@ static void TestCrossCatalogPublicationConsumers(bool commit) {
 	Execute(owner, "DROP VIEW " + fast + "; DROP VIEW " + slow + "; DROP VIEW " + parent + ";");
 	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Cross-catalog publication cleanup leaked') END "
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Cross-catalog publication cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE starts_with(table_name, 'openivm_data_') "
+	               "OR starts_with(table_name, 'openivm_visible_') "
+	               "OR (starts_with(table_name, 'openivm_delta_') AND table_name <> 'openivm_delta_tables');");
 }
 
 // Drop the parent first, including descendants whose ownership lives in another
@@ -3133,8 +3146,12 @@ int main(int argc, char **argv) {
 		}
 		TestPublicationOwnerCleanup(false, false, true, false);
 		TestPublicationOwnerCleanup(false, false, true, true);
-		TestCrossCatalogPublicationConsumers(false);
-		TestCrossCatalogPublicationConsumers(true);
+		for (bool commit : {false, true}) {
+			TestCrossCatalogPublicationConsumers(commit, "Internal Space", false);
+			for (const auto &internal_schema : vector<string> {"", "Control.Space", "Internal Space"}) {
+				TestCrossCatalogPublicationConsumers(commit, internal_schema, true);
+			}
+		}
 		for (bool batched_drop : {false, true}) {
 			TestViewCascade(false, false, true, batched_drop);
 			TestViewCascade(true, false, true, batched_drop);

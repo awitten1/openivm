@@ -224,6 +224,8 @@ nothing has to be moved by hand:
   the same qualified source identity and consumer watermarks as cleanup. A slower
   consumer keeps its pending deltas when another consumer refreshes. Replacement
   also discovers consumers across catalogs before preserving publication state.
+  Generated internal targets always include their catalog and schema, including
+  for unqualified MVs created in the caller's control-metadata schema.
 
 An MV in an external catalog other than DuckLake keeps its internal objects in the
 `main` schema of the native frontend database, never in the metadata schema.
