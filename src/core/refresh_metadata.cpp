@@ -18,6 +18,7 @@
 #include "rules/column_hider.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/main/appender.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
@@ -123,6 +124,52 @@ string PreferredMetadataSchema(ClientContext &context, const string &catalog) {
 	return RefreshMetadata::ConfiguredMetadataSchema(context);
 }
 
+string SelectMetadataSchema(const vector<string> &schemas, const string &catalog, const string &preferred) {
+	for (auto &schema : schemas) {
+		if (StringUtil::CIEquals(schema, preferred)) {
+			return schema;
+		}
+	}
+	if (schemas.size() > 1) {
+		throw CatalogException("OpenIVM metadata exists in schemas %s of catalog '%s'; set openivm_metadata_schema "
+		                       "to the schema that should hold it",
+		                       StringUtil::Join(schemas, ", "), catalog);
+	}
+	if (schemas.size() == 1) {
+		// Existing metadata stays authoritative until PrepareMetadataSchema moves it.
+		return schemas[0];
+	}
+	return preferred.empty() ? string(DEFAULT_SCHEMA) : preferred;
+}
+
+vector<string> TransactionMetadataSchemas(ClientContext &context, const string &catalog_name) {
+	vector<string> schemas;
+	if (context.transaction.IsAutoCommit() || !context.transaction.HasActiveTransaction()) {
+		return schemas;
+	}
+	// Replay already pins the location used by this transaction's lifecycle statements.
+	// A changed setting must not send later reads or writes to a second registry.
+	if (auto state = TransactionalMVMetadataState::TryGet(context)) {
+		for (auto &location : state->MetadataLocations()) {
+			if (StringUtil::CIEquals(location.first, catalog_name)) {
+				schemas.push_back(location.second);
+			}
+		}
+	}
+	if (schemas.empty()) {
+		// The caller can also see metadata created without a replay record. A fresh
+		// helper cannot discover these uncommitted schemas or registry tables.
+		auto &catalog = Catalog::GetCatalog(context, catalog_name);
+		for (auto &schema : CatalogSchemas(context, catalog)) {
+			if (catalog.GetEntry<TableCatalogEntry>(context, schema, openivm::VIEWS_TABLE,
+			                                        OnEntryNotFound::RETURN_NULL)) {
+				schemas.push_back(schema);
+			}
+		}
+	}
+	return schemas;
+}
+
 // Compilation may USE the source schema after selecting its metadata location.
 // Ownership reads must retain that location, including its transaction replay.
 string MetadataOwnershipTable(Connection &con, const string &table) {
@@ -201,27 +248,15 @@ vector<string> RefreshMetadata::FindMetadataSchemas(Connection &con, const strin
 }
 
 string RefreshMetadata::ResolveMetadataSchema(Connection &con, const string &catalog, const string &preferred) {
-	auto schemas = FindMetadataSchemas(con, catalog, openivm::VIEWS_TABLE);
-	for (auto &schema : schemas) {
-		if (StringUtil::CIEquals(schema, preferred)) {
-			return schema;
-		}
-	}
-	if (schemas.size() > 1) {
-		throw CatalogException("OpenIVM metadata exists in schemas %s of catalog '%s'; set openivm_metadata_schema "
-		                       "to the schema that should hold it",
-		                       StringUtil::Join(schemas, ", "), catalog);
-	}
-	if (schemas.size() == 1) {
-		// Existing metadata stays authoritative until PrepareMetadataSchema moves it.
-		return schemas[0];
-	}
-	return preferred.empty() ? string(DEFAULT_SCHEMA) : preferred;
+	return SelectMetadataSchema(FindMetadataSchemas(con, catalog, openivm::VIEWS_TABLE), catalog, preferred);
 }
 
 void RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
 	auto catalog = ResolveMetadataCatalog(context, con, view_catalog);
-	auto schema = ResolveMetadataSchema(con, catalog, PreferredMetadataSchema(context, catalog));
+	auto preferred = PreferredMetadataSchema(context, catalog);
+	auto transaction_schemas = TransactionMetadataSchemas(context, catalog);
+	auto schema = transaction_schemas.empty() ? ResolveMetadataSchema(con, catalog, preferred)
+	                                          : SelectMetadataSchema(transaction_schemas, catalog, preferred);
 	SelectMetadataLocation(con, catalog, schema);
 }
 
@@ -266,7 +301,7 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 		return;
 	}
 	Connection con(*context.db);
-	// Dropping a legacy table re-enters OpenIVM's DROP handling on this helper.
+	// Metadata INSERTs still enter the maintenance optimizer on this helper.
 	TransactionalMVLockState::Get(*con.context)
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	MutationLockGuard guard(context);
@@ -337,7 +372,21 @@ void RefreshMetadata::PrepareMetadataSchema(ClientContext &context, const string
 			auto column_list = StringUtil::Join(columns, ", ");
 			run("INSERT OR IGNORE INTO " + target_name + " (" + column_list + ") SELECT " + column_list + " FROM " +
 			    source_name);
-			run("DROP TABLE " + source_name);
+			// This migration owns the old control table. SQL DROP would re-enter
+			// source cleanup while both registries exist in this transaction, and
+			// discovery would mistake that intermediate state for ambiguity. Use
+			// the native catalog operation, as metadata replay does for its shadows.
+			// The preceding INSERT registered this catalog's write transaction;
+			// native dependency checks and rollback still apply to the drop.
+			con.context->RunFunctionInTransaction([&]() {
+				DropInfo drop;
+				drop.type = CatalogType::TABLE_ENTRY;
+				drop.catalog = catalog;
+				drop.schema = legacy;
+				drop.name = table;
+				Catalog::GetCatalog(*con.context, catalog).DropEntry(*con.context, drop);
+			});
+			OPENIVM_DEBUG_PRINT("[METADATA] Moved control table %s to %s\n", source_name.c_str(), target_name.c_str());
 		}
 		con.Commit();
 	} catch (std::exception &ex) {

@@ -31,7 +31,8 @@ public:
 
 	// Native view metadata belongs to the view catalog; external catalogs use the native default.
 	// Within that catalog, metadata stays in the schema that already holds it. New metadata uses
-	// openivm_metadata_schema, or main when it is unset.
+	// openivm_metadata_schema, or main when it is unset. Explicit transactions retain their
+	// recorded or caller-visible registry even if the setting changes before commit/rollback.
 	static void UseCatalog(ClientContext &context, Connection &con, const string &view_catalog = "");
 	// Select the location already resolved for a helper context; resolve it for any other context.
 	static void UseSameLocation(ClientContext &context, Connection &con);

@@ -50,6 +50,10 @@ The move runs outside explicit transactions. Inside `BEGIN ... COMMIT`, OpenIVM
 keeps using the existing metadata schema. If a catalog has no metadata yet, the
 first materialized view in the transaction creates the configured schema, and
 `ROLLBACK` removes it with the view.
+Changing or clearing the setting during that transaction does not change its
+metadata location: CREATE, ALTER, replacement and DROP keep using the registry
+already visible to the caller or recorded by its earlier lifecycle statements.
+Commit and rollback discard that transaction's recorded locations.
 
 ## Internal maintenance objects
 

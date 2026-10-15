@@ -158,6 +158,17 @@ quoted semicolons, dollar-quoted literals, nested and keyword comments, interven
 DML, explicit commit and rollback.
 Metadata replay supplies helper-local ownership visibility without running physical
 programs ahead of their native statement position.
+The metadata-setting transaction matrix changes and clears the setting between
+CREATE, ALTER, replacement, final-consumer DROP and recreation, using both separate
+and batched statements with new and existing registries. Commit/rollback checks
+reject split registries and leaked schemas; surviving views receive conflicting
+batched writes and bidirectional bag-equality checks after refresh. A new transaction
+after rollback must use its newly configured metadata location.
+Metadata migration is exercised through both refresh and CREATE, including a
+late copy failure after earlier registry tables have moved. The test checks atomic
+rollback, successful retry, movement back to `main`, retained hooks and unchanged
+internal tables. Each refresh checks bidirectional bag equality after conflicting
+batched writes; final-consumer DROP must still remove its source delta.
 
 The mixed lifecycle cases preserve newline/line-comment-concatenated string literals,
 nested block comments, dollar-quoted case and literal lifecycle keywords through

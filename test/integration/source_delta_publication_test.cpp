@@ -1868,6 +1868,208 @@ static void TestCreateAlterTransaction(bool existing_metadata, bool batched, boo
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
 }
 
+static void TestMetadataSchemaMigration(bool create_trigger) {
+	std::cerr << "CASE metadata migration create_trigger=" << create_trigger << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_internal_schema='Internal Space'; CREATE SCHEMA \"Source.Space\"; "
+	               "CREATE TABLE \"Source.Space\".source(i INTEGER); "
+	               "INSERT INTO \"Source.Space\".source VALUES (1),(1),(2); "
+	               "CREATE TABLE main.hook_log(message VARCHAR); "
+	               "CREATE MATERIALIZED VIEW main.mv AS SELECT * FROM \"Source.Space\".source;");
+	const auto hook = Value("INSERT INTO main.hook_log VALUES ('migrated')").ToSQLString();
+	Execute(owner, "INSERT INTO main.openivm_refresh_hooks SELECT view_name, " + hook +
+	                   ", 'after' FROM main.openivm_views WHERE view_sql_name='mv'; "
+	                   "CREATE TEMP TABLE maintenance_before AS SELECT schema_name, table_name FROM duckdb_tables() "
+	                   "WHERE schema_name='Internal Space';");
+	// A deliberately incompatible target forces a late copy failure, after the
+	// dependency and view registries were copied and dropped in the helper.
+	Execute(owner, "CREATE SCHEMA \"Control.Space\"; "
+	               "CREATE TABLE \"Control.Space\".openivm_refresh_hooks "
+	               "(view_name VARCHAR PRIMARY KEY, hook_sql INTEGER, mode VARCHAR); "
+	               "SET openivm_metadata_schema='Control.Space'; "
+	               "INSERT INTO \"Source.Space\".source VALUES (1),(2),(3),(3); "
+	               "DELETE FROM \"Source.Space\".source WHERE i=1; "
+	               "UPDATE \"Source.Space\".source SET i=4 WHERE i=2;");
+	const string trigger = create_trigger
+	                           ? "CREATE MATERIALIZED VIEW main.sibling AS SELECT * FROM \"Source.Space\".source;"
+	                           : "PRAGMA refresh('main.mv');";
+	auto failure = owner.Query(trigger);
+	if (!failure->HasError() || failure->GetError().find("could not move its metadata") == string::npos ||
+	    failure->GetError().find("Conversion Error") == string::npos) {
+		throw InvalidInputException("Metadata migration did not reach the intended late copy failure: %s",
+		                            failure->HasError() ? failure->GetError() : string("query succeeded"));
+	}
+	Execute(owner, "SELECT CASE WHEN "
+	               "(SELECT count(*) FROM main.openivm_views WHERE view_sql_name='mv')=1 "
+	               "AND (SELECT count(*) FROM main.openivm_delta_tables)=1 "
+	               "AND (SELECT count(*) FROM main.openivm_refresh_hooks WHERE hook_sql=" +
+	                   hook +
+	                   ")=1 "
+	                   "AND (SELECT count(*) FROM duckdb_tables() WHERE schema_name='Control.Space')=1 "
+	                   "AND NOT EXISTS (SELECT 1 FROM main.hook_log) "
+	                   "THEN true ELSE error('Failed migration did not restore metadata') END;");
+	// The successful retry must not treat the two transient view registries as
+	// competing metadata locations, nor retract or drop a tracked source delta.
+	Execute(owner, "DROP TABLE \"Control.Space\".openivm_refresh_hooks;");
+	Execute(owner, trigger);
+	auto check_bag = [&](const string &view) {
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view +
+		                   " EXCEPT ALL SELECT * FROM \"Source.Space\".source) "
+		                   "OR EXISTS (SELECT * FROM \"Source.Space\".source EXCEPT ALL SELECT * FROM " +
+		                   view + ") THEN error('Migrated MV bag mismatch') ELSE true END;");
+	};
+	check_bag(create_trigger ? "main.sibling" : "main.mv");
+	Execute(owner,
+	        "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM duckdb_tables() "
+	        "WHERE schema_name='main' AND table_name IN "
+	        "('openivm_views','openivm_delta_tables','openivm_refresh_hooks','openivm_refresh_history',"
+	        "'openivm_refresh_profile','openivm_mv_dependencies','openivm_match_log','openivm_constraints_cache')) "
+	        "AND (SELECT count(*) FROM \"Control.Space\".openivm_refresh_hooks WHERE hook_sql=" +
+	            hook +
+	            ")=1 "
+	            "THEN true ELSE error('Migration split metadata or lost the hook') END;");
+	vector<string> survivors = {"main.mv"};
+	if (create_trigger) {
+		survivors.push_back("main.sibling");
+	}
+	// Exercise moving the same registry back, with pending conflicting writes.
+	for (const auto &schema : vector<string> {"Control.Space", "main"}) {
+		Execute(owner, "SET openivm_metadata_schema=" + Value(schema).ToSQLString() +
+		                   "; "
+		                   "INSERT INTO \"Source.Space\".source VALUES (1),(2),(3),(3); "
+		                   "DELETE FROM \"Source.Space\".source WHERE i=1; "
+		                   "UPDATE \"Source.Space\".source SET i=4 WHERE i=2;");
+		for (auto &view : survivors) {
+			Execute(owner, "PRAGMA refresh(" + Value(view).ToSQLString() + ");");
+			check_bag(view);
+		}
+	}
+	Execute(owner, "SELECT CASE WHEN NOT EXISTS (SELECT * FROM maintenance_before EXCEPT ALL "
+	               "SELECT schema_name, table_name FROM duckdb_tables() WHERE schema_name='Internal Space') "
+	               "AND EXISTS (SELECT 1 FROM main.hook_log WHERE message='migrated') "
+	               "AND (SELECT count(*) FROM duckdb_tables() WHERE schema_name='Control.Space')=0 "
+	               "THEN true ELSE error('Metadata migration moved maintenance state or lost the hook') END;");
+	for (auto &view : survivors) {
+		Execute(owner, "DROP VIEW " + view + ";");
+	}
+	Execute(owner, "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM main.openivm_views) "
+	               "AND NOT EXISTS (SELECT 1 FROM main.openivm_delta_tables) "
+	               "AND NOT EXISTS (SELECT 1 FROM duckdb_tables() WHERE schema_name='Internal Space') "
+	               "THEN true ELSE error('Migration final-consumer cleanup leaked') END;");
+}
+
+static void TestMetadataSchemaSettingTransaction(bool existing_metadata, bool batched, bool commit) {
+	std::cerr << "CASE metadata setting transaction existing_metadata=" << existing_metadata << " batched=" << batched
+	          << " commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Public;Space\"; CREATE TABLE source(i INTEGER); "
+	               "INSERT INTO source VALUES (1),(1),(2);");
+	if (existing_metadata) {
+		Execute(owner, "CREATE MATERIALIZED VIEW main.sibling AS SELECT * FROM source;");
+		Execute(owner, "USE memory.\"Control.Space\";");
+	}
+	const string first = "memory.\"Public;Space\".\"First;MV\"";
+	const string second = "memory.\"Public;Space\".\"Second;MV\"";
+	const string registry = "memory.\"Control.Space\".openivm_views";
+	vector<string> statements = {"BEGIN"};
+	if (existing_metadata) {
+		// No replay record exists yet: the caller-visible registry still wins.
+		statements.push_back("SET openivm_metadata_schema='Different;Control'");
+	}
+	statements.push_back("CREATE MATERIALIZED VIEW " + first + " AS SELECT * FROM memory.main.source");
+	statements.push_back("SET openivm_metadata_schema=''");
+	statements.push_back("ALTER MATERIALIZED VIEW " + first + " SET REFRESH MANUAL");
+	statements.push_back("SELECT CASE WHEN count(*)=1 THEN true ELSE error('Cleared setting lost ALTER registry') "
+	                     "END FROM " +
+	                     registry + " WHERE view_sql_name='First;MV' AND refresh_interval IS NULL");
+	statements.push_back("SET openivm_metadata_schema='Different;Control'");
+	statements.push_back("CREATE MATERIALIZED VIEW " + second + " AS SELECT * FROM memory.main.source");
+	statements.push_back("SET openivm_metadata_schema=''");
+	statements.push_back("CREATE OR REPLACE MATERIALIZED VIEW " + first +
+	                     " AS SELECT i FROM memory.main.source WHERE i<>1");
+	statements.push_back("SET openivm_metadata_schema='Different;Control'");
+	statements.push_back("DROP VIEW " + second);
+	statements.push_back("SET openivm_metadata_schema=''");
+	statements.push_back("DROP VIEW " + first);
+	// With no consumers left (in the fresh case), neither cleanup nor the next
+	// CREATE may abandon the transaction's original registry and delta ownership.
+	statements.push_back("SET openivm_metadata_schema=''");
+	statements.push_back("CREATE MATERIALIZED VIEW " + first + " AS SELECT i FROM memory.main.source WHERE i<>1");
+	statements.push_back("SET openivm_metadata_schema='Different;Control'");
+	statements.push_back("CREATE MATERIALIZED VIEW " + second + " AS SELECT * FROM memory.main.source");
+	statements.push_back("ALTER MATERIALIZED VIEW " + first + " SET REFRESH EVERY '2 hours'");
+	statements.push_back("SELECT CASE WHEN count(*)=1 THEN true ELSE error('Changed setting lost ALTER registry') "
+	                     "END FROM " +
+	                     registry + " WHERE view_sql_name='First;MV' AND refresh_interval=7200");
+	statements.push_back("SELECT CASE WHEN count(*)=" + string(existing_metadata ? "3" : "2") +
+	                     " THEN true ELSE error('Setting change split transaction registry') END FROM " + registry);
+	const string no_other_registry =
+	    "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Setting change created another registry') END "
+	    "FROM duckdb_tables() WHERE database_name='memory' AND table_name='openivm_views' "
+	    "AND schema_name<>'Control.Space'";
+	statements.push_back(no_other_registry);
+	statements.push_back("SELECT CASE WHEN count(*)=0 THEN true ELSE error('Setting change created another schema') "
+	                     "END FROM duckdb_schemas() WHERE schema_name='Different;Control'");
+	if (batched) {
+		Execute(owner, StringUtil::Join(statements, "; ") + ";");
+	} else {
+		for (auto &statement : statements) {
+			Execute(owner, statement + ";");
+		}
+	}
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	// Avoid a requested autocommit migration obscuring the transaction outcome.
+	Execute(owner, "SET openivm_metadata_schema='';");
+	Execute(owner, no_other_registry + ";");
+	Execute(owner, "SELECT CASE WHEN count(*)=" + string(commit ? "2" : "0") +
+	                   " THEN true ELSE error('Setting transaction view outcome mismatch') END FROM duckdb_views() "
+	                   "WHERE database_name='memory' AND schema_name='Public;Space';");
+	vector<pair<string, string>> survivors;
+	if (commit) {
+		Execute(owner, "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Setting transaction lost ALTER commit') "
+		               "END FROM " +
+		                   registry + " WHERE view_sql_name='First;MV' AND refresh_interval=7200;");
+		survivors.emplace_back(first, "SELECT i FROM main.source WHERE i<>1");
+		survivors.emplace_back(second, "SELECT * FROM main.source");
+	} else if (!existing_metadata) {
+		Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Setting rollback leaked schemas') END "
+		               "FROM duckdb_schemas() WHERE schema_name IN ('Control.Space','Internal Space');");
+		// Commit/rollback must discard the old transaction's recorded location.
+		Execute(owner, "SET openivm_metadata_schema='After;Control'; BEGIN;");
+		Execute(owner, "CREATE MATERIALIZED VIEW main.after_mv AS SELECT * FROM main.source;");
+		Execute(owner, "COMMIT; SET openivm_metadata_schema='';");
+		Execute(owner, "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Rollback retained stale metadata location') "
+		               "END FROM memory.\"After;Control\".openivm_views WHERE view_sql_name='after_mv';");
+		survivors.emplace_back("main.after_mv", "SELECT * FROM main.source");
+	} else {
+		Execute(owner, "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Setting rollback changed sibling registry') "
+		               "END FROM " +
+		                   registry + " WHERE view_sql_name='sibling';");
+	}
+	if (existing_metadata) {
+		survivors.emplace_back("main.sibling", "SELECT * FROM main.source");
+	}
+	Execute(owner, "INSERT INTO main.source VALUES (1),(2),(3),(3); DELETE FROM main.source WHERE i=1; "
+	               "UPDATE main.source SET i=4 WHERE i=2; INSERT INTO main.source VALUES (4),(5),(5); "
+	               "DELETE FROM main.source WHERE i=5;");
+	for (auto &survivor : survivors) {
+		Execute(owner, "PRAGMA refresh(" + Value(survivor.first).ToSQLString() + ");");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + survivor.first + " EXCEPT ALL " + survivor.second +
+		                   ") OR EXISTS (" + survivor.second + " EXCEPT ALL SELECT * FROM " + survivor.first +
+		                   ") THEN error('Setting transaction survivor bag mismatch') ELSE true END;");
+	}
+	for (auto &survivor : survivors) {
+		Execute(owner, "DROP VIEW " + survivor.first + ";");
+	}
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Setting transaction cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
 static void TestFailedCreateSourceDelta(bool dedicated_schema, bool peer_view, bool shared) {
 	std::cerr << "CASE failed CREATE dedicated_schema=" << dedicated_schema << " peer_view=" << peer_view
 	          << " shared=" << shared << std::endl;
@@ -2085,10 +2287,14 @@ int main(int argc, char **argv) {
 		TestSequentialCreateBatch(false, true);
 		TestSequentialCreateBatch(true, true);
 		TestSequentialCreateBatch(true, false);
+		TestMetadataSchemaMigration(false);
+		TestMetadataSchemaMigration(true);
 		for (bool existing_metadata : {false, true}) {
 			for (bool batched : {false, true}) {
 				TestCreateAlterTransaction(existing_metadata, batched, true);
 				TestCreateAlterTransaction(existing_metadata, batched, false);
+				TestMetadataSchemaSettingTransaction(existing_metadata, batched, true);
+				TestMetadataSchemaSettingTransaction(existing_metadata, batched, false);
 			}
 		}
 		for (bool dedicated_schema : {false, true}) {
