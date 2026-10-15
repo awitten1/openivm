@@ -76,10 +76,15 @@ public:
 	void AcquireMutationLock();
 	void DeferDeltaCleanup(vector<string> statements);
 	void DeferUnusedSourceDeltaCleanup(const RefreshMetadata::DeltaSource &source);
+	// Helper-committed allocations must be reclaimed if the caller fails to publish ownership.
+	void RecordSourceDeltaAllocation(const RefreshMetadata::DeltaSource &source);
+	vector<RefreshMetadata::DeltaSource> TakeSourceDeltaAllocations();
+	void CleanupSourceDeltaAllocations(const vector<RefreshMetadata::DeltaSource> &sources);
 	void RecordSourceDeltaDrop(const string &catalog, const string &schema, const string &table);
 	bool HasDroppedSourceDelta(const string &catalog, const string &schema, const string &table);
 	optional_ptr<TableCatalogEntry> FindDeferredSourceDelta(const string &catalog, const string &schema,
 	                                                        const string &table);
+	// Reused replay helpers may reassert the same owner while their guard is held.
 	void SetMutationOwner(const void *owner_token);
 	const void *GetMutationOwner();
 
@@ -87,6 +92,8 @@ public:
 	void TransactionRollback(MetaTransaction &transaction, ClientContext &context) override;
 
 private:
+	void CleanupUnusedSourceDeltas(ClientContext &context, const vector<RefreshMetadata::DeltaSource> &sources,
+	                               vector<string> cleanup);
 	void Release();
 
 	mutex state_lock;
@@ -95,6 +102,7 @@ private:
 	const void *mutation_owner;
 	vector<string> deferred_delta_cleanup;
 	vector<RefreshMetadata::DeltaSource> deferred_source_delta_cleanup;
+	vector<RefreshMetadata::DeltaSource> allocated_source_deltas;
 	unordered_set<string> dropped_source_deltas;
 };
 

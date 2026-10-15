@@ -176,3 +176,15 @@ transaction. Compile-only plans must retain the outer-join transition guards for
 caller-local deltas; deleting both sides must not leave a negative-count group.
 Both COMMIT and ROLLBACK check bidirectional bag equality inside and after the
 transaction. The qualified-source variants remain in the namespace fixtures.
+
+The lifecycle executable also covers failed autocommit initial materialization,
+corrected retry, shared source consumers and final DROP in the same or another
+native metadata catalog. New helper-committed deltas must be reclaimed on failure;
+existing consumers keep their deltas. CREATE followed by two column renames,
+ADD/DROP of an unreferenced column and rejection of a referenced-column DROP runs
+with new and existing configured metadata, separate maintenance schemas, mixed
+batches, commit and rollback. Cross-native-catalog ALTER retains helper undo.
+Every surviving view is refreshed after conflicting writes and checked in both
+`EXCEPT ALL` directions. The DuckLake fixture additionally selects a projection
+key from the second same-named source in a three-way join and checks failed staged
+CREATE over a native source through retry and final cleanup.

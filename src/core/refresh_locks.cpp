@@ -84,7 +84,7 @@ void TransactionalMVLockState::AcquireMutationLock() {
 
 void TransactionalMVLockState::SetMutationOwner(const void *owner_token) {
 	lock_guard<mutex> guard(state_lock);
-	if (mutation_guard) {
+	if (mutation_guard && mutation_owner != owner_token) {
 		throw InternalException("OpenIVM cannot change mutation ownership after acquiring the mutation lock");
 	}
 	mutation_owner = owner_token;
@@ -107,11 +107,19 @@ void TransactionalMVLockState::TransactionCommit(MetaTransaction &transaction, C
 		lock_guard<mutex> guard(state_lock);
 		cleanup.swap(deferred_delta_cleanup);
 		source_cleanup.swap(deferred_source_delta_cleanup);
+		source_cleanup.insert(source_cleanup.end(), allocated_source_deltas.begin(), allocated_source_deltas.end());
+		allocated_source_deltas.clear();
 	}
+	CleanupUnusedSourceDeltas(context, source_cleanup, std::move(cleanup));
+	Release();
+}
+
+void TransactionalMVLockState::CleanupUnusedSourceDeltas(ClientContext &context,
+                                                         const vector<RefreshMetadata::DeltaSource> &source_cleanup,
+                                                         vector<string> cleanup) {
 	if (!cleanup.empty() || !source_cleanup.empty()) {
-		// The caller is already committed. Housekeeping failures must never report
-		// a failed commit or roll back a successfully refreshed MV. Retained deltas
-		// are excluded by the committed watermark and retried on a later refresh.
+		// The caller transaction has ended, but the mutation gate still protects
+		// the committed ownership check and physical cleanup from another CREATE.
 		try {
 			Connection con(*context.db);
 			Get(*con.context).SetMutationOwner(GetMutationOwner());
@@ -128,20 +136,36 @@ void TransactionalMVLockState::TransactionCommit(MetaTransaction &transaction, C
 			for (auto &sql : cleanup) {
 				auto result = con.Query(sql);
 				if (result->HasError()) {
-					Printer::Print("OpenIVM transaction committed; external delta cleanup deferred: " +
-					               result->GetError());
+					Printer::Print("OpenIVM transaction ended; external delta cleanup deferred: " + result->GetError());
 				}
 			}
 		} catch (const std::exception &ex) {
-			Printer::Print(string("OpenIVM transaction committed; external delta cleanup deferred: ") + ex.what());
+			Printer::Print(string("OpenIVM transaction ended; external delta cleanup deferred: ") + ex.what());
 		}
 	}
-	Release();
 }
 
 void TransactionalMVLockState::DeferUnusedSourceDeltaCleanup(const RefreshMetadata::DeltaSource &source) {
 	lock_guard<mutex> guard(state_lock);
 	deferred_source_delta_cleanup.push_back(source);
+}
+
+void TransactionalMVLockState::RecordSourceDeltaAllocation(const RefreshMetadata::DeltaSource &source) {
+	lock_guard<mutex> guard(state_lock);
+	allocated_source_deltas.push_back(source);
+	OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Retained allocation %s.%s.%s until publication\n",
+	                    source.catalog_name.c_str(), source.delta_schema_name.c_str(), source.delta_table_name.c_str());
+}
+
+vector<RefreshMetadata::DeltaSource> TransactionalMVLockState::TakeSourceDeltaAllocations() {
+	lock_guard<mutex> guard(state_lock);
+	vector<RefreshMetadata::DeltaSource> allocations;
+	allocations.swap(allocated_source_deltas);
+	return allocations;
+}
+
+void TransactionalMVLockState::CleanupSourceDeltaAllocations(const vector<RefreshMetadata::DeltaSource> &sources) {
+	CleanupUnusedSourceDeltas(owner, sources, {});
 }
 
 void TransactionalMVLockState::RecordSourceDeltaDrop(const string &catalog, const string &schema, const string &table) {
@@ -171,6 +195,10 @@ TransactionalMVLockState::FindDeferredSourceDelta(const string &catalog, const s
 }
 
 void TransactionalMVLockState::TransactionRollback(MetaTransaction &transaction, ClientContext &context) {
+	auto allocations = TakeSourceDeltaAllocations();
+	// Existing deltas scheduled for final-consumer cleanup belong to the restored
+	// owners after rollback. Only newly helper-committed allocations need checking.
+	CleanupUnusedSourceDeltas(context, allocations, {});
 	Release();
 }
 
@@ -179,6 +207,7 @@ void TransactionalMVLockState::Release() {
 	OPENIVM_DEBUG_PRINT("[LOCK] release database mutation lock owner=%p\n", static_cast<void *>(&owner));
 	deferred_delta_cleanup.clear();
 	deferred_source_delta_cleanup.clear();
+	allocated_source_deltas.clear();
 	dropped_source_deltas.clear();
 	mutation_guard.reset();
 }

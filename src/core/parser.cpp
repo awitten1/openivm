@@ -1746,6 +1746,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// writes earlier in this transaction and changes retained for other MVs.
 		auto source_delta = delta_prefix + SqlUtils::QuoteIdentifier(placement.table_name);
 		auto allocated = InitializeSourceDelta(context, con, source_delta, create_delta);
+		if (allocated) {
+			TransactionalMVLockState::Get(context).RecordSourceDeltaAllocation(
+			    {source_metadata_key(source, SqlUtils::DeltaName(table_name)), "duckdb", source.catalog_name,
+			     source.schema_name, placement.schema_name, placement.table_name});
+		}
 		if (!context.transaction.IsAutoCommit() &&
 		    !Catalog::GetEntry<TableCatalogEntry>(context, source.catalog_name, placement.schema_name,
 		                                          placement.table_name, OnEntryNotFound::RETURN_NULL)) {

@@ -584,6 +584,65 @@ static void TestDeferredScratchDrop(bool explicit_transaction, bool commit, bool
 	Execute(owner, "DROP VIEW main.mv; SELECT 1;");
 }
 
+// Fail on a wrong helper identity before acquiring the caller gate: otherwise
+// the subsequent replayed ALTER would wait forever instead of reporting it.
+static void TestMetadataReplayMutationOwner(bool commit) {
+	std::cerr << "CASE metadata replay mutation owner commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db), helper(db), competitor(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1),(1),(2); "
+	               "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	RefreshMetadata::UseCatalog(*owner.context, helper, "memory");
+	auto key = RefreshMetadata(helper).FindViewKey("memory", "main", "mv");
+	Execute(owner, "BEGIN;");
+	auto &state = TransactionalMVMetadataState::Get(*owner.context);
+	state.RegisterSQL(
+	    CreateMetadataTableSQL(openivm::REFRESH_HOOKS_TABLE, "memory.\"Control.Space\".openivm_refresh_hooks") +
+	        "; ALTER TABLE memory.\"Control.Space\".openivm_refresh_hooks "
+	        "ADD COLUMN IF NOT EXISTS replay_probe INTEGER;",
+	    key);
+	state.Apply(helper);
+	auto &owner_locks = TransactionalMVLockState::Get(*owner.context);
+	auto &helper_locks = TransactionalMVLockState::Get(*helper.context);
+	if (helper_locks.GetMutationOwner() != owner_locks.GetMutationOwner()) {
+		throw InvalidInputException("Metadata replay helper did not inherit the caller mutation owner");
+	}
+	owner_locks.AcquireMutationLock();
+	Execute(helper, "BEGIN;");
+	// The second Apply must also work while this helper retains its own
+	// re-entrant guard through an explicit transaction.
+	state.Apply(helper);
+	state.Apply(helper);
+	auto gate = RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(*owner.context));
+	const auto competing_owner = TransactionalMVLockState::Get(*competitor.context).GetMutationOwner();
+	if (gate->TryLock(competing_owner)) {
+		gate->Unlock(competing_owner);
+		throw InvalidInputException("Metadata replay released the caller mutation gate");
+	}
+	Execute(helper, "SELECT replay_probe FROM temp.main.openivm_refresh_hooks LIMIT 0;");
+	Execute(helper, "ROLLBACK;");
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	if (!gate->TryLock(competing_owner)) {
+		throw InvalidInputException("Metadata replay retained the mutation gate after transaction end");
+	}
+	gate->Unlock(competing_owner);
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Replay mutated durable metadata') END "
+	               "FROM duckdb_columns() WHERE schema_name='Control.Space' AND table_name='openivm_refresh_hooks' "
+	               "AND column_name='replay_probe';");
+	Execute(owner, "INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
+	               "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (4),(5),(5); "
+	               "DELETE FROM source WHERE i=5;");
+	Execute(owner, "PRAGMA refresh('mv');");
+	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM mv EXCEPT ALL SELECT * FROM source) "
+	               "OR EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM mv) "
+	               "THEN error('Metadata replay damaged surviving MV') ELSE true END;");
+	Execute(owner, "DROP VIEW mv;");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Metadata replay cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
 // Replay on a reused helper must follow catalog/schema identity, including when
 // CREATE and CASCADE have both contributed mutations to the same transaction.
 static void TestMetadataReplayLocations() {
@@ -1459,6 +1518,148 @@ static void TestCreateAlterTransaction(bool existing_metadata, bool batched, boo
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
 }
 
+static void TestFailedCreateSourceDelta(bool dedicated_schema, bool peer_view, bool shared) {
+	std::cerr << "CASE failed CREATE dedicated_schema=" << dedicated_schema << " peer_view=" << peer_view
+	          << " shared=" << shared << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; CREATE TABLE source(i INTEGER); "
+	               "INSERT INTO source VALUES (1000),(1),(1),(2); ATTACH ':memory:' AS peer;");
+	if (dedicated_schema) {
+		Execute(owner, "SET openivm_internal_schema='Internal Space';");
+	}
+	if (shared) {
+		Execute(owner, "CREATE MATERIALIZED VIEW sibling AS SELECT * FROM main.source;");
+	}
+	const string view = peer_view ? "peer.main.mv" : "main.mv";
+	auto failed =
+	    owner.Query("CREATE MATERIALIZED VIEW " + view + " AS SELECT i::TINYINT AS original FROM main.source;");
+	if (!failed->HasError() || failed->GetError().find("1000") == string::npos) {
+		throw InvalidInputException("Failed CREATE fixture did not reach the intended initial-load conversion error");
+	}
+	const auto delta_name =
+	    dedicated_schema ? RefreshMetadata::InternalSourceDeltaName("main", "source") : SqlUtils::DeltaName("source");
+	const string schema = dedicated_schema ? "Internal Space" : "main";
+	const string allocations =
+	    " FROM duckdb_tables() WHERE database_name='memory' AND schema_name=" + Value(schema).ToSQLString() +
+	    " AND starts_with(table_name," + Value(delta_name).ToSQLString() + ")";
+	Execute(owner, "SELECT CASE WHEN count(*)=" + string(shared ? "1" : "0") +
+	                   " THEN true ELSE error('Failed CREATE leaked or removed a shared source delta') END" +
+	                   allocations);
+	Execute(owner, "DELETE FROM main.source WHERE i=1000; CREATE MATERIALIZED VIEW " + view +
+	                   " AS SELECT i::TINYINT AS original FROM main.source;");
+	Execute(owner,
+	        "SELECT CASE WHEN count(*)=1 THEN true ELSE error('CREATE retry allocated a second source delta') END" +
+	            allocations);
+	Execute(owner, "INSERT INTO main.source VALUES (1),(2),(3),(3); DELETE FROM main.source WHERE i=1; "
+	               "UPDATE main.source SET i=4 WHERE i=2; INSERT INTO main.source VALUES (5),(5); "
+	               "DELETE FROM main.source WHERE i=5;");
+	for (auto &survivor : shared ? vector<string> {view, "main.sibling"} : vector<string> {view}) {
+		Execute(owner, "PRAGMA refresh(" + Value(survivor).ToSQLString() + ");");
+		Execute(owner,
+		        "SELECT CASE WHEN EXISTS (SELECT * FROM " + survivor +
+		            " EXCEPT ALL SELECT i::TINYINT FROM main.source) OR EXISTS (SELECT i::TINYINT FROM main.source "
+		            "EXCEPT ALL SELECT * FROM " +
+		            survivor + ") THEN error('Failed CREATE retry survivor bag mismatch') ELSE true END;");
+	}
+	Execute(owner, "DROP VIEW " + view + ";");
+	if (shared) {
+		Execute(owner, "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Retry DROP removed sibling delta') END" +
+		                   allocations);
+		Execute(owner, "DROP VIEW main.sibling;");
+	}
+	Execute(owner,
+	        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Final DROP leaked failed-CREATE allocation') END" +
+	            allocations);
+}
+
+static void TestAlterTableNamespace(bool existing_metadata, bool batched, bool commit, bool peer_view) {
+	std::cerr << "CASE ALTER TABLE namespace existing_metadata=" << existing_metadata << " batched=" << batched
+	          << " commit=" << commit << " peer_view=" << peer_view << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Source;Space\"; CREATE SCHEMA \"Other Source\"; "
+	               "CREATE TABLE \"Source;Space\".items(i INTEGER); CREATE TABLE \"Other Source\".items(i INTEGER); "
+	               "INSERT INTO \"Source;Space\".items VALUES (1),(1),(2); "
+	               "INSERT INTO \"Other Source\".items VALUES (8),(8),(9); ATTACH ':memory:' AS peer;");
+	if (existing_metadata) {
+		Execute(owner,
+		        "CREATE MATERIALIZED VIEW \"Other Source\".\"Same;MV\" AS SELECT i FROM \"Other Source\".items;");
+	}
+	const string view = peer_view ? "peer.main.\"Same;MV\"" : "\"Source;Space\".\"Same;MV\"";
+	const string create =
+	    "CREATE MATERIALIZED VIEW " + view + " AS SELECT i AS original FROM memory.\"Source;Space\".items";
+	// Cross-native-catalog DDL retains the existing committed-helper/undo route.
+	// New metadata in BEGIN is tested in its source's native catalog.
+	if (peer_view) {
+		Execute(owner, create + ";");
+	}
+	vector<string> statements = {"BEGIN"};
+	if (!peer_view) {
+		statements.push_back(create);
+	}
+	statements.push_back("ALTER TABLE memory.\"Source;Space\".items RENAME COLUMN i TO \"New;Column\"");
+	statements.push_back("ALTER TABLE memory.\"Source;Space\".items RENAME COLUMN \"New;Column\" TO \"Final.Column\"");
+	statements.push_back("ALTER TABLE memory.\"Source;Space\".items ADD COLUMN scratch INTEGER");
+	statements.push_back("ALTER TABLE memory.\"Source;Space\".items DROP COLUMN scratch");
+	if (batched) {
+		Execute(owner, StringUtil::Join(statements, "; ") + ";");
+	} else {
+		for (auto &statement : statements) {
+			Execute(owner, statement + ";");
+		}
+	}
+	auto rejected_drop = owner.Query("ALTER TABLE memory.\"Source;Space\".items DROP COLUMN \"Final.Column\";");
+	if (!rejected_drop->HasError() ||
+	    rejected_drop->GetError().find("referenced by materialized view") == string::npos ||
+	    rejected_drop->GetError().find("Same;MV") == string::npos) {
+		throw InvalidInputException("Caller-visible namespace dependency did not reject DROP COLUMN");
+	}
+	if (!peer_view) {
+		Execute(owner, "INSERT INTO memory.\"Source;Space\".items VALUES (1),(2),(3),(3); "
+		               "DELETE FROM memory.\"Source;Space\".items WHERE \"Final.Column\"=1; "
+		               "UPDATE memory.\"Source;Space\".items SET \"Final.Column\"=4 WHERE \"Final.Column\"=2;");
+		Execute(owner, "PRAGMA refresh(" + Value(view).ToSQLString() + ");");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view +
+		                   " EXCEPT ALL SELECT \"Final.Column\" FROM memory.\"Source;Space\".items) OR EXISTS "
+		                   "(SELECT \"Final.Column\" FROM memory.\"Source;Space\".items EXCEPT ALL SELECT * FROM " +
+		                   view + ") THEN error('Caller-visible ALTER TABLE bag mismatch') ELSE true END;");
+	}
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	if (commit || peer_view) {
+		const string column = commit ? "\"Final.Column\"" : "i";
+		Execute(owner, "INSERT INTO memory.\"Source;Space\".items VALUES (1),(2),(3),(3); "
+		               "DELETE FROM memory.\"Source;Space\".items WHERE " +
+		                   column +
+		                   "=1; "
+		                   "UPDATE memory.\"Source;Space\".items SET " +
+		                   column + "=4 WHERE " + column + "=2;");
+		Execute(owner, "PRAGMA refresh(" + Value(view).ToSQLString() + ");");
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL SELECT " + column +
+		                   " FROM memory.\"Source;Space\".items) OR EXISTS (SELECT " + column +
+		                   " FROM memory.\"Source;Space\".items EXCEPT ALL SELECT * FROM " + view +
+		                   ") THEN error('ALTER TABLE transaction outcome bag mismatch') ELSE true END;");
+		Execute(owner, "DROP VIEW " + view + ";");
+	}
+	if (existing_metadata) {
+		Execute(owner,
+		        "INSERT INTO \"Other Source\".items VALUES (8),(9),(10),(10); "
+		        "DELETE FROM \"Other Source\".items WHERE i=8; UPDATE \"Other Source\".items SET i=11 WHERE i=9;");
+		Execute(owner, "PRAGMA refresh('\"Other Source\".\"Same;MV\"');");
+		Execute(owner,
+		        "SELECT CASE WHEN EXISTS (SELECT * FROM \"Other Source\".\"Same;MV\" EXCEPT ALL "
+		        "SELECT * FROM \"Other Source\".items) OR EXISTS (SELECT * FROM \"Other Source\".items EXCEPT ALL "
+		        "SELECT * FROM \"Other Source\".\"Same;MV\") THEN error('ALTER TABLE changed sibling identity') ELSE "
+		        "true END;");
+		Execute(owner, "DROP VIEW \"Other Source\".\"Same;MV\";");
+	}
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('ALTER TABLE namespace cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
 static void TestLateLifecycleBindFailure(bool explicit_transaction) {
 	std::cerr << "CASE late lifecycle bind failure explicit_transaction=" << explicit_transaction << std::endl;
 	DuckDB db(nullptr);
@@ -1524,6 +1725,8 @@ int main(int argc, char **argv) {
 		TestSharedMetadataUpgrade(false, true);
 		TestSharedMetadataUpgrade(true, true);
 		TestSharedMetadataUpgrade(true, false);
+		TestMetadataReplayMutationOwner(true);
+		TestMetadataReplayMutationOwner(false);
 		for (bool executor_drop : {false, true}) {
 			TestDeferredScratchDrop(false, true, executor_drop);
 			TestDeferredScratchDrop(true, true, executor_drop);
@@ -1538,6 +1741,20 @@ int main(int argc, char **argv) {
 				TestCreateAlterTransaction(existing_metadata, batched, false);
 			}
 		}
+		for (bool dedicated_schema : {false, true}) {
+			for (bool peer_view : {false, true}) {
+				TestFailedCreateSourceDelta(dedicated_schema, peer_view, false);
+				TestFailedCreateSourceDelta(dedicated_schema, peer_view, true);
+			}
+		}
+		for (bool existing_metadata : {false, true}) {
+			for (bool batched : {false, true}) {
+				TestAlterTableNamespace(existing_metadata, batched, true, false);
+				TestAlterTableNamespace(existing_metadata, batched, false, false);
+			}
+		}
+		TestAlterTableNamespace(true, false, true, true);
+		TestAlterTableNamespace(true, false, false, true);
 		TestLateLifecycleBindFailure(false);
 		TestLateLifecycleBindFailure(true);
 		TestMetadataReplayLocations();

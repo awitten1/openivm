@@ -3,6 +3,7 @@
 #include "rules/schema_evolution.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/parser_ddl.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/refresh_locks.hpp"
 #include "core/sql_utils.hpp"
@@ -110,15 +111,26 @@ static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &t
 
 static void RegisterMetadataRestore(ClientContext &context, Connection &con, const string &table_name,
                                     const string &predicate) {
-	auto rows = con.Query("SELECT * FROM " + SqlUtils::QuoteIdentifier(table_name) + " WHERE " + predicate);
+	auto location = RefreshMetadata::CurrentLocation(con);
+	auto target = SqlUtils::FullName(location.catalog_name, location.schema_name, table_name);
+	auto rows = con.Query("SELECT * FROM " + target + " WHERE " + predicate);
 	if (rows->HasError()) {
 		throw CatalogException("OpenIVM could not snapshot helper metadata: %s", rows->GetError());
 	}
-	auto location = RefreshMetadata::CurrentLocation(con);
-	auto restore =
-	    BuildRestoreRowsSQL(*rows, SqlUtils::FullName(location.catalog_name, location.schema_name, table_name));
+	auto restore = BuildRestoreRowsSQL(*rows, target);
 	if (!restore.empty()) {
 		TransactionalHelperUndoState::Get(context).AddRestoreSQL(std::move(restore));
+	}
+}
+
+static void SnapshotSchemaEvolutionMetadata(ClientContext &context, Connection &con,
+                                            const RefreshMetadata::MetadataLocation &location) {
+	TransactionalMVLockState::Get(*con.context)
+	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	RefreshMetadata::UseLocation(con, location);
+	RefreshMetadata(con).SnapshotTransaction(context);
+	if (auto state = TransactionalMVMetadataState::TryGet(context)) {
+		state->Apply(con);
 	}
 }
 
@@ -270,6 +282,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		string delta_name = SqlUtils::DeltaName(table_name);
 		auto source_locus = std::make_pair(source->ParentCatalog().GetName(), source->schema.name);
 
+		TransactionalMVLockState::Get(input.context).AcquireMutationLock();
 		// Resolve only the source's delta table in the caller transaction. Scanning
 		// information_schema touches unrelated external catalogs and can silently
 		// skip schema synchronization when one of them is unavailable.
@@ -280,9 +293,6 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		}
 		// The physical delta may sit in an internal schema; metadata still keys it by delta_name.
 		auto delta_locus = std::make_pair(delta_entry->schema.name, delta_entry->name);
-		Connection con(*input.context.db);
-		RefreshMetadata::UseCatalog(input.context, con, source_locus.first);
-		TransactionalMVLockState::Get(input.context).AcquireMutationLock();
 
 		switch (alter_info->alter_table_type) {
 		case AlterTableType::ADD_COLUMN: {
@@ -302,10 +312,11 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 				break;
 			}
 			string col_name = remove_info->removed_column;
-			for (auto &catalog : RefreshMetadata::MetadataCatalogs(con)) {
-				RefreshMetadata::UseCatalog(input.context, con, catalog);
-				auto referencing_mv = FirstMVReferencingColumn(con, delta_name, source_locus.first, source_locus.second,
-				                                               table_name, col_name);
+			for (auto &location : RefreshMetadata::MetadataLocations(input.context, openivm::DELTA_TABLES_TABLE)) {
+				Connection con(*input.context.db);
+				SnapshotSchemaEvolutionMetadata(input.context, con, location);
+				auto referencing_mv = FirstMVReferencingColumn(input.context, con, delta_name, source_locus.first,
+				                                               source_locus.second, table_name, col_name);
 				if (!referencing_mv.empty()) {
 					throw CatalogException("Cannot drop column '" + col_name +
 					                       "': it is referenced by materialized view '" + referencing_mv +
@@ -327,11 +338,16 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 			auto dependent_view_predicate =
 			    "view_name IN (SELECT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
 			    RefreshMetadata::SourcePredicate(delta_name, source_locus.first, source_locus.second) + ")";
-			for (auto &catalog : RefreshMetadata::MetadataCatalogs(con)) {
-				RefreshMetadata::UseCatalog(input.context, con, catalog);
-				RegisterMetadataRestore(input.context, con, openivm::VIEWS_TABLE, dependent_view_predicate);
-				RewriteDependentViewMetadataForRename(con, delta_name, source_locus.first, source_locus.second,
-				                                      table_name, old_name, new_name);
+			for (auto &location : RefreshMetadata::MetadataLocations(input.context, openivm::DELTA_TABLES_TABLE)) {
+				Connection con(*input.context.db);
+				SnapshotSchemaEvolutionMetadata(input.context, con, location);
+				// DuckDB permits writes to one native catalog per transaction. Keep
+				// the existing audited helper/undo path for other committed catalogs.
+				if (!StringUtil::CIEquals(location.catalog_name, source_locus.first)) {
+					RegisterMetadataRestore(input.context, con, openivm::VIEWS_TABLE, dependent_view_predicate);
+				}
+				RewriteDependentViewMetadataForRename(input.context, con, delta_name, source_locus.first,
+				                                      source_locus.second, table_name, old_name, new_name);
 			}
 			OPENIVM_DEBUG_PRINT("[INSERT RULE] ALTER TABLE RENAME COLUMN '%s' → '%s' — syncing delta table\n",
 			                    old_name.c_str(), new_name.c_str());

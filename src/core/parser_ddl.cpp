@@ -482,6 +482,22 @@ DeltaSchemaDDL BuildCreateDeltaFromDataSQL(Connection &conn, const string &delta
 	return result;
 }
 
+// Staged execution suspends the caller transaction. Its rollback callback must
+// not reclaim source allocations before the staged program publishes ownership.
+class StagedSourceDeltaCleanup {
+public:
+	explicit StagedSourceDeltaCleanup(ClientContext &context)
+	    : owner(TransactionalMVLockState::Get(context)), allocations(owner.TakeSourceDeltaAllocations()) {
+	}
+	~StagedSourceDeltaCleanup() {
+		owner.CleanupSourceDeltaAllocations(allocations);
+	}
+
+private:
+	TransactionalMVLockState &owner;
+	vector<RefreshMetadata::DeltaSource> allocations;
+};
+
 void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	if (ddl.empty()) {
 		return;
@@ -491,6 +507,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 	auto &helper_lock_state = TransactionalMVLockState::Get(*conn->context);
 	helper_lock_state.SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	MutationLockGuard mutation_guard(context);
+	StagedSourceDeltaCleanup source_delta_cleanup(context);
 	bool suspended_autocommit_transaction = false;
 	auto restore_outer_transaction = [&]() {
 		if (suspended_autocommit_transaction && !context.transaction.HasActiveTransaction()) {
@@ -697,8 +714,12 @@ void DDLExecutorExecuteFunction(ClientContext &context, TableFunctionInput &data
 
 } // namespace
 
+TransactionalMVMetadataState::TransactionalMVMetadataState(ClientContext &context) : owner(context) {
+}
+
 TransactionalMVMetadataState &TransactionalMVMetadataState::Get(ClientContext &context) {
-	return *context.registered_state->GetOrCreate<TransactionalMVMetadataState>("openivm_transactional_mv_metadata");
+	return *context.registered_state->GetOrCreate<TransactionalMVMetadataState>("openivm_transactional_mv_metadata",
+	                                                                            context);
 }
 
 optional_ptr<TransactionalMVMetadataState> TransactionalMVMetadataState::TryGet(ClientContext &context) {
@@ -784,6 +805,11 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	if (statements.empty()) {
 		return;
 	}
+	// Replayed ALTER statements enter the maintenance optimizer. Every replay
+	// helper, including ownership-inventory readers, belongs to the caller that
+	// already holds the mutation gate, rather than a competing transaction.
+	TransactionalMVLockState::Get(*connection.context)
+	    .SetMutationOwner(TransactionalMVLockState::Get(owner).GetMutationOwner());
 	// Seed from the durable tables in the connection's metadata schema.
 	auto metadata_location = RefreshMetadata::CurrentLocation(connection);
 	vector<string> local_statements;

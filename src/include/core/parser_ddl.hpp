@@ -40,6 +40,7 @@ enum class DDLExecutionMode : uint8_t { CALLER_TRANSACTION, STAGED_CROSS_CATALOG
 // in the same transaction needs to compile.
 class TransactionalMVMetadataState : public ClientContextState {
 public:
+	explicit TransactionalMVMetadataState(ClientContext &context);
 	static TransactionalMVMetadataState &Get(ClientContext &context);
 	static optional_ptr<TransactionalMVMetadataState> TryGet(ClientContext &context);
 
@@ -59,6 +60,7 @@ public:
 private:
 	void Clear();
 
+	ClientContext &owner;
 	vector<string> statements;
 	unordered_set<string> view_names;
 	unordered_set<string> dropped_views;

@@ -610,13 +610,8 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
 	                     " IS NOT DISTINCT FROM openivm_key_source." + SqlUtils::QuoteIdentifier(lineage.key_col) +
 	                     "))";
 	bool replaced = false;
-	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(
-	    view_query_sql, SqlUtils::QuoteIdentifier(lineage.key_source), lineage.key_occurrence, replacement, replaced);
-	if (!replaced) {
-		pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql,
-		                                                         SqlUtils::QuoteIdentifier(key_spec->loc.table_name),
-		                                                         lineage.key_occurrence, replacement, replaced);
-	}
+	string pushed_query = SqlUtils::ReplaceTableReferenceOccurrence(view_query_sql, key_table, lineage.key_occurrence,
+	                                                                replacement, replaced);
 	if (!replaced || pushed_query == view_query_sql) {
 		return false;
 	}

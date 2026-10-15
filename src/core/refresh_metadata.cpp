@@ -370,6 +370,23 @@ vector<RefreshMetadata::MetadataLocation> RefreshMetadata::MetadataLocations(Con
 	return locations;
 }
 
+vector<RefreshMetadata::MetadataLocation> RefreshMetadata::MetadataLocations(ClientContext &context,
+                                                                             const string &table) {
+	vector<MetadataLocation> locations;
+	for (auto &database : DatabaseManager::Get(context).GetDatabases(context)) {
+		auto &catalog = database->GetCatalog();
+		if (catalog.GetCatalogType() != "duckdb" || catalog.IsSystemCatalog() || catalog.IsTemporaryCatalog()) {
+			continue;
+		}
+		for (auto &schema : CatalogSchemas(context, catalog)) {
+			if (catalog.GetEntry<TableCatalogEntry>(context, schema, table, OnEntryNotFound::RETURN_NULL)) {
+				locations.push_back({catalog.GetName(), schema});
+			}
+		}
+	}
+	return locations;
+}
+
 vector<string> RefreshMetadata::MetadataTables(Connection &con, const string &table) {
 	vector<string> tables;
 	for (auto &location : MetadataLocations(con, table)) {
