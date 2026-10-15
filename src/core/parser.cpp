@@ -2001,9 +2001,9 @@ static void AdmitAutocommitCreateSources(ClientContext &context, MaterializedVie
 		}
 	}
 	auto publication_locks = locks.TakeSourcePublicationLocks();
-	if (publication_locks.empty()) {
-		return;
-	}
+	// DuckLake-only discovery can also open a native catalog snapshot. Renew it
+	// before shared metadata initialization commits tables on the helper, even
+	// though these sources need no native publication admission.
 	// No physical lifecycle step has run. Do not renew a caller transaction that
 	// has writes (for example if invoked from a containing maintenance program).
 	if (context.transaction.ActiveTransaction().ModifiedDatabase()) {

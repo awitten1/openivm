@@ -36,6 +36,9 @@ struct DuckLakeSourceLocation {
 	string table_name;
 };
 
+string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
+                                        int64_t current_snapshot_id);
+
 struct DuckLakeSourceSpec {
 	string metadata_key;
 	DuckLakeSourceLocation loc;

@@ -33,7 +33,6 @@ namespace duckdb {
 
 namespace {
 
-constexpr const char *DUCKLAKE_SYNTHETIC_DELTA_TS = "1970-01-02 00:00:00";
 constexpr const char *DUCKLAKE_SYNTHETIC_LAST_UPDATE = "1970-01-01 00:00:00";
 
 static string SparkPortableRefreshSQL(string sql) {
@@ -157,28 +156,6 @@ static string ResolveSourceTableSQL(RefreshMetadata &metadata, const string &vie
 		loc.schema_name = "main";
 	}
 	return SqlUtils::FullName(loc.catalog_name, loc.schema_name, BaseTableNameFromDeltaKey(loc.table_name));
-}
-
-static string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
-                                               int64_t current_snapshot_id) {
-	string delta_columns = ", 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", TIMESTAMP '" +
-	                       DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL);
-	if (last_snapshot_id == current_snapshot_id) {
-		// The next snapshot does not exist yet. Retain the source's column types
-		// without binding a change scan with an invalid snapshot range.
-		return "(SELECT *" + delta_columns + " FROM " +
-		       SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name) + " WHERE false)";
-	}
-	// Change scans include the lower bound; the stored snapshot was already consumed.
-	auto start_snapshot_id = last_snapshot_id + 1;
-	string insertions = "SELECT *" + delta_columns + " FROM " +
-	                    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
-	                                                    loc.table_name, start_snapshot_id, current_snapshot_id);
-	string deletions = "SELECT *, -1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", TIMESTAMP '" +
-	                   DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL) + " FROM " +
-	                   SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
-	                                                   loc.table_name, start_snapshot_id, current_snapshot_id);
-	return "(" + insertions + "\nUNION ALL\n" + deletions + ")";
 }
 
 static TrackedSourceInput ResolveTrackedSourceInput(RefreshMetadata &metadata, Connection &con, const string &view_name,

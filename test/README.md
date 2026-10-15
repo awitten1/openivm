@@ -36,6 +36,12 @@ The DuckLake fixture also verifies snapshot-backed auxiliary refresh and repair
 for COUNT(DISTINCT), inner DISTINCT and filtered-group counts: repeated refreshes
 must not replay a consumed snapshot, unrelated lake snapshots permit repair, and
 pending source changes prevent rebuilding missing state.
+First-MV creation from lake-only sources checks dedicated native metadata and
+internal schemas. FULL OUTER projection and grouped refreshes read qualified
+lake snapshot changes for same-named sources, including an unchanged source and
+repeated no-change refreshes, with both native and lake targets. The short-name
+capture fixture explicitly registers its source delta and verifies that an
+unregistered reserved namesake receives no writes.
 Snapshot publications in quoted internal schemas check creation, chained reads,
 reopen and refresh. The lifecycle executable also checks reference matching with
 quoted dots and escaped quotes: catalog/schema components must remain distinct

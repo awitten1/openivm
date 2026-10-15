@@ -107,7 +107,9 @@ context, including its temporary tables and search path. It retains those source
 guards while ending the discovery snapshot and starting the transaction that
 compiles and executes creation. No lifecycle writes run in the discovery phase.
 This prevents initial loading from an older snapshot after waiting for an
-uncaptured writer. The staged executor retains the same source guards while
+uncaptured writer. Lake-only discovery also ends its read snapshot before shared
+native metadata initialization, even though it requires no native source guards.
+The staged executor retains the same source guards while
 suspending the planning transaction, through publication or allocation cleanup.
 An explicit transaction keeps its snapshot: first-source capture requires a retry
 if an admitted writer committed changes to that qualified source after

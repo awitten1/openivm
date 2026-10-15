@@ -1842,3 +1842,130 @@ endloop
 statement ok
 DROP SCHEMA dl."Projection.Left";
 DROP SCHEMA dl."Projection.Right";
+
+# FULL OUTER affected keys come from each lake source's snapshots, never a
+# guessed native delta name. Exercise projection and grouped maintenance with
+# both native and lake targets in separate internal schemas.
+statement ok
+USE internal_schema_host."Control Space";
+SET openivm_internal_schema='Full Internal';
+SET openivm_full_outer_merge=false;
+SET openivm_skip_empty_deltas=false;
+CREATE SCHEMA dl."Full.Left";
+CREATE SCHEMA dl."Full.Right";
+
+foreach mv_catalog internal_schema_host dl
+
+statement ok
+CREATE TABLE dl."Full.Left"."Full;Items"(id INTEGER, v INTEGER);
+CREATE TABLE dl."Full.Right"."Full;Items"(id INTEGER, v INTEGER);
+INSERT INTO dl."Full.Left"."Full;Items" VALUES (1,10),(1,10),(2,20),(3,30),(NULL,40);
+INSERT INTO dl."Full.Right"."Full;Items" VALUES (1,100),(1,100),(2,200),(4,400),(NULL,500);
+
+statement ok
+CREATE MATERIALIZED VIEW ${mv_catalog}.main.namespace_full_projection AS
+SELECT a.id aid, a.v av, b.id bid, b.v bv
+FROM dl."Full.Left"."Full;Items" a FULL OUTER JOIN dl."Full.Right"."Full;Items" b USING(id);
+
+statement ok
+CREATE MATERIALIZED VIEW ${mv_catalog}.main.namespace_full_group AS
+SELECT a.id, COUNT(*) n
+FROM dl."Full.Left"."Full;Items" a FULL OUTER JOIN dl."Full.Right"."Full;Items" b USING(id) GROUP BY a.id;
+
+# The pinned classifier maintains FULL OUTER aggregates through source-delta
+# group recompute: the LEFT-only secondary-delta compiler does not accept this
+# join. Keep that incremental strategy rather than enabling a new aggregate
+# capability in a namespace regression. Assert each view and affected mode so
+# full refresh and current-diff recompute cannot hide qualified-source bugs.
+query TIT
+SELECT view_sql_name, type, group_recompute_affected_mode FROM internal_schema_host."Control Space".openivm_views
+WHERE view_catalog='${mv_catalog}' AND view_sql_name IN ('namespace_full_projection','namespace_full_group')
+AND view_schema='main' AND internal_schema='Full Internal' AND has_full_outer
+ORDER BY view_sql_name;
+----
+namespace_full_group	6	source_delta
+namespace_full_projection	2	source_delta
+
+# The second iteration changes only the right source; the first changes only
+# the left. Cancelled duplicates and updated keys must all consolidate.
+foreach changed_schema Full.Left Full.Right
+
+statement ok
+INSERT INTO dl."${changed_schema}"."Full;Items" VALUES (5,50),(5,50),(9,90),(9,90);
+DELETE FROM dl."${changed_schema}"."Full;Items" WHERE id IN (1,9);
+UPDATE dl."${changed_schema}"."Full;Items" SET id=4, v=v+1 WHERE id=2;
+
+statement ok
+PRAGMA refresh('${mv_catalog}.main.namespace_full_projection');
+
+query I
+SELECT count(*) FROM (
+(SELECT * FROM ${mv_catalog}.main.namespace_full_projection EXCEPT ALL
+ SELECT a.id, a.v, b.id, b.v FROM dl."Full.Left"."Full;Items" a FULL OUTER JOIN dl."Full.Right"."Full;Items" b USING(id))
+UNION ALL
+(SELECT a.id, a.v, b.id, b.v FROM dl."Full.Left"."Full;Items" a FULL OUTER JOIN dl."Full.Right"."Full;Items" b USING(id)
+ EXCEPT ALL SELECT * FROM ${mv_catalog}.main.namespace_full_projection));
+----
+0
+
+statement ok
+PRAGMA refresh('${mv_catalog}.main.namespace_full_group');
+
+query I
+SELECT count(*) FROM (
+(SELECT * FROM ${mv_catalog}.main.namespace_full_group EXCEPT ALL
+ SELECT a.id, COUNT(*) FROM dl."Full.Left"."Full;Items" a FULL OUTER JOIN dl."Full.Right"."Full;Items" b USING(id) GROUP BY a.id)
+UNION ALL
+(SELECT a.id, COUNT(*) FROM dl."Full.Left"."Full;Items" a FULL OUTER JOIN dl."Full.Right"."Full;Items" b USING(id) GROUP BY a.id
+ EXCEPT ALL SELECT * FROM ${mv_catalog}.main.namespace_full_group));
+----
+0
+
+endloop
+
+# Compile the no-source-change path too, including equal snapshot bounds for
+# a native target. Repeat both bag checks rather than only checking row counts.
+statement ok
+PRAGMA refresh('${mv_catalog}.main.namespace_full_projection');
+
+query I
+SELECT count(*) FROM (
+(SELECT * FROM ${mv_catalog}.main.namespace_full_projection EXCEPT ALL
+ SELECT a.id, a.v, b.id, b.v FROM dl."Full.Left"."Full;Items" a FULL OUTER JOIN dl."Full.Right"."Full;Items" b USING(id))
+UNION ALL
+(SELECT a.id, a.v, b.id, b.v FROM dl."Full.Left"."Full;Items" a FULL OUTER JOIN dl."Full.Right"."Full;Items" b USING(id)
+ EXCEPT ALL SELECT * FROM ${mv_catalog}.main.namespace_full_projection));
+----
+0
+
+statement ok
+PRAGMA refresh('${mv_catalog}.main.namespace_full_group');
+
+query I
+SELECT count(*) FROM (
+(SELECT * FROM ${mv_catalog}.main.namespace_full_group EXCEPT ALL
+ SELECT a.id, COUNT(*) FROM dl."Full.Left"."Full;Items" a FULL OUTER JOIN dl."Full.Right"."Full;Items" b USING(id) GROUP BY a.id)
+UNION ALL
+(SELECT a.id, COUNT(*) FROM dl."Full.Left"."Full;Items" a FULL OUTER JOIN dl."Full.Right"."Full;Items" b USING(id) GROUP BY a.id
+ EXCEPT ALL SELECT * FROM ${mv_catalog}.main.namespace_full_group));
+----
+0
+
+statement ok
+DROP VIEW ${mv_catalog}.main.namespace_full_projection;
+DROP VIEW ${mv_catalog}.main.namespace_full_group;
+DROP TABLE dl."Full.Left"."Full;Items";
+DROP TABLE dl."Full.Right"."Full;Items";
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE schema_name='Full Internal' AND starts_with(table_name,'openivm_');
+----
+0
+
+endloop
+
+statement ok
+DROP SCHEMA dl."Full.Left";
+DROP SCHEMA dl."Full.Right";
+SET openivm_full_outer_merge=true;
+SET openivm_skip_empty_deltas=true;

@@ -172,6 +172,47 @@ string BaseTableNameFromDeltaKey(const string &delta_key) {
 	return delta_key;
 }
 
+string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
+                                        int64_t current_snapshot_id) {
+	constexpr const char *DUCKLAKE_SYNTHETIC_DELTA_TS = "1970-01-02 00:00:00";
+	string delta_columns = ", 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", TIMESTAMP '" +
+	                       DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL);
+	if (last_snapshot_id == current_snapshot_id) {
+		// The next snapshot does not exist yet. Retain the source's column types
+		// without binding a change scan with an invalid snapshot range.
+		return "(SELECT *" + delta_columns + " FROM " +
+		       SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name) + " WHERE false)";
+	}
+	// Change scans include the lower bound; the stored snapshot was already consumed.
+	auto start_snapshot_id = last_snapshot_id + 1;
+	string insertions = "SELECT *" + delta_columns + " FROM " +
+	                    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
+	                                                    loc.table_name, start_snapshot_id, current_snapshot_id);
+	string deletions = "SELECT *, -1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", TIMESTAMP '" +
+	                   DUCKLAKE_SYNTHETIC_DELTA_TS + "' AS " + string(openivm::TIMESTAMP_COL) + " FROM " +
+	                   SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
+	                                                   loc.table_name, start_snapshot_id, current_snapshot_id);
+	return "(" + insertions + "\nUNION ALL\n" + deletions + ")";
+}
+
+static string ResolveFullOuterDeltaSource(RefreshMetadata &metadata, const string &view_name, const string &delta_key) {
+	if (!metadata.IsDuckLakeTable(view_name, delta_key)) {
+		return metadata.ResolveDeltaQualifiedName(view_name, delta_key);
+	}
+	auto source = metadata.GetSourceLocation(view_name, delta_key);
+	auto last_snapshot = metadata.GetLastSnapshotId(view_name, delta_key);
+	auto current_snapshot = metadata.GetCurrentDuckLakeSnapshot(source.catalog_name);
+	if (last_snapshot < 0 || current_snapshot < last_snapshot) {
+		throw CatalogException("OpenIVM missing DuckLake snapshot metadata for view '%s', source '%s'", view_name,
+		                       delta_key);
+	}
+	OPENIVM_DEBUG_PRINT("[UPSERT] FULL OUTER source %s uses snapshots %lld -> %lld\n", delta_key.c_str(),
+	                    static_cast<long long>(last_snapshot), static_cast<long long>(current_snapshot));
+	return BuildDuckLakeSignedDeltaRelation(
+	    {source.catalog_name, source.schema_name, BaseTableNameFromDeltaKey(source.table_name)}, last_snapshot,
+	    current_snapshot);
+}
+
 string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
                                  const string &extra_predicate) {
 	string predicate;
@@ -310,7 +351,7 @@ static string BuildFullOuterAffectedGroupsSubquery(RefreshMetadata &metadata, co
 			if (!changed_keys.empty()) {
 				changed_keys += "\n  UNION\n  ";
 			}
-			string q_delta = metadata.ResolveDeltaQualifiedName(view_name, delta_table);
+			string q_delta = ResolveFullOuterDeltaSource(metadata, view_name, delta_table);
 			changed_keys += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(join_col) +
 			                " AS openivm_foj_key FROM " + q_delta + where_clause;
 		};
@@ -325,11 +366,11 @@ static string BuildFullOuterAffectedGroupsSubquery(RefreshMetadata &metadata, co
 
 	if (group_cols.size() == 1) {
 		if (!foj.dt_left_name.empty()) {
-			string q_dt_left = metadata.ResolveDeltaQualifiedName(view_name, foj.dt_left_name);
+			string q_dt_left = ResolveFullOuterDeltaSource(metadata, view_name, foj.dt_left_name);
 			affected += "\n  UNION\n  SELECT DISTINCT " + keys_tuple + " FROM " + q_dt_left + delta_where_left;
 		}
 		if (!foj.dt_right_name.empty() && !foj.left_table.empty()) {
-			string q_dt_right = metadata.ResolveDeltaQualifiedName(view_name, foj.dt_right_name);
+			string q_dt_right = ResolveFullOuterDeltaSource(metadata, view_name, foj.dt_right_name);
 			auto left_source = metadata.GetSourceLocation(view_name, foj.dt_left_name);
 			string q_left_base = SqlUtils::FullName(left_source.catalog_name, left_source.schema_name,
 			                                        BaseTableNameFromDeltaKey(left_source.table_name));
@@ -871,7 +912,7 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 
 	string union_parts;
 	if (!foj.dt_left_name.empty() && !foj.left_col.empty()) {
-		string dt = metadata.ResolveDeltaQualifiedName(view_name, foj.dt_left_name);
+		string dt = ResolveFullOuterDeltaSource(metadata, view_name, foj.dt_left_name);
 		union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.left_col) + " AS _k FROM " + dt +
 		               delta_where_left;
 	}
@@ -879,7 +920,7 @@ static string BuildFullOuterProjectionRefresh(RefreshMetadata &metadata, const s
 		if (!union_parts.empty()) {
 			union_parts += "\n  UNION\n  ";
 		}
-		string dt = metadata.ResolveDeltaQualifiedName(view_name, foj.dt_right_name);
+		string dt = ResolveFullOuterDeltaSource(metadata, view_name, foj.dt_right_name);
 		union_parts += "SELECT DISTINCT " + KeywordHelper::WriteOptionallyQuoted(foj.right_col) + " AS _k FROM " + dt +
 		               delta_where_right;
 	}
