@@ -8,6 +8,9 @@
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/common/serializer/deserializer.hpp"
 #include "duckdb/common/serializer/serializer.hpp"
@@ -18,6 +21,8 @@
 #include "duckdb/execution/operator/set/physical_recursive_cte.hpp"
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/main/client_config.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/main/valid_checker.hpp"
 #include "duckdb/parallel/event.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
@@ -31,6 +36,7 @@
 #include "duckdb/parser/statement/drop_statement.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/planner.hpp"
+#include "duckdb/transaction/local_storage.hpp"
 
 #include <chrono>
 #include <cctype>
@@ -1158,6 +1164,10 @@ public:
 						                           ? BuildDropTableStatement(*drop.info)
 						                           : BuildDropViewStatement(*drop.info));
 						statement = std::move(drop_parser.statements[0]);
+					} else if (drop.info->type == CatalogType::SCHEMA_ENTRY) {
+						Parser drop_parser(options);
+						drop_parser.ParseQuery(BuildDropSchemaStatement(*drop.info));
+						statement = std::move(drop_parser.statements[0]);
 					}
 				}
 				// Binding is deliberately here, after all prior physical steps finish.
@@ -1287,18 +1297,23 @@ unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder 
 	return make_uniq<LogicalLifecycleProgram>(binder.GenerateTableIndex(), program);
 }
 
-string BuildDropViewStatement(const DropInfo &drop_info) {
-	return "SELECT * FROM openivm_execute_drop_view('" + SqlUtils::EscapeValue(drop_info.catalog) + "', '" +
+static string BuildDropEntryStatement(const DropInfo &drop_info, const string &function) {
+	return "SELECT * FROM " + function + "('" + SqlUtils::EscapeValue(drop_info.catalog) + "', '" +
 	       SqlUtils::EscapeValue(drop_info.schema) + "', '" + SqlUtils::EscapeValue(drop_info.name) + "', " +
 	       (drop_info.cascade ? "true" : "false") + ", " +
 	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
 }
 
+string BuildDropViewStatement(const DropInfo &drop_info) {
+	return BuildDropEntryStatement(drop_info, "openivm_execute_drop_view");
+}
+
 string BuildDropTableStatement(const DropInfo &drop_info) {
-	return "SELECT * FROM openivm_execute_drop_table('" + SqlUtils::EscapeValue(drop_info.catalog) + "', '" +
-	       SqlUtils::EscapeValue(drop_info.schema) + "', '" + SqlUtils::EscapeValue(drop_info.name) + "', " +
-	       (drop_info.cascade ? "true" : "false") + ", " +
-	       (drop_info.if_not_found == OnEntryNotFound::RETURN_NULL ? "true" : "false") + ")";
+	return BuildDropEntryStatement(drop_info, "openivm_execute_drop_table");
+}
+
+string BuildDropSchemaStatement(const DropInfo &drop_info) {
+	return BuildDropEntryStatement(drop_info, "openivm_execute_drop_schema");
 }
 
 struct DropViewBindData : public TableFunctionData {
@@ -1356,6 +1371,11 @@ static unique_ptr<FunctionData> BindDropTable(ClientContext &context, TableFunct
 	return BindDropEntry(context, input, return_types, names, CatalogType::TABLE_ENTRY);
 }
 
+static unique_ptr<FunctionData> BindDropSchema(ClientContext &context, TableFunctionBindInput &input,
+                                               vector<LogicalType> &return_types, vector<string> &names) {
+	return BindDropEntry(context, input, return_types, names, CatalogType::SCHEMA_ENTRY);
+}
+
 static unique_ptr<GlobalTableFunctionState> InitDropView(ClientContext &context, TableFunctionInitInput &input) {
 	return make_uniq<DropViewGlobalState>();
 }
@@ -1372,7 +1392,37 @@ static void ExecuteDropView(ClientContext &context, TableFunctionInput &input, D
 	    info.type == CatalogType::TABLE_ENTRY && SqlUtils::IsDelta(info.name) &&
 	    Catalog::GetEntry(context, info.catalog, info.schema, EntryLookupInfo(CatalogType::TABLE_ENTRY, info.name),
 	                      OnEntryNotFound::RETURN_NULL);
+	vector<reference<TableCatalogEntry>> schema_tables;
+	if (info.type == CatalogType::SCHEMA_ENTRY && info.cascade && catalog.IsDuckCatalog()) {
+		auto schema = catalog.GetSchema(context, info.name, OnEntryNotFound::RETURN_NULL);
+		if (schema) {
+			schema->Scan(context, CatalogType::TABLE_ENTRY, [&](CatalogEntry &entry) {
+				if (entry.type == CatalogType::TABLE_ENTRY) {
+					schema_tables.push_back(entry.Cast<TableCatalogEntry>());
+				}
+			});
+		}
+	}
 	catalog.DropEntry(context, info);
+	// Native schema CASCADE drops through CatalogSet, bypassing the local-storage
+	// cleanup in DuckSchemaEntry::DropEntry. Discard pending appends only after a
+	// successful DROP, or commit would flush them into the removed table allocation.
+	// Use the captured entries, not names that a later CREATE can reuse.
+	for (auto &table : schema_tables) {
+		LocalStorage::Get(context, catalog).DropTable(table.get().GetStorage());
+	}
+	if (!schema_tables.empty()) {
+		OPENIVM_DEBUG_PRINT("[DROP] Discarded local storage for %zu schema tables in %s.%s\n", schema_tables.size(),
+		                    catalog.GetName().c_str(), info.name.c_str());
+	}
+	if (info.type == CatalogType::SCHEMA_ENTRY) {
+		// Match PhysicalDrop's search-path handling when dropping the current schema.
+		auto &current = ClientData::Get(context).catalog_search_path->GetDefault();
+		if (StringUtil::CIEquals(catalog.GetName(), current.catalog) &&
+		    StringUtil::CIEquals(info.name, current.schema)) {
+			SchemaSetting::SetLocal(context, DEFAULT_SCHEMA);
+		}
+	}
 	if (source_delta_drop) {
 		TransactionalMVLockState::Get(context).RecordSourceDeltaDrop(info.catalog, info.schema, info.name);
 		OPENIVM_DEBUG_PRINT("[DROP] Recorded transaction-local source delta removal %s\n",
@@ -1396,12 +1446,14 @@ static unique_ptr<FunctionData> DeserializeDropEntry(Deserializer &deserializer,
 }
 
 TableFunction DropEntryFunction(CatalogType type) {
-	D_ASSERT(type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY);
+	D_ASSERT(type == CatalogType::TABLE_ENTRY || type == CatalogType::VIEW_ENTRY || type == CatalogType::SCHEMA_ENTRY);
 	const bool is_table = type == CatalogType::TABLE_ENTRY;
+	const bool is_schema = type == CatalogType::SCHEMA_ENTRY;
 	TableFunction function(
-	    is_table ? "openivm_execute_drop_table" : "openivm_execute_drop_view",
+	    is_schema ? "openivm_execute_drop_schema"
+	              : (is_table ? "openivm_execute_drop_table" : "openivm_execute_drop_view"),
 	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN, LogicalType::BOOLEAN},
-	    ExecuteDropView, is_table ? BindDropTable : BindDropView, InitDropView);
+	    ExecuteDropView, is_schema ? BindDropSchema : (is_table ? BindDropTable : BindDropView), InitDropView);
 	function.serialize = SerializeDropEntry;
 	function.deserialize = DeserializeDropEntry;
 	return function;
@@ -1525,6 +1577,10 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 				}
 				if (drop.info->type == CatalogType::TABLE_ENTRY) {
 					append_statement(BuildDropTableStatement(*drop.info));
+					continue;
+				}
+				if (drop.info->type == CatalogType::SCHEMA_ENTRY) {
+					append_statement(BuildDropSchemaStatement(*drop.info));
 					continue;
 				}
 			}

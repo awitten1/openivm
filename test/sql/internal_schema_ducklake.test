@@ -1647,3 +1647,92 @@ AND schema_name='Lake Internal' AND starts_with(table_name,'openivm_delta_6d6169
 OR (database_name='dl' AND schema_name='Lake Internal' AND starts_with(table_name,'openivm_'));
 ----
 0
+
+# Schema CASCADE must cross the native-metadata/lake-object boundary. Public
+# objects and sources are in the dropped schema; internals remain separately
+# placed, and a surviving sibling still owns the shared native source delta.
+statement ok
+SET openivm_metadata_schema='Control Space';
+SET openivm_internal_schema='Lake Internal';
+SET openivm_cascade_refresh='off';
+USE internal_schema_host.main;
+CREATE SCHEMA dl."Drop;Space";
+CREATE SCHEMA dl."Keep;Space";
+CREATE TABLE main.schema_shared(i INTEGER);
+INSERT INTO main.schema_shared VALUES (1),(1),(2);
+CREATE TABLE dl."Drop;Space".items(i INTEGER);
+INSERT INTO dl."Drop;Space".items VALUES (3),(3),(4);
+
+statement ok
+CREATE MATERIALIZED VIEW dl."Drop;Space"."Same.MV" AS SELECT * FROM main.schema_shared;
+CREATE MATERIALIZED VIEW dl."Keep;Space"."Same.MV" AS SELECT * FROM main.schema_shared;
+CREATE MATERIALIZED VIEW dl."Drop;Space".own_source AS SELECT * FROM dl."Drop;Space".items;
+CREATE MATERIALIZED VIEW main.schema_source_consumer AS SELECT * FROM dl."Drop;Space".items;
+
+statement ok
+CREATE TEMP TABLE schema_removed_keys AS
+SELECT view_name, view_catalog FROM internal_schema_host."Control Space".openivm_views
+WHERE (view_catalog='dl' AND view_schema='Drop;Space') OR view_sql_name='schema_source_consumer';
+
+query I
+SELECT count(*) FROM schema_removed_keys;
+----
+3
+
+statement ok
+USE internal_schema_host."Control Space";
+SELECT 'before;schema'; /* preserve; boundary */ DROP SCHEMA dl."Drop;Space" CASCADE; SELECT 1;
+
+query III
+SELECT
+(SELECT count(*) FROM internal_schema_host."Control Space".openivm_views v JOIN schema_removed_keys k USING(view_name)),
+(SELECT count(*) FROM internal_schema_host."Control Space".openivm_delta_tables d JOIN schema_removed_keys k USING(view_name)),
+(SELECT count(*) FROM duckdb_tables() t JOIN schema_removed_keys k ON t.database_name=k.view_catalog
+ AND t.table_name IN ('openivm_data_' || k.view_name, 'openivm_visible_' || k.view_name,
+                     'openivm_delta_' || k.view_name, 'openivm_delta_openivm_visible_' || k.view_name)
+ WHERE t.schema_name='Lake Internal');
+----
+0	0	0
+
+query II
+SELECT
+(SELECT count(*) FROM internal_schema_host."Control Space".openivm_views
+ WHERE view_sql_name='Same.MV' AND view_catalog='dl' AND view_schema='Keep;Space'),
+(SELECT count(*) FROM duckdb_tables() WHERE database_name='internal_schema_host'
+ AND schema_name='Lake Internal' AND table_name='openivm_delta_6d61696e_schema_shared');
+----
+1	1
+
+statement ok
+INSERT INTO main.schema_shared VALUES (1),(2),(3),(3),(5),(5);
+DELETE FROM main.schema_shared WHERE i IN (1,5);
+UPDATE main.schema_shared SET i=4 WHERE i=2;
+INSERT INTO main.schema_shared VALUES (1),(4);
+
+statement ok
+PRAGMA refresh('dl."Keep;Space"."Same.MV"');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM dl."Keep;Space"."Same.MV" EXCEPT ALL SELECT * FROM main.schema_shared)
+UNION ALL (SELECT * FROM main.schema_shared EXCEPT ALL SELECT * FROM dl."Keep;Space"."Same.MV"));
+----
+0
+
+# Dropping the final public namespace releases the native source delta too.
+statement ok
+DROP SCHEMA dl."Keep;Space" CASCADE;
+
+query III
+SELECT
+(SELECT count(*) FROM internal_schema_host."Control Space".openivm_views
+ WHERE view_catalog='dl' AND view_schema IN ('Drop;Space','Keep;Space')),
+(SELECT count(*) FROM duckdb_tables() WHERE database_name='internal_schema_host'
+ AND schema_name='Lake Internal' AND table_name='openivm_delta_6d61696e_schema_shared'),
+(SELECT count(*) FROM duckdb_tables() WHERE database_name='dl'
+ AND schema_name='Lake Internal' AND starts_with(table_name,'openivm_'));
+----
+0	0	0
+
+statement ok
+DROP TABLE schema_removed_keys;
+DROP TABLE main.schema_shared;

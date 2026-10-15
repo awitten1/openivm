@@ -22,6 +22,7 @@
 #include "upsert/refresh_compiler.hpp"
 #include "duckdb/common/printer.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/main/client_config.hpp"
 #include "duckdb/main/client_data.hpp"
@@ -43,6 +44,7 @@
 #include "core/openivm_debug.hpp"
 
 #include <chrono>
+#include <functional>
 
 namespace duckdb {
 
@@ -2088,7 +2090,10 @@ static string ExecuteAutocommitDropProgram(Connection &con, const string &progra
 	return "SELECT true AS Success";
 }
 
-static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop_info, bool defer_native_execution) {
+// TABLE CASCADE and SCHEMA CASCADE remove the same ownership closure. Build one
+// cleanup program before any physical drop, so shared source deltas are tested
+// against the complete set of removed consumers across metadata catalogs.
+static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info, bool defer_native_execution) {
 	unique_ptr<MutationLockGuard> autocommit_guard;
 	if (context.transaction.IsAutoCommit() && !defer_native_execution) {
 		autocommit_guard = make_uniq<MutationLockGuard>(context);
@@ -2096,36 +2101,51 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 		TransactionalMVLockState::Get(context).AcquireMutationLock();
 	}
 
-	QueryErrorContext error_context;
-	auto table_entry = Catalog::GetEntry(context, drop_info.catalog, drop_info.schema,
-	                                     EntryLookupInfo(CatalogType::TABLE_ENTRY, drop_info.name, error_context),
-	                                     OnEntryNotFound::RETURN_NULL);
-	if (!table_entry) {
-		// Resolve this DROP when the native driver reaches it; temporary objects
-		// may have been created by preceding statements in the same batch.
-		// Keep the unresolved reference for the DROP executor's native bind; assigning
-		// the current metadata schema here loses temporary and search-path identities.
-		return BuildDropTableStatement(drop_info) + ";\n";
-	}
-	if (table_entry) {
+	const bool schema_drop = drop_info.type == CatalogType::SCHEMA_ENTRY;
+	auto drop_statement = [&]() {
+		return (schema_drop ? BuildDropSchemaStatement(drop_info) : BuildDropTableStatement(drop_info)) + ";\n";
+	};
+	if (schema_drop) {
+		// DROP SCHEMA stores the schema in name, not in DropInfo::schema. Resolve
+		// the catalog as native PhysicalDrop does, independently of search_path.
+		auto &catalog = Catalog::GetCatalog(context, drop_info.catalog);
+		drop_info.catalog = catalog.GetName();
+		auto schema = catalog.GetSchema(context, drop_info.name, OnEntryNotFound::RETURN_NULL);
+		if (!schema || !drop_info.cascade) {
+			// RESTRICT must retain DuckDB's native dependency error, with no cleanup.
+			return drop_statement();
+		}
+		drop_info.name = schema->name;
+	} else {
+		QueryErrorContext error_context;
+		auto table_entry = Catalog::GetEntry(context, drop_info.catalog, drop_info.schema,
+		                                     EntryLookupInfo(CatalogType::TABLE_ENTRY, drop_info.name, error_context),
+		                                     OnEntryNotFound::RETURN_NULL);
+		if (!table_entry) {
+			// Resolve this DROP when the native driver reaches it; temporary objects
+			// may have been created by preceding statements in the same batch.
+			// Keep the unresolved reference for the DROP executor's native bind; assigning
+			// the current metadata schema here loses temporary and search-path identities.
+			return drop_statement();
+		}
 		drop_info.name = table_entry->name;
 		drop_info.catalog = table_entry->ParentCatalog().GetName();
 		drop_info.schema = table_entry->ParentSchema().name;
-	}
-	auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-	if (drop_info.catalog.empty()) {
-		drop_info.catalog =
-		    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
-	}
-	if (drop_info.schema.empty()) {
-		drop_info.schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
-	}
+		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
+		if (drop_info.catalog.empty()) {
+			drop_info.catalog =
+			    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
+		}
+		if (drop_info.schema.empty()) {
+			drop_info.schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
+		}
 
-	// Lifecycle/refresh programs own their internal state cleanup. They are not
-	// source-table deletions and must not produce a second set of retractions.
-	if (table_entry->temporary || SqlUtils::IsDelta(drop_info.name) ||
-	    IncrementalTableNames::IsDataTable(drop_info.name)) {
-		return BuildDropTableStatement(drop_info) + ";\n";
+		// Lifecycle/refresh programs own their internal state cleanup. They are not
+		// source-table deletions and must not produce a second set of retractions.
+		if (table_entry->temporary || SqlUtils::IsDelta(drop_info.name) ||
+		    IncrementalTableNames::IsDataTable(drop_info.name)) {
+			return drop_statement();
+		}
 	}
 
 	Connection con(*context.db);
@@ -2133,26 +2153,61 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	RefreshMetadata::UseCatalog(context, con, drop_info.catalog);
 	auto catalogs = RefreshMetadata::MetadataCatalogs(con);
-	// A first CREATE in this transaction may own metadata not yet discoverable
-	// by a helper. Include its selected catalog when replay supplies the registry.
+	// Include every transaction-local registry, even if its schema is not yet
+	// discoverable from a helper's committed catalog snapshot.
 	if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
-		auto location = RefreshMetadata::CurrentLocation(con);
-		if (std::find(catalogs.begin(), catalogs.end(), location.catalog_name) == catalogs.end()) {
-			metadata_state->Apply(con);
-			if (con.TableInfo(openivm::DELTA_TABLES_TABLE)) {
-				catalogs.push_back(location.catalog_name);
+		for (auto &location : metadata_state->MetadataLocations()) {
+			if (std::find(catalogs.begin(), catalogs.end(), location.first) == catalogs.end()) {
+				catalogs.push_back(location.first);
 			}
 		}
 	}
+	vector<pair<string, string>> roots;
 	vector<string> dependent_views;
 	vector<RefreshMetadata::DeltaSource> sources;
 	string program;
 	unordered_map<string, string> excluded_consumers;
 	bool staged_drop = false;
-	for (auto &catalog : catalogs) {
+	auto select_metadata = [&](const string &catalog) {
 		RefreshMetadata::UseCatalog(context, con, catalog);
 		if (auto metadata_state = TransactionalMVMetadataState::TryGet(context)) {
 			metadata_state->Apply(con);
+		}
+	};
+	for (auto &catalog : catalogs) {
+		select_metadata(catalog);
+		if (schema_drop) {
+			auto namespace_matches = [&](const string &catalog_name, const string &schema_name) {
+				return StringUtil::CIEquals(catalog_name, drop_info.catalog) &&
+				       StringUtil::CIEquals(schema_name, drop_info.name);
+			};
+			auto metadata_location = RefreshMetadata::CurrentLocation(con);
+			auto rows = con.Query("SELECT view_name FROM " + string(openivm::VIEWS_TABLE) + " ORDER BY view_name");
+			if (rows->HasError()) {
+				throw CatalogException("OpenIVM could not resolve schema ownership for '%s': %s", drop_info.name,
+				                       rows->GetError());
+			}
+			RefreshMetadata metadata(con);
+			for (idx_t row = 0; row < rows->RowCount(); row++) {
+				auto key = rows->GetValue(0, row).ToString();
+				auto location = metadata.GetStoredViewLocation(key);
+				auto internal = metadata.GetInternalLocation(key);
+				// Public objects, backing objects, sources and source deltas have
+				// independent placements. Dropping any owner's namespace needs the
+				// same cleanup; dropping the registry removes every local owner.
+				bool affected = namespace_matches(metadata_location.catalog_name, metadata_location.schema_name) ||
+				                namespace_matches(location.catalog_name, location.schema_name) ||
+				                namespace_matches(internal.catalog_name, internal.schema_name);
+				for (auto &source : metadata.GetDeltaSources(key, location.catalog_name, location.schema_name)) {
+					affected |= namespace_matches(source.catalog_name, source.schema_name) ||
+					            (source.catalog_type != "ducklake" &&
+					             namespace_matches(source.catalog_name, source.delta_schema_name));
+				}
+				if (affected) {
+					roots.emplace_back(catalog, std::move(key));
+				}
+			}
+			continue;
 		}
 		auto dependent_rows = con.Query(
 		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
@@ -2173,46 +2228,78 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 			           ? ExecuteAutocommitDropProgram(con, retract)
 			           : retract;
 		}
-		RefreshMetadata metadata(con);
-		vector<string> local_views;
-		unordered_set<string> seen;
 		for (idx_t row = 0; row < dependent_rows->RowCount(); row++) {
-			auto direct_view = dependent_rows->GetValue(0, row).ToString();
-			auto downstream = metadata.GetDownstreamViewsStrict(direct_view);
-			for (auto it = downstream.rbegin(); it != downstream.rend(); ++it) {
-				if (seen.insert(*it).second) {
-					local_views.push_back(*it);
-				}
+			roots.emplace_back(catalog, dependent_rows->GetValue(0, row).ToString());
+		}
+	}
+	// Follow physical MV sources in every metadata catalog. A child in another
+	// catalog reads the parent's maintenance schema, not its public schema, and
+	// would otherwise be invisible to a public-schema CASCADE.
+	unordered_set<string> seen;
+	std::function<void(const pair<string, string> &)> collect = [&](const pair<string, string> &view) {
+		select_metadata(view.first);
+		auto metadata_location = RefreshMetadata::CurrentLocation(con);
+		if (!seen.insert(SqlUtils::FullName(metadata_location.catalog_name, metadata_location.schema_name, view.second))
+		         .second) {
+			return;
+		}
+		auto internal = RefreshMetadata(con).GetInternalLocation(view.second);
+		string predicate;
+		for (auto &source : {SqlUtils::DeltaName(view.second), IncrementalTableNames::DataTableName(view.second),
+		                     PublishedViewName(view.second), SqlUtils::DeltaName(PublishedViewName(view.second))}) {
+			if (!predicate.empty()) {
+				predicate += " OR ";
 			}
-			if (seen.insert(direct_view).second) {
-				local_views.push_back(std::move(direct_view));
+			predicate +=
+			    "(" + RefreshMetadata::SourcePredicate(source, internal.catalog_name, internal.schema_name) + ")";
+		}
+		vector<pair<string, string>> children;
+		for (auto &catalog : catalogs) {
+			select_metadata(catalog);
+			auto rows = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
+			                      predicate + " ORDER BY view_name");
+			if (rows->HasError()) {
+				throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view.second,
+				                       rows->GetError());
+			}
+			for (idx_t row = 0; row < rows->RowCount(); row++) {
+				children.emplace_back(catalog, rows->GetValue(0, row).ToString());
 			}
 		}
+		for (auto &child : children) {
+			collect(child);
+		}
+		select_metadata(view.first);
+		RefreshMetadata metadata(con);
+		auto location = metadata.GetStoredViewLocation(view.second);
 		string local_program;
-		string local_excluded_views;
-		for (auto &view_name : local_views) {
-			auto location = metadata.GetStoredViewLocation(view_name);
-			AppendTrackedViewDropProgram(context, metadata, view_name, location, local_program, sources, true,
-			                             OnEntryNotFound::RETURN_NULL);
-			TransactionalMVMetadataState::Get(context).RegisterViewDrop(view_name);
-			if (!local_excluded_views.empty()) {
-				local_excluded_views += ", ";
-			}
-			local_excluded_views += "'" + SqlUtils::EscapeValue(view_name) + "'";
+		AppendTrackedViewDropProgram(context, metadata, view.second, location, local_program, sources, true,
+		                             OnEntryNotFound::RETURN_NULL);
+		TransactionalMVMetadataState::Get(context).RegisterViewDrop(view.second);
+		auto &excluded = excluded_consumers[RefreshMetadata::MetadataTable(con, openivm::DELTA_TABLES_TABLE)];
+		if (!excluded.empty()) {
+			excluded += ", ";
 		}
-		excluded_consumers[RefreshMetadata::MetadataTable(con, openivm::DELTA_TABLES_TABLE)] = local_excluded_views;
-		program += QualifyDropMetadata(local_program, RefreshMetadata::CurrentLocation(con));
-		dependent_views.insert(dependent_views.end(), local_views.begin(), local_views.end());
-		staged_drop |= !StringUtil::CIEquals(catalog, drop_info.catalog);
+		excluded += Value(view.second).ToSQLString();
+		program += QualifyDropMetadata(local_program, metadata_location);
+		dependent_views.push_back(view.second);
+		staged_drop |= !StringUtil::CIEquals(view.first, drop_info.catalog) ||
+		               !StringUtil::CIEquals(location.catalog_name, drop_info.catalog) ||
+		               metadata.IsDuckLakeCatalog(location.catalog_name);
+	};
+	for (auto &root : roots) {
+		collect(root);
 	}
 	if (dependent_views.empty()) {
-		return BuildDropTableStatement(drop_info) + ";\n";
+		return drop_statement();
 	}
 	AppendUnusedSourceDropProgram(context, con, sources, program, excluded_consumers);
 	for (auto &source : sources) {
 		staged_drop |= !StringUtil::CIEquals(source.catalog_name, drop_info.catalog);
 	}
-	program += BuildDropTableStatement(drop_info) + ";\n";
+	program += drop_statement();
+	OPENIVM_DEBUG_PRINT("[DROP] Compiled %s cleanup for '%s', views=%zu, staged=%d\n",
+	                    schema_drop ? "schema" : "source", drop_info.name.c_str(), dependent_views.size(), staged_drop);
 	if (context.transaction.IsAutoCommit()) {
 		if (staged_drop) {
 			ExecuteStagedDDL(context, {Value(program)});
@@ -2232,9 +2319,12 @@ static string BuildSourceDropTableProgram(ClientContext &context, DropInfo &drop
 
 static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo &drop_info,
                                                bool defer_native_execution) {
+	if (drop_info.type == CatalogType::SCHEMA_ENTRY) {
+		return BuildSourceDropProgram(context, drop_info, defer_native_execution);
+	}
 	Binder::BindSchemaOrCatalog(context, drop_info.catalog, drop_info.schema);
 	if (drop_info.type == CatalogType::TABLE_ENTRY) {
-		return BuildSourceDropTableProgram(context, drop_info, defer_native_execution);
+		return BuildSourceDropProgram(context, drop_info, defer_native_execution);
 	}
 	if (drop_info.type != CatalogType::VIEW_ENTRY) {
 		throw InternalException("OpenIVM DROP rewrite expected DROP VIEW");
@@ -2386,7 +2476,8 @@ void BindMaterializedViewLifecycle(PlannerExtensionInput &input, BoundStatement 
 		return;
 	}
 	auto &drop = statement.plan->Cast<LogicalSimple>().info->Cast<DropInfo>();
-	if (drop.type != CatalogType::TABLE_ENTRY && drop.type != CatalogType::VIEW_ENTRY) {
+	if (drop.type != CatalogType::TABLE_ENTRY && drop.type != CatalogType::VIEW_ENTRY &&
+	    drop.type != CatalogType::SCHEMA_ENTRY) {
 		return;
 	}
 	auto program = BuildMaterializedViewDropProgram(input.context, drop, true);

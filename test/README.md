@@ -26,6 +26,14 @@ Snapshot publications in quoted internal schemas check creation, chained reads,
 reopen and refresh. The lifecycle executable also checks reference matching with
 quoted dots and escaped quotes: catalog/schema components must remain distinct
 when pinning maintenance scans, and existing pins must be replaced exactly once.
+Native schema-drop cases verify pending-insert cleanup across repeated schema/table
+name reuse, commit and rollback, through both SQL DROP and its physical executor. A
+same-named source in another schema keeps its pending data and refreshes with full
+bag equality. The larger schema-cascade matrix retains ownership, auxiliary-state
+cleanup and native/DuckLake placement checks. Its COUNT(DISTINCT) fixture uses
+distinct group/value column names, requires incremental classification, and
+checks the auxiliary column identity and full tuple-count bag at creation,
+after rollback and after the surviving view refreshes.
 The Python integration wrapper supplies a temporary database path and removes it
 after execution. After building the executable, a focused diagnostic uses the
 same wrapper as the normal test target:
@@ -96,6 +104,17 @@ and a bidirectional `EXCEPT ALL` comparison; final-consumer cleanup must remove
 all maintenance tables. A cross-catalog source consumer and an exclusion list containing its key
 also verify that direct CASCADE exclusions and staged final DROP retain the
 consumer's catalog/schema identity.
+
+Schema CASCADE cases cover public/source, control, and internal namespaces with
+separate placement, quoted names, and a non-default search path. They check
+RESTRICT and absent schemas, replacement before DROP, DROP/recreate in one
+transaction, commit/rollback, auxiliary state, cross-catalog descendants, shared
+siblings, and final-consumer cleanup. Concurrent schema DROP uses the same
+deterministic mutation-gate fixture as view DROP. Every surviving MV receives
+conflicting batched writes and bidirectional `EXCEPT ALL` checks. The DuckLake
+fixture also drops public/source schemas through staged native-metadata cleanup,
+retains a shared native source delta for a lake sibling, and removes it with the
+final public namespace.
 
 Unicode CASCADE cases keep `"Ä".items` and `"ä".items`, plus same-named MVs,
 distinct with separate metadata and maintenance schemas. Replacement followed by

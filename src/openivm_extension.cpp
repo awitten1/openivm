@@ -417,6 +417,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(SourceWatermarkFunction());
 	loader.RegisterFunction(DropEntryFunction(CatalogType::VIEW_ENTRY));
 	loader.RegisterFunction(DropEntryFunction(CatalogType::TABLE_ENTRY));
+	loader.RegisterFunction(DropEntryFunction(CatalogType::SCHEMA_ENTRY));
 
 	TableFunction compute_delta_function("ComputeDelta",
 	                                     {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},

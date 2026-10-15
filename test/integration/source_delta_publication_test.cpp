@@ -320,9 +320,9 @@ static void TestPublication(bool explicit_transaction) {
 	}
 }
 
-static void TestDropDuringPublication(bool explicit_transaction, bool staged_drop) {
+static void TestDropDuringPublication(bool explicit_transaction, bool staged_drop, bool schema_drop = false) {
 	std::cerr << "CASE drop during publication explicit_transaction=" << explicit_transaction
-	          << " staged_drop=" << staged_drop << std::endl;
+	          << " staged_drop=" << staged_drop << " schema_drop=" << schema_drop << std::endl;
 	DuckDB db(nullptr);
 	Connection creator(db), dropper(db), observer(db);
 	Execute(creator, "LOAD openivm; SET openivm_disable_daemon=true; "
@@ -335,6 +335,11 @@ static void TestDropDuringPublication(bool explicit_transaction, bool staged_dro
 		Execute(creator, "ATTACH ':memory:' AS other;");
 		dropped_view = "other.main.first_mv";
 	}
+	const string dropped_schema = staged_drop ? "other.\"Drop;Space\"" : "memory.\"Drop;Space\"";
+	if (schema_drop) {
+		Execute(creator, "CREATE SCHEMA " + dropped_schema + ";");
+		dropped_view = dropped_schema + ".first_mv";
+	}
 	Execute(creator, "CREATE MATERIALIZED VIEW " + dropped_view + " AS SELECT * FROM source;");
 	creator.context->transaction.BeginTransaction();
 	auto parsed = ParseMaterializedViewStatement("CREATE MATERIALIZED VIEW second_mv AS SELECT * FROM source;",
@@ -345,7 +350,10 @@ static void TestDropDuringPublication(bool explicit_transaction, bool staged_dro
 		Execute(dropper, "BEGIN;");
 	}
 	auto gate = RefreshLocks::AcquireGate(DatabaseInstance::GetDatabase(*creator.context));
-	auto competing = std::async(std::launch::async, [&]() { Execute(dropper, "DROP VIEW " + dropped_view + ";"); });
+	auto competing = std::async(std::launch::async, [&]() {
+		Execute(dropper,
+		        schema_drop ? "DROP SCHEMA " + dropped_schema + " CASCADE;" : "DROP VIEW " + dropped_view + ";");
+	});
 	try {
 		// Old DROP reaches this wait only AFTER deciding to delete the delta;
 		// corrected DROP waits BEFORE reading any ownership metadata.
@@ -1333,6 +1341,288 @@ static void TestBatchedViewDrop(bool explicit_transaction, bool commit, bool dis
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
 }
 
+// Schema CASCADE must discard local appends to each removed allocation, even
+// when its SQL name is reused before commit. Another schema's same-named table
+// and its pending source deltas must survive.
+static void TestSchemaDropPendingAppends(bool commit, bool executor_drop) {
+	std::cerr << "CASE schema DROP pending appends commit=" << commit << " executor_drop=" << executor_drop
+	          << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	const string source = "memory.\"Drop;Space\".items";
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE SCHEMA \"Drop;Space\"; CREATE TABLE " +
+	                   source + "(i INTEGER); INSERT INTO " + source +
+	                   " VALUES (1),(1),(2); "
+	                   "CREATE TABLE main.items(i INTEGER); INSERT INTO main.items VALUES (3),(3),(4); "
+	                   "CREATE MATERIALIZED VIEW main.mv AS SELECT * FROM main.items; "
+	                   "USE memory.\"Control.Space\"; BEGIN; "
+	                   "INSERT INTO main.items VALUES (1),(2),(3),(3); DELETE FROM main.items WHERE i=1; "
+	                   "UPDATE main.items SET i=4 WHERE i=2;");
+	for (idx_t generation = 0; generation < 2; generation++) {
+		Execute(owner, "INSERT INTO " + source + " VALUES (5),(5),(6); DELETE FROM " + source + " WHERE i=5; UPDATE " +
+		                   source + " SET i=9 WHERE i=6;");
+		Execute(owner,
+		        executor_drop
+		            ? "SELECT * FROM openivm_execute_drop_schema('memory', '', 'Drop;Space', true, false);"
+		            : "SELECT 'before;schema'; /* pending; appends */ DROP SCHEMA memory.\"Drop;Space\" CASCADE;");
+		Execute(owner, "CREATE SCHEMA memory.\"Drop;Space\"; CREATE TABLE " + source + "(i INTEGER); INSERT INTO " +
+		                   source + " VALUES (7),(7),(8);");
+	}
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	const vector<pair<string, string>> expected = {
+	    {source, commit ? "SELECT * FROM (VALUES (7),(7),(8))" : "SELECT * FROM (VALUES (1),(1),(2))"},
+	    {"main.items",
+	     commit ? "SELECT * FROM (VALUES (3),(3),(3),(3),(4),(4))" : "SELECT * FROM (VALUES (3),(3),(4))"}};
+	for (auto &table : expected) {
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + table.first + " EXCEPT ALL " + table.second +
+		                   ") OR EXISTS (" + table.second + " EXCEPT ALL SELECT * FROM " + table.first +
+		                   ") THEN error('Schema reuse lost committed or restored appends') ELSE true END;");
+	}
+	Execute(owner, "INSERT INTO main.items VALUES (1),(2),(3),(3); DELETE FROM main.items WHERE i=1; "
+	               "UPDATE main.items SET i=4 WHERE i=2;");
+	RefreshAndCheckBag(owner, "main.mv", "SELECT * FROM main.items");
+	Execute(owner,
+	        "DROP VIEW main.mv; DROP SCHEMA memory.\"Drop;Space\" CASCADE; "
+	        "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Schema append fixture leaked maintenance tables') END "
+	        "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
+// Schema CASCADE must clean both public MVs and out-of-schema consumers of
+// sources, while retaining an independent sibling's shared physical delta.
+static void TestSchemaCascade(bool explicit_transaction, bool commit, bool cross_catalog) {
+	std::cerr << "CASE schema cascade explicit_transaction=" << explicit_transaction << " commit=" << commit
+	          << " cross_catalog=" << cross_catalog << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db), helper(db);
+	const string dropped_schema = "memory.\"Drop;Space\"";
+	const string own_source = dropped_schema + ".items";
+	const string shared_source = "memory.\"Keep.Space\".items";
+	// Keep the group output distinct from the counted value's auxiliary column.
+	// This exercises namespace cleanup without the baseline COUNT(DISTINCT)
+	// duplicate-column alias defect for SELECT i, count(DISTINCT i).
+	const string shared_query = "SELECT i AS g, count(DISTINCT i) AS n FROM " + shared_source + " GROUP BY i";
+	const string sibling = "memory.\"Keep.Space\".\"Same.MV\"";
+	const string new_sibling = "memory.\"Keep.Space\".\"New;MV\"";
+	const string child_catalog = cross_catalog ? "Peer.Catalog" : "memory";
+	const string child = SqlUtils::FullName(child_catalog, "main", "Child;MV");
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "SET openivm_stateful_auxstate=true; "
+	               "CREATE SCHEMA \"Drop;Space\"; CREATE SCHEMA \"Keep.Space\"; "
+	               "CREATE TABLE " +
+	                   own_source + "(i INTEGER); CREATE TABLE " + shared_source + "(i INTEGER); INSERT INTO " +
+	                   own_source + " VALUES (1),(1),(2); INSERT INTO " + shared_source +
+	                   " VALUES (3),(3),(4); CREATE MATERIALIZED VIEW " + dropped_schema +
+	                   ".\"Same.MV\" AS SELECT * FROM " + own_source + "; CREATE MATERIALIZED VIEW " + dropped_schema +
+	                   ".\"Shared;MV\" AS " + shared_query + "; CREATE MATERIALIZED VIEW " + sibling +
+	                   " AS SELECT * FROM " + shared_source +
+	                   "; CREATE MATERIALIZED VIEW main.source_consumer AS SELECT * FROM " + own_source + ";");
+	if (cross_catalog) {
+		Execute(owner, "ATTACH ':memory:' AS \"Peer.Catalog\"; CREATE SCHEMA \"Peer.Catalog\".\"Drop;Space\"; "
+		               "CREATE TABLE \"Peer.Catalog\".\"Drop;Space\".items(i INTEGER); "
+		               "INSERT INTO \"Peer.Catalog\".\"Drop;Space\".items VALUES (8),(8),(9); "
+		               "CREATE MATERIALIZED VIEW \"Peer.Catalog\".\"Drop;Space\".\"Same.MV\" "
+		               "AS SELECT * FROM \"Peer.Catalog\".\"Drop;Space\".items;");
+	}
+	Execute(owner, "CREATE MATERIALIZED VIEW " + child + " AS SELECT * FROM " + dropped_schema + ".\"Shared;MV\";");
+	const vector<pair<string, string>> removed = {
+	    {"memory", "Drop;Space"}, {"memory", "Drop;Space"}, {"memory", "main"}, {child_catalog, "main"}};
+	const vector<string> removed_names = {"Same.MV", "Shared;MV", "source_consumer", "Child;MV"};
+	string owned_predicate;
+	string auxiliary_table;
+	RefreshMetadata::CountDistinctAuxMeta auxiliary_meta;
+	for (idx_t index = 0; index < removed.size(); index++) {
+		RefreshMetadata::UseCatalog(*owner.context, helper, removed[index].first);
+		RefreshMetadata metadata(helper);
+		auto key = metadata.FindViewKey(removed[index].first, removed[index].second, removed_names[index]);
+		if (key.empty()) {
+			throw InvalidInputException("Schema CASCADE fixture has no registered MV");
+		}
+		auto auxiliary = metadata.GetAuxiliaryTables(key);
+		if (index == 1 && auxiliary.empty()) {
+			throw InvalidInputException("Schema CASCADE fixture must own auxiliary state");
+		}
+		if (index == 1) {
+			if (metadata.GetViewType(key) != RefreshType::COUNT_DISTINCT_INCREMENTAL ||
+			    !metadata.GetCountDistinctAuxMeta(key, auxiliary_meta)) {
+				throw InvalidInputException("Schema CASCADE fixture must use incremental COUNT(DISTINCT)");
+			}
+			auto internal = metadata.GetInternalLocation(key);
+			auxiliary_table = SqlUtils::FullName(internal.catalog_name, internal.schema_name, auxiliary_meta.aux_table);
+		}
+		vector<string> tables = {IncrementalTableNames::DataTableName(key), PublishedViewName(key),
+		                         SqlUtils::DeltaName(key), SqlUtils::DeltaName(PublishedViewName(key))};
+		tables.insert(tables.end(), auxiliary.begin(), auxiliary.end());
+		for (auto &table : tables) {
+			if (!owned_predicate.empty()) {
+				owned_predicate += " OR ";
+			}
+			owned_predicate += "(database_name=" + Value(removed[index].first).ToSQLString() +
+			                   " AND schema_name='Internal Space' AND table_name=" + Value(table).ToSQLString() + ")";
+		}
+	}
+	auto check_auxiliary_state = [&]() {
+		if (!RefreshMetadata(helper).TableColumnsMatch(
+		        "memory", "Internal Space", auxiliary_meta.aux_table,
+		        RefreshMetadata::ExpectedCountDistinctAuxColumns(auxiliary_meta))) {
+			throw InvalidInputException("Schema CASCADE changed the auxiliary column identity");
+		}
+		auto expected =
+		    "SELECT i AS g, i, count(*)::BIGINT AS _count FROM " + shared_source + " WHERE i IS NOT NULL GROUP BY i";
+		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + auxiliary_table + " EXCEPT ALL " + expected +
+		                   ") OR EXISTS (" + expected + " EXCEPT ALL SELECT * FROM " + auxiliary_table +
+		                   ") THEN error('Schema CASCADE auxiliary bag mismatch') ELSE true END;");
+	};
+	check_auxiliary_state();
+	auto owned_query = "SELECT database_name, schema_name, table_name FROM duckdb_tables() WHERE " + owned_predicate;
+	auto original = owner.Query(owned_query);
+	if (original->HasError() || original->RowCount() == 0) {
+		throw InvalidInputException("Schema CASCADE fixture has no maintenance tables");
+	}
+	const auto original_count = original->RowCount();
+	Execute(owner, "USE memory.\"Control.Space\"; DROP SCHEMA IF EXISTS memory.\"Missing;Space\" CASCADE;");
+	auto restricted = owner.Query("DROP SCHEMA " + dropped_schema + ";");
+	if (!restricted->HasError() || restricted->GetError().find("depend") == string::npos) {
+		throw InvalidInputException("Schema RESTRICT must retain the native dependency error");
+	}
+	Execute(owner, "SELECT CASE WHEN (SELECT count(*) FROM (" + owned_query + "))=" + to_string(original_count) +
+	                   " THEN true ELSE error('Schema RESTRICT mutated maintenance objects') END;");
+	if (explicit_transaction) {
+		// Replacement contributes metadata replay before the schema cleanup.
+		Execute(owner, "BEGIN; CREATE OR REPLACE MATERIALIZED VIEW " + dropped_schema +
+		                   ".\"Same.MV\" AS SELECT * FROM " + own_source + ";");
+	}
+	Execute(owner, "SELECT 'before;schema'; /* drop; comment */ DROP SCHEMA " + dropped_schema + " CASCADE; SELECT 1;");
+	Execute(owner, "SELECT CASE WHEN NOT EXISTS (" + owned_query +
+	                   ") THEN true ELSE error('Schema CASCADE leaked maintenance objects') END;");
+	Execute(owner, "SELECT CASE WHEN count(*)=1 AND min(view_schema)='Keep.Space' "
+	               "THEN true ELSE error('Schema CASCADE leaked registry rows or removed a sibling') END "
+	               "FROM memory.\"Control.Space\".openivm_views;");
+	if (cross_catalog) {
+		Execute(owner, "SELECT CASE WHEN count(*)=1 AND min(view_schema)='Drop;Space' "
+		               "THEN true ELSE error('Schema CASCADE lost cross-catalog registry identity') END "
+		               "FROM \"Peer.Catalog\".\"Control.Space\".openivm_views;");
+	}
+	if (explicit_transaction) {
+		// Reuse the same schema and physical MV key before commit. Neither the
+		// removed source owner nor its old allocation may leak into this CREATE.
+		Execute(owner, "CREATE SCHEMA " + dropped_schema + "; CREATE TABLE " + own_source +
+		                   "(i INTEGER); INSERT INTO " + own_source + " VALUES (7),(7),(8); CREATE MATERIALIZED VIEW " +
+		                   dropped_schema + ".\"Same.MV\" AS SELECT * FROM " + own_source + "; DROP SCHEMA " +
+		                   dropped_schema + " CASCADE;");
+	}
+	// A later CREATE must replay the schema cleanup without losing the sibling
+	// that still owns the shared delta. Rollback must restore all prior owners.
+	Execute(owner, "CREATE MATERIALIZED VIEW " + new_sibling + " AS SELECT * FROM " + shared_source + ";");
+	if (explicit_transaction) {
+		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	}
+	const bool retained = explicit_transaction && !commit;
+	Execute(owner, "SELECT CASE WHEN (SELECT count(*) FROM (" + owned_query +
+	                   "))=" + to_string(retained ? original_count : 0) +
+	                   " THEN true ELSE error('Schema CASCADE commit/rollback lost maintenance objects') END;");
+	if (retained) {
+		check_auxiliary_state();
+	}
+	vector<pair<string, string>> survivors = {{sibling, "SELECT * FROM " + shared_source}};
+	if (!retained) {
+		survivors.emplace_back(new_sibling, "SELECT * FROM " + shared_source);
+	} else {
+		survivors.emplace_back(dropped_schema + ".\"Same.MV\"", "SELECT * FROM " + own_source);
+		survivors.emplace_back(dropped_schema + ".\"Shared;MV\"", shared_query);
+		survivors.emplace_back("memory.main.source_consumer", "SELECT * FROM " + own_source);
+		survivors.emplace_back(child, "SELECT * FROM " + dropped_schema + ".\"Shared;MV\"");
+	}
+	if (cross_catalog) {
+		survivors.emplace_back("\"Peer.Catalog\".\"Drop;Space\".\"Same.MV\"",
+		                       "SELECT * FROM \"Peer.Catalog\".\"Drop;Space\".items");
+	}
+	vector<string> sources = {shared_source};
+	if (retained) {
+		sources.push_back(own_source);
+	}
+	if (cross_catalog) {
+		sources.push_back("\"Peer.Catalog\".\"Drop;Space\".items");
+	}
+	for (auto &source : sources) {
+		Execute(owner, "INSERT INTO " + source + " VALUES (1),(2),(3),(3); DELETE FROM " + source +
+		                   " WHERE i IN (1,8); UPDATE " + source + " SET i=4 WHERE i IN (2,9); INSERT INTO " + source +
+		                   " VALUES (1),(4),(5); DELETE FROM " + source + " WHERE i=5; UPDATE " + source +
+		                   " SET i=2 WHERE i=4;");
+	}
+	for (auto &view : survivors) {
+		RefreshAndCheckBag(owner, view.first, view.second);
+	}
+	if (retained) {
+		check_auxiliary_state();
+	}
+	// A rolled-back schema is removed again through the same cleanup path.
+	if (retained) {
+		Execute(owner, "DROP SCHEMA " + dropped_schema + " CASCADE;");
+	}
+	Execute(owner, "DROP VIEW " + sibling + ";");
+	if (!retained) {
+		Execute(owner, "DROP VIEW " + new_sibling + ";");
+	}
+	if (cross_catalog) {
+		Execute(owner, "DROP SCHEMA \"Peer.Catalog\".\"Drop;Space\" CASCADE;");
+	}
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Schema final-consumer cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+	for (auto &catalog : cross_catalog ? vector<string> {"memory", "Peer.Catalog"} : vector<string> {"memory"}) {
+		const auto views = SqlUtils::FullName(catalog, "Control.Space", openivm::VIEWS_TABLE);
+		const auto deltas = SqlUtils::FullName(catalog, "Control.Space", openivm::DELTA_TABLES_TABLE);
+		Execute(owner, "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM " + views + ") AND NOT EXISTS (SELECT 1 FROM " +
+		                   deltas + ") THEN true ELSE error('Schema final-consumer metadata cleanup leaked') END;");
+	}
+	Execute(owner,
+	        "CREATE SCHEMA \"Current;Space\"; USE memory.\"Current;Space\"; "
+	        "CREATE TABLE scratch(i INTEGER); DROP SCHEMA memory.\"Current;Space\" CASCADE; "
+	        "SELECT CASE WHEN current_schema()='main' THEN true ELSE error('Schema DROP lost search path reset') END;");
+}
+
+static void TestOwnedNamespaceCascade(const string &schema, bool commit) {
+	std::cerr << "CASE owned namespace cascade schema=" << schema << " commit=" << commit << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; SET openivm_cascade_refresh='off'; "
+	               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
+	               "CREATE TABLE source(i INTEGER); INSERT INTO source VALUES (1),(1),(2); "
+	               "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source; "
+	               "CREATE MATERIALIZED VIEW sibling AS SELECT * FROM source;");
+	auto initial = owner.Query("SELECT count(*) FROM duckdb_tables() WHERE schema_name='Internal Space'");
+	if (initial->HasError() || initial->RowCount() != 1) {
+		throw InvalidInputException("Owned namespace fixture could not read initial table count");
+	}
+	auto initial_count = initial->GetValue(0, 0).GetValue<int64_t>();
+	Execute(owner, "BEGIN; DROP SCHEMA " + SqlUtils::QuoteIdentifier(schema) + " CASCADE;");
+	Execute(owner, "SELECT CASE WHEN NOT EXISTS (SELECT 1 FROM duckdb_views() WHERE view_name IN ('mv','sibling')) "
+	               "AND NOT EXISTS (SELECT 1 FROM duckdb_tables() WHERE schema_name='Internal Space') "
+	               "THEN true ELSE error('Owned namespace CASCADE left live consumers or tables') END;");
+	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
+	Execute(owner, "SELECT CASE WHEN (SELECT count(*) FROM duckdb_views() WHERE view_name IN ('mv','sibling'))=" +
+	                   string(commit ? "0" : "2") +
+	                   " AND (SELECT count(*) FROM duckdb_tables() WHERE schema_name='Internal Space')=" +
+	                   to_string(commit ? 0 : initial_count) +
+	                   " THEN true ELSE error('Owned namespace transaction lost ownership') END;");
+	if (commit) {
+		// Missing control/internal schemas are recreated by the normal lifecycle.
+		Execute(owner, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source;");
+	}
+	Execute(owner, "INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
+	               "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (4),(5); DELETE FROM source WHERE i=5;");
+	RefreshAndCheckBag(owner, "mv", "SELECT * FROM source");
+	if (!commit) {
+		RefreshAndCheckBag(owner, "sibling", "SELECT * FROM source");
+		Execute(owner, "DROP VIEW sibling;");
+	}
+	Execute(owner, "DROP VIEW mv;");
+	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Owned namespace final cleanup leaked') END "
+	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
+}
+
 static void TestMixedLifecycleBatch(bool explicit_transaction, bool commit) {
 	std::cerr << "CASE mixed lifecycle explicit_transaction=" << explicit_transaction << " commit=" << commit
 	          << std::endl;
@@ -1783,6 +2073,18 @@ int main(int argc, char **argv) {
 			}
 		}
 		TestStagedCascadeConsumerIdentity();
+		for (bool executor_drop : {false, true}) {
+			TestSchemaDropPendingAppends(true, executor_drop);
+			TestSchemaDropPendingAppends(false, executor_drop);
+		}
+		TestSchemaCascade(false, true, false);
+		TestSchemaCascade(true, true, false);
+		TestSchemaCascade(true, false, false);
+		TestSchemaCascade(false, true, true);
+		for (const auto &schema : vector<string> {"Control.Space", "Internal Space"}) {
+			TestOwnedNamespaceCascade(schema, true);
+			TestOwnedNamespaceCascade(schema, false);
+		}
 		for (bool batched_drop : {false, true}) {
 			TestUnicodeSourceCascade(false, true, false, batched_drop);
 			TestUnicodeSourceCascade(true, true, false, batched_drop);
@@ -1800,6 +2102,9 @@ int main(int argc, char **argv) {
 		TestDropDuringPublication(false, false);
 		TestDropDuringPublication(true, false);
 		TestDropDuringPublication(false, true);
+		TestDropDuringPublication(false, false, true);
+		TestDropDuringPublication(true, false, true);
+		TestDropDuringPublication(false, true, true);
 		TestMixedLifecycleBatch(false, true);
 		TestMixedLifecycleBatch(true, true);
 		TestMixedLifecycleBatch(true, false);

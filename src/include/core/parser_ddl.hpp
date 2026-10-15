@@ -77,6 +77,7 @@ string BuildSourceWatermarkUpdate(const string &metadata_table, const string &vi
 ScalarFunction SourceWatermarkFunction();
 string BuildDropViewStatement(const DropInfo &drop_info);
 string BuildDropTableStatement(const DropInfo &drop_info);
+string BuildDropSchemaStatement(const DropInfo &drop_info);
 unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder &binder, const string &program);
 TableFunction DropEntryFunction(CatalogType type);
 
