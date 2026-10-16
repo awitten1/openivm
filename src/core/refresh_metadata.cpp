@@ -740,7 +740,8 @@ void RefreshMetadata::SetRefreshInProgress(const string &view_name, bool in_prog
 
 string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string &metadata_key,
                                              const string &delta_metadata_table, vector<string> *deferred_cleanup,
-                                             const vector<MetadataLocation> &metadata_locations) {
+                                             const vector<MetadataLocation> &metadata_locations,
+                                             const string &data_catalog) {
 	string qtarget = target.find('.') == string::npos ? KeywordHelper::WriteOptionallyQuoted(target) : target;
 	auto metadata_table = delta_metadata_table.empty() ? string(openivm::DELTA_TABLES_TABLE) : delta_metadata_table;
 	auto consumers = "SELECT last_update FROM " + metadata_table + " WHERE table_name = '" +
@@ -760,7 +761,10 @@ string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string 
 	           " < (SELECT MIN(last_update) FROM (" + consumers + ") consumers);\n";
 	if (deferred_cleanup && parts.size() == 3) {
 		auto metadata_parts = SqlUtils::ParseQualifiedIdentifier(metadata_table);
-		if (metadata_parts.size() == 3 && !StringUtil::CIEquals(parts[0], metadata_parts[0])) {
+		// Inline cleanup must write the database the refresh's data transaction writes; a
+		// source delta stored next to separately placed metadata is in another one.
+		bool outside_data = !data_catalog.empty() && !StringUtil::CIEquals(parts[0], data_catalog);
+		if ((metadata_parts.size() == 3 && !StringUtil::CIEquals(parts[0], metadata_parts[0])) || outside_data) {
 			// Only housekeeping crosses the native write boundary. MV state and its
 			// watermark commit together; cleanup reads the committed consumer minimum.
 			deferred_cleanup->push_back(std::move(sql));

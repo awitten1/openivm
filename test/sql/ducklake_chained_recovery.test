@@ -34,9 +34,10 @@ CREATE MATERIALIZED VIEW dl.big_regions AS SELECT region, total, cnt FROM dl.reg
 
 # ==========================================
 # Crash right after the upstream view writes its own delta rows, before its backing table
-# changes. With default metadata these DuckLake statements commit one by one, so the delta
-# rows stay behind. The downstream view reads the upstream backing table's snapshot changes
-# and sees nothing; recovery and later incremental refreshes never apply the stale rows.
+# changes. A view with downstream views runs its DuckLake data statements in one lake
+# transaction, so the crash rolls back its delta rows together with the backing table. The
+# downstream view reads the upstream backing table's snapshot changes and sees nothing;
+# recovery and later incremental refreshes apply each change exactly once.
 # ==========================================
 
 statement ok

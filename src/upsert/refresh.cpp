@@ -354,6 +354,9 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// transaction; cross-catalog refreshes archive after their last commit.
 	bool execution_started = false;
 	bool effects_may_be_committed = false;
+	// Whether MV data may have committed: a data statement ran outside a transaction or a
+	// data COMMIT was attempted. Until then a failure rolls the data back completely, so the
+	// split protocol can retract its interruption marker.
 	bool data_may_be_committed = false;
 	bool archive_handled = false;
 	// Track whether we're inside an open exec_con transaction so any exception path can
@@ -402,7 +405,20 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		// For cross_system (DuckLake or separately stored metadata) MVs, split the refresh SQL
 		// into data ops (MV catalog) and metadata ops to avoid the cross-catalog write error.
 		string meta_pre_sql, meta_post_sql;
+		// Native refreshes are always transactional. DuckLake needs a data transaction for the
+		// exhaustive-delete attempt: a multiplicity mismatch rolls the attempt back before the
+		// ranked rowid program runs. Under the split protocol the data step is one transaction
+		// too, so a crash, a lost lease or a concurrent source change rolls it back instead of
+		// committing a partly refreshed backing table that downstream DuckLake views would read.
+		// Downstream views that read delta_<mv> need it as well: rows committed for a change
+		// that never reached the backing table would be emitted again by the cascading recovery.
+		bool atomic_ducklake_data =
+		    cross_system && !split_native && (split_protocol || probe_meta.HasDownstreamViews(vn));
+		// Source-delta cleanup outside the database the data transaction writes (or, for native
+		// data, outside the metadata catalog) is collected instead of inlined: one transaction
+		// cannot write two databases. Every data step that runs in a transaction collects it.
 		vector<string> deferred_cleanup;
+		bool collect_cleanup = !cross_system || split_native || atomic_ducklake_data;
 		RefreshCompileProfile compile_profile;
 		ProjectionDeleteRetryPlan delete_retry_plan;
 		auto generate_start = std::chrono::steady_clock::now();
@@ -412,8 +428,11 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		                       cross_system ? &meta_post_sql : nullptr, profiler.Enabled() ? &compile_profile : nullptr,
 		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr,
 		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan,
-		                       /*write_query_file=*/true, cross_system && !split_native ? nullptr : &deferred_cleanup);
+		                       /*write_query_file=*/true, collect_cleanup ? &deferred_cleanup : nullptr);
 		string fallback_sql;
+		// The fallback defers the same cleanup as the primary program, so it never writes
+		// outside the data catalog either.
+		vector<string> fallback_deferred_cleanup;
 		if (delete_retry_plan.IsActive()) {
 			// Compile the ranked rowid program before setting refresh_in_progress. It is only
 			// executed when DuckLake reports that the exhaustive tuple delete removed more
@@ -423,7 +442,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr,
 			    cross_system ? &meta_post_sql : nullptr, /*compile_profile=*/nullptr, precomputed_delta_activity,
 			    /*out_adaptive_estimate=*/nullptr, /*facts=*/nullptr, /*metadata_connection=*/nullptr,
-			    /*delete_retry_plan=*/nullptr, /*write_query_file=*/false);
+			    /*delete_retry_plan=*/nullptr, /*write_query_file=*/false,
+			    collect_cleanup ? &fallback_deferred_cleanup : nullptr);
 		}
 		// The archived program is exactly what this refresh executes, in order: after a
 		// delete retry, the fallback that replaced the rolled-back attempt, and for
@@ -484,18 +504,26 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		if (cross_system && !meta_pre_sql.empty()) {
 			auto meta_pre_start = std::chrono::steady_clock::now();
 			execution_started = true;
-			// The intent is durable even if subsequent data work rolls back.
-			effects_may_be_committed = true;
+			// Outside the split protocol these metadata statements commit on their own
+			// connection, each one even if a later statement of the batch fails, so no
+			// failure after this point rolls the whole program back. The split protocol
+			// commits them in one transaction: a failure leaves nothing committed.
+			effects_may_be_committed = effects_may_be_committed || !split_protocol;
 			auto meta_error = run_metadata(meta_pre_sql);
 			if (!meta_error.empty()) {
 				throw Exception(ExceptionType::EXECUTOR,
 				                "IVM refresh of '" + display_name + "' failed before data refresh: " + meta_error);
 			}
+			// The in-progress marker has committed; a later rollback cannot undo it.
+			effects_may_be_committed = true;
 			intent_recorded = true;
 			profiler.AddStep("metadata_pre_sql", meta_pre_start, "bytes=" + to_string(meta_pre_sql.size()));
 		}
 		if (split_protocol) {
 			MetadataLocator::FailPoint(context, "after_intent");
+			// Test-only: another client commits between the intent marker and the data step,
+			// whose first statement then fails.
+			InjectConcurrentCommit(context, "concurrent_commit_then_data_error", attempt);
 		}
 		if (lease.Active()) {
 			if (MetadataLocator::TestPoint(context, "lease_lost_before_data")) {
@@ -503,19 +531,17 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 			lease.Require(display_name);
 		}
-		// Native refreshes are always transactional. DuckLake needs a data transaction for the
-		// exhaustive-delete attempt: a multiplicity mismatch rolls the attempt back before the
-		// ranked rowid program runs. Under the split protocol the data step is one transaction
-		// too, so a crash, a lost lease or a concurrent source change rolls it back instead of
-		// committing a partly refreshed backing table that downstream DuckLake views would read.
-		// Downstream views that read delta_<mv> need it as well: rows committed for a change
-		// that never reached the backing table would be emitted again by the cascading recovery.
-		bool atomic_ducklake_data =
-		    cross_system && !split_native && (split_protocol || probe_meta.HasDownstreamViews(vn));
-		if (!cross_system || delete_retry_plan.IsActive() || split_native || atomic_ducklake_data) {
+		// Collected cleanup is handed over exactly once here: every collecting refresh opens a
+		// data transaction. A cross-system refresh runs it itself after its watermarks commit,
+		// so it removes the rows this refresh consumed; a native refresh hands it to its data
+		// transaction, which runs it on commit together with the watermarks.
+		vector<string> post_watermark_cleanup;
+		if (collect_cleanup || delete_retry_plan.IsActive()) {
 			exec_con.BeginTransaction();
 			tx_open = true;
-			if (!split_native) {
+			if (cross_system) {
+				post_watermark_cleanup = std::move(deferred_cleanup);
+			} else {
 				TransactionalMVLockState::Get(*exec_con.context).DeferDeltaCleanup(std::move(deferred_cleanup));
 			}
 		}
@@ -533,8 +559,15 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			// Under a lease every statement is checked first, so a client past its deadline
 			// stops before the next write; the data transaction then rolls back.
 			bool crash_after_view_delta = MetadataLocator::TestPoint(context, "after_view_delta");
+			string fail_data_point;
+			for (auto point : {"data_statement_error", "concurrent_commit_then_data_error"}) {
+				if (MetadataLocator::TestPoint(context, point)) {
+					fail_data_point = point;
+				}
+			}
+			bool fail_data_statement = !fail_data_point.empty();
 			bool split_program = profiler.Enabled() || (retry_plan && retry_plan->IsActive()) || lease.Active() ||
-			                     crash_after_view_delta;
+			                     crash_after_view_delta || fail_data_statement;
 			if (!split_program) {
 				executed_statement_count++;
 				return exec_con.Query(program);
@@ -561,6 +594,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 				}
 				if (crash_after_view_delta && WritesViewDelta(statements[stmt_idx], vn)) {
 					MetadataLocator::FailPoint(context, "after_view_delta");
+				}
+				if (fail_data_statement) {
+					// Test-only: an ordinary statement error after the first data statement ran.
+					// Unlike a simulated crash, the normal failure handling runs.
+					throw Exception(ExceptionType::EXECUTOR, "IVM refresh of '" + display_name +
+					                                             "' failed: openivm_test_fail_point '" +
+					                                             fail_data_point + "' failed a data statement");
 				}
 				if (!retry_plan || !retry_plan->IsActive()) {
 					continue;
@@ -600,6 +640,12 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			                    static_cast<long long>(expected_delete_count));
 			exec_con.BeginTransaction();
 			tx_open = true;
+			if (!cross_system) {
+				// The rollback discarded the cleanup handed to the first data transaction.
+				// post_watermark_cleanup survives it and already holds the same statements.
+				TransactionalMVLockState::Get(*exec_con.context)
+				    .DeferDeltaCleanup(std::move(fallback_deferred_cleanup));
+			}
 			executed_program = &fallback_sql;
 			set_archived_program();
 			result = execute_program(fallback_sql, nullptr);
@@ -693,6 +739,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			    prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(vn)),
 			    publication->GetValue(0, 0).ToString());
 			set_archived_program();
+			data_may_be_committed = true;
 			auto published = exec_con.Query(publish_sql);
 			if (published->HasError()) {
 				throw CatalogException("Could not advance snapshot publication for '%s': %s", vn,
@@ -773,13 +820,13 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 			profiler.AddStep("metadata_post_sql", meta_post_start, "bytes=" + to_string(meta_post_sql.size()));
 		}
-		if (split_native && !deferred_cleanup.empty()) {
+		if (!post_watermark_cleanup.empty()) {
 			// Housekeeping after the watermarks advanced: delete delta rows every consumer
 			// has committed. Failures only retain rows that later refreshes exclude.
 			Connection cleanup_con(*context.db.get());
 			TransactionalMVLockState::Get(*cleanup_con.context)
 			    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
-			for (auto &cleanup : deferred_cleanup) {
+			for (auto &cleanup : post_watermark_cleanup) {
 				auto cleaned = cleanup_con.Query(cleanup);
 				if (cleaned->HasError()) {
 					Printer::Print("OpenIVM refresh committed; delta cleanup deferred: " + cleaned->GetError());
@@ -863,12 +910,19 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		}
 		if (split_protocol && intent_recorded && !data_may_be_committed && !was_interrupted) {
 			// The data transaction rolled back, so nothing changed: retract our marker
-			// rather than force a full recompute. The committed intent still makes the
-			// archive outcome unknown. Best effort; a set marker is still safe.
+			// rather than force a full recompute. Best effort; a set marker is still safe.
+			// Under a lease the fence refuses this after a takeover, keeping the new
+			// owner's marker.
+			string retraction = "UPDATE " + metadata_location.Table(openivm::VIEWS_TABLE) +
+			                    " SET refresh_in_progress = false WHERE view_name = " + Value(vn).ToSQLString();
+			if (lease.Active()) {
+				// A client that overran its lease marks the view and bumps the epoch after its
+				// late data commit, possibly while this client holds the lease. That marker must
+				// survive: with a changed epoch this matches no row.
+				retraction += " AND COALESCE(refresh_epoch, 0) = " + to_string(refresh_epoch);
+			}
 			try {
-				auto cleared = run_metadata(
-				    "UPDATE " + metadata_location.Table(openivm::VIEWS_TABLE) +
-				    " SET refresh_in_progress = false WHERE view_name = " + Value(vn).ToSQLString() + ";\n");
+				auto cleared = run_metadata(retraction + ";\n");
 				if (!cleared.empty()) {
 					OPENIVM_DEBUG_PRINT("[REFRESH] Could not retract marker: %s\n", cleared.c_str());
 				}

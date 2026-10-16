@@ -308,6 +308,35 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
             == before
         )
 
+        # A client that overran its lease commits its data late, after this client recorded
+        # its intent; its failed watermark commit then marks the view and bumps refresh_epoch.
+        # This client's data step fails cleanly, but retracting its own marker must not clear
+        # that one: the late commit changed the backing table outside the watermarks (here a
+        # removed group), which only a recompute repairs.
+        backing = client.value(
+            "SELECT table_name FROM duckdb_tables() WHERE database_name = 'host' AND starts_with(table_name, 'openivm_data_');"
+        )
+        epoch = int(client.value(f"SELECT COALESCE(refresh_epoch, 0) FROM control.{schema}.openivm_views;"))
+        late_commit = (
+            f"DELETE FROM host.main.\"{backing}\" WHERE product = 'a'; "
+            f"UPDATE control.{schema}.openivm_views SET refresh_in_progress = true, "
+            "refresh_epoch = COALESCE(refresh_epoch, 0) + 1"
+        )
+        client.expect_error(
+            "INSERT INTO orders VALUES (12, 'a', 12), (13, 'h', 13);\n"
+            f"SET openivm_test_concurrent_sql = {sql_literal(late_commit)};\n"
+            "SET openivm_test_fail_point = 'concurrent_commit_then_data_error';\nPRAGMA refresh('sales');\n",
+            "'concurrent_commit_then_data_error' failed a data statement",
+        )
+        assert (
+            client.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "true"
+        ), "a clean data rollback retracted the marker of a client that overran its lease"
+        assert client.value(f"SELECT refresh_epoch FROM control.{schema}.openivm_views;") == str(epoch + 1)
+        assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_refresh_leases;") == "0"
+        client.run("PRAGMA refresh('sales');\n")
+        assert client.value(bag_difference("sales", base)) == "0", "the late data commit was not recomputed"
+        assert client.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "false"
+
         client.run("DROP VIEW sales;\n")
         assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_views;") == "0"
         assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_delta_tables;") == "0"

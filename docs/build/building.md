@@ -255,9 +255,10 @@ ORDER BY s.stmt_order;
 - **Outcomes.** `last_outcome` describes the latest operation that ran the version:
   `committed` (its transaction committed), `attempted` (it failed and rolled back,
   so nothing was committed) or `unknown` (a cross-catalog refresh failed after its
-  first statements ran, or `COMMIT` itself failed, so some effects may have
-  committed). This includes a DuckLake refresh whose data statements roll back,
-  because its native in-progress marker has already committed.
+  first statements ran outside a transaction, or `COMMIT` itself failed, so some
+  effects may have committed). This includes a DuckLake refresh whose data statements
+  roll back, because its in-progress marker in the metadata location has already
+  committed.
   `committed_count` counts committed runs. Compile-only calls such as
   `openivm_compile_with_facts` are never archived, so a stored program has always
   been executed.

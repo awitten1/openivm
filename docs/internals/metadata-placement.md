@@ -138,7 +138,10 @@ catalogs, delete by key plus insert on PostgreSQL. If that restore itself fails,
    `refresh_in_progress`.
 4. **Cleanup.** Consumed source-delta rows are deleted after step 3. This only removes rows
    every consumer's committed watermark has passed, so a failure here retains rows that
-   later refreshes ignore.
+   later refreshes ignore. Step 2 only reads source delta tables, so it writes one
+   database even when a source is stored in the metadata catalog (for example a host view
+   over `control.main.<source>` with `control.openivm` metadata) or a DuckLake view reads
+   a native source.
 
 Crash and retry semantics:
 
@@ -146,7 +149,7 @@ Crash and retry semantics:
 |---|---|---|
 | Before step 1 commits | unchanged | normal incremental refresh |
 | After 1, before 2 commits | marker set, data unchanged | full recompute |
-| Step 2 fails cleanly (rolled back) | marker retracted | normal incremental refresh |
+| Step 2 fails cleanly (rolled back) | marker retracted, unless another client set it (lease lost or `refresh_epoch` changed) | normal incremental refresh, or full recompute if the marker stayed |
 | Crash inside 2 | marker set, data rolled back | full recompute |
 | After 2, before 3 commits | marker set, data new, watermarks old | full recompute |
 | After 3 | consistent | normal |
@@ -168,7 +171,8 @@ once:
   never applied.
 
 A non-native view with downstream views that read its delta table also runs its data
-statements in one transaction outside this protocol. Full recomputes take
+statements in one transaction outside this protocol, and likewise deletes consumed
+native source-delta rows only after its watermarks commit. Full recomputes take
 the same three steps, and recovery clears the marker only in step 3, together with the
 new watermarks. A view marked interrupted never uses the empty-delta shortcut.
 
@@ -258,7 +262,8 @@ The lease protocol is:
   transaction's row lock (after which the extended lease no longer qualifies as expired,
   or the takeover gets a serialization failure, so the takeover fails), or this `UPDATE`
   finds the row gone or concurrently changed and fails (zero rows, or a serialization
-  failure). Step 3 also fails if `refresh_epoch` changed. The client's own heartbeat waits
+  failure). Step 3 also fails if `refresh_epoch` changed, and the retraction then matches no
+  row, leaving the marker set. The client's own heartbeat waits
   while a fenced transaction is open, so the two never write the lease row at the same
   time and spuriously fail each other.
 - A client whose step 3 fails after committing data bumps `refresh_epoch` and sets the
@@ -316,9 +321,12 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 |---|---|
 | Placement of metadata vs backing/delta tables, marker | `test/sql/metadata_location.test` |
 | Batched DML refresh, delta cleanup, profiles, history | `test/sql/metadata_location.test` |
+| Host view over a source in the metadata catalog: incremental and full refresh, source delta cleaned after the watermarks | `test/sql/metadata_location.test` |
+| DuckLake view over a native frontend source: crash after the data commit, recovery, forced full refresh, native source delta cleaned after the watermarks | `test/sql/metadata_location_ducklake.test` |
 | Explicit-transaction rejection (including RENAME COLUMN); atomic same-database schema | `test/sql/metadata_location.test` |
 | RENAME COLUMN restore after a failed ALTER; autocommit rename | `test/sql/metadata_location.test` |
 | Crash after intent, inside data transaction, after data commit; full recompute | `test/sql/metadata_location.test` (`openivm_test_fail_point`) |
+| Clean data-step failure retracts the marker; next refresh is incremental and exact (native view, chained DuckLake view) | `test/sql/metadata_location.test`, `test/sql/metadata_location_ducklake.test` (`data_statement_error`) |
 | Concurrent connections, daemon scheduling | `test/sql/metadata_location.test` |
 | Read-only and missing catalogs, untracked DROP TABLE while detached, reopen discovery, conflicting setting, existing databases, replace, drop, orphan cleanup | `test/sql/metadata_location.test` |
 | DuckLake views: frontend marker, reopen without settings, crash after the DuckLake data commit | `test/sql/metadata_location_ducklake.test` |
@@ -327,6 +335,7 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 | Legacy discovery unchanged; scheduler discovery of a configured location | `test/integration/scheduler_catalog_test.cpp` |
 | PostgreSQL metadata: placement, reopen, crash + abandoned lease, RENAME rejection and portable restore, CREATE inside the metadata catalog rejected, DROP, concurrent DuckLake clients without a local frontend file | `test/integration/test_remote_metadata.py` (CI: `.github/workflows/RemoteMetadata.yml`) |
 | Lease lost before the data phase, after the first DuckLake statement, and taken over before the watermark commit (fence) | `test/integration/test_remote_metadata.py` |
+| A clean data rollback keeps the marker another client set with a bumped `refresh_epoch`; the next refresh recomputes exactly | `test/integration/test_remote_metadata.py` (`concurrent_commit_then_data_error`) |
 | Lease times written from the PostgreSQL server clock; expiry judged on that clock (live 120 s ahead refuses, 1 s past takes over) | `test/integration/test_remote_metadata.py` |
 | Rejected CREATE in an explicit transaction creates no metadata schema; ADD COLUMN of a tracked source while the metadata catalog is detached | `test/sql/metadata_location.test` |
 | Settings contradicting the frontend marker of a DuckLake view | `test/sql/metadata_location_ducklake.test` |
@@ -337,10 +346,14 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 `openivm_test_fail_point` is a testing hook. `after_intent`, `before_data_commit` and
 `after_data_commit` simulate a process crash at a protocol step and run no compensation.
 `after_view_delta` crashes right after the statement that writes the view's own delta
-rows for downstream views, before the backing table changes.
+rows for downstream views, before the backing table changes. `data_statement_error` makes
+the data step fail with an ordinary error after its first statement, so the normal failure
+handling (rollback, then retracting the marker) runs.
 `concurrent_commit_before_data` and `concurrent_commit_after_data` commit the SQL in
 `openivm_test_concurrent_sql` from another connection during the first refresh attempt,
 after compilation or after the data statements, as a concurrent client would.
+`concurrent_commit_then_data_error` commits it after the interruption marker and then
+fails the data step like `data_statement_error`.
 `lease_lost_before_data` and `lease_lost_mid_data` hand the lease to another (already
 expired) owner and make the client observe the loss, as its deadline would;
 `lease_lost_before_watermark` hands it over without local notice, so only the fence can

@@ -195,6 +195,107 @@ SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
 0
 
 # ==========================================
+# A host view over a source stored in the metadata catalog: the data transaction writes
+# only the host database; the source-delta cleanup in control runs after the watermarks
+# ==========================================
+
+statement ok
+CREATE TABLE control.main.shipments (id INTEGER, region VARCHAR, qty INTEGER);
+
+statement ok
+INSERT INTO control.main.shipments VALUES (1, 'n', 5), (2, 's', 7), (3, 'n', 1), (4, NULL, 2);
+
+statement ok
+CREATE MATERIALIZED VIEW region_qty AS
+SELECT region, SUM(qty) AS total, COUNT(*) AS cnt FROM control.main.shipments GROUP BY region;
+
+# The source delta stays next to its source; the backing table stays in the host.
+query II
+SELECT database_name, schema_name FROM duckdb_tables() WHERE table_name = 'openivm_delta_shipments';
+----
+control	main
+
+query II
+SELECT count(*) FILTER (WHERE database_name = 'openivm_metadata_host'),
+       count(*) FILTER (WHERE database_name = 'control')
+FROM duckdb_tables() WHERE starts_with(table_name, 'openivm_data_');
+----
+2	0
+
+statement ok
+INSERT INTO control.main.shipments VALUES (5, 'e', 3), (6, 'n', 2), (7, NULL, 4);
+
+statement ok
+UPDATE control.main.shipments SET qty = qty + 10 WHERE region = 's' OR id = 1;
+
+statement ok
+DELETE FROM control.main.shipments WHERE id IN (3, 4);
+
+statement ok
+PRAGMA refresh('region_qty');
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM region_qty
+                              EXCEPT ALL SELECT region, SUM(qty), COUNT(*) FROM control.main.shipments GROUP BY region))
+     + (SELECT count(*) FROM (SELECT region, SUM(qty), COUNT(*) FROM control.main.shipments GROUP BY region
+                              EXCEPT ALL SELECT * FROM region_qty));
+----
+0
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'region_qty';
+----
+false
+
+query I
+SELECT count(*) FROM control.main.openivm_delta_shipments;
+----
+0
+
+# A full recompute takes the same route.
+statement ok
+INSERT INTO control.main.shipments VALUES (8, 'w', 6), (9, 's', 1);
+
+statement ok
+UPDATE control.main.shipments SET qty = qty * 2 WHERE region = 'n';
+
+statement ok
+DELETE FROM control.main.shipments WHERE id = 5;
+
+statement ok
+SET openivm_refresh_mode = 'full';
+
+statement ok
+PRAGMA refresh('region_qty');
+
+statement ok
+SET openivm_refresh_mode = 'auto';
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM region_qty
+                              EXCEPT ALL SELECT region, SUM(qty), COUNT(*) FROM control.main.shipments GROUP BY region))
+     + (SELECT count(*) FROM (SELECT region, SUM(qty), COUNT(*) FROM control.main.shipments GROUP BY region
+                              EXCEPT ALL SELECT * FROM region_qty));
+----
+0
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'region_qty';
+----
+false
+
+query I
+SELECT count(*) FROM control.main.openivm_delta_shipments;
+----
+0
+
+statement ok
+DROP VIEW region_qty;
+
+statement ok
+DROP TABLE control.main.shipments;
+
+# ==========================================
 # Explicit transactions spanning the data and metadata databases fail safely
 # ==========================================
 
@@ -426,6 +527,72 @@ SELECT (SELECT count(*) FROM (SELECT * FROM big_products
                               EXCEPT ALL SELECT * FROM big_products));
 ----
 0
+
+# A data statement fails without a crash: the data transaction rolls back, so the refresh
+# retracts its interruption marker, keeps the source deltas, and the next refresh is a
+# normal incremental one that applies them exactly once.
+statement ok
+INSERT INTO orders VALUES (40, 'a', 4), (41, 'k', 41);
+
+statement ok
+UPDATE orders SET amount = amount + 3 WHERE product = 'f';
+
+statement ok
+CREATE OR REPLACE TEMP TABLE sales_before AS SELECT * FROM product_sales;
+
+statement ok
+SET openivm_test_fail_point = 'data_statement_error';
+
+statement error
+PRAGMA refresh('product_sales');
+----
+'data_statement_error' failed a data statement
+
+statement ok
+SET openivm_test_fail_point = '';
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales EXCEPT ALL SELECT * FROM sales_before))
+     + (SELECT count(*) FROM (SELECT * FROM sales_before EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+query I
+SELECT count(*) > 0 FROM openivm_delta_orders;
+----
+true
+
+statement ok
+PRAGMA refresh('product_sales');
+
+query I
+SELECT refresh_in_progress FROM control.openivm.openivm_views WHERE view_sql_name = 'product_sales';
+----
+false
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM product_sales
+                              EXCEPT ALL SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product
+                              EXCEPT ALL SELECT * FROM product_sales));
+----
+0
+
+query I
+SELECT (SELECT count(*) FROM (SELECT * FROM big_products
+                              EXCEPT ALL SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25))
+     + (SELECT count(*) FROM (SELECT product, SUM(amount) FROM orders GROUP BY product HAVING SUM(amount) > 25
+                              EXCEPT ALL SELECT * FROM big_products));
+----
+0
+
+statement ok
+DROP TABLE sales_before;
 
 # Crash inside the data transaction, before COMMIT: the data change is lost with the process.
 statement ok
