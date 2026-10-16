@@ -99,12 +99,13 @@ INSERT INTO ccfk_fact VALUES (12, 3, 300);
 statement ok
 PRAGMA openivm_declare_rely_fk('ccfk_fact', 'product_id', 'ccfk_dim', 'product_id');
 
-query TTTTTI
-SELECT table_name, constraint_kind, columns_json, referenced_table, referenced_columns_json, is_trusted
+query ITTITI
+SELECT table_name = current_database() || '.main.ccfk_fact', constraint_kind, columns_json,
+       referenced_table = current_database() || '.main.ccfk_dim', referenced_columns_json, is_trusted
 FROM openivm_constraints_cache
-WHERE table_name = 'ccfk_fact';
+WHERE table_name = current_database() || '.main.ccfk_fact';
 ----
-ccfk_fact	RELY_FK	["product_id"]	ccfk_dim	["product_id"]	true
+true	RELY_FK	["product_id"]	true	["product_id"]	true
 
 statement ok
 CREATE TABLE ccfk_refresh_sql AS
@@ -163,3 +164,112 @@ SELECT sale_id, name, amount FROM ccfk_mv ORDER BY sale_id;
 
 statement ok
 SET openivm_skip_empty_deltas = true;
+
+# Qualified declarations must not authorize pruning for same-named sources in
+# another schema. Repeat with control metadata moved away from the sources.
+foreach placement main FK_Control
+
+statement ok
+SET openivm_metadata_schema='${placement}';
+CREATE SCHEMA fk_a;
+CREATE SCHEMA fk_b;
+CREATE TABLE fk_a.dim(k INTEGER PRIMARY KEY);
+CREATE TABLE fk_a.fact(k INTEGER);
+INSERT INTO fk_a.dim VALUES(1);
+INSERT INTO fk_a.fact VALUES(1);
+CREATE TABLE fk_b.dim(k INTEGER PRIMARY KEY);
+CREATE TABLE fk_b.fact(k INTEGER);
+INSERT INTO fk_b.dim VALUES(1);
+INSERT INTO fk_b.fact VALUES(1),(2);
+CREATE MATERIALIZED VIEW schema_fk_mv AS
+SELECT f.k FROM fk_b.fact f JOIN fk_b.dim d ON f.k=d.k;
+
+statement ok
+PRAGMA openivm_declare_rely_fk('fk_a.fact','k','fk_a.dim','k');
+
+statement ok
+INSERT INTO fk_b.dim VALUES(2),(3);
+UPDATE fk_b.dim SET k=4 WHERE k=3;
+DELETE FROM fk_b.dim WHERE k=4;
+
+statement ok
+PRAGMA refresh('schema_fk_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM schema_fk_mv EXCEPT ALL SELECT f.k FROM fk_b.fact f JOIN fk_b.dim d ON f.k=d.k)
+UNION ALL (SELECT f.k FROM fk_b.fact f JOIN fk_b.dim d ON f.k=d.k EXCEPT ALL SELECT * FROM schema_fk_mv));
+----
+0
+
+statement ok
+DROP VIEW schema_fk_mv;
+DROP SCHEMA fk_a CASCADE;
+DROP SCHEMA fk_b CASCADE;
+
+endloop
+
+# Enforced FKs also name an exact target schema. A native FK to fk_parent.dim
+# says nothing about a join against another schema's dimension.
+statement ok
+CREATE SCHEMA fk_parent;
+CREATE SCHEMA fk_joined;
+CREATE TABLE fk_parent.dim(k INTEGER PRIMARY KEY);
+INSERT INTO fk_parent.dim VALUES(1),(2);
+CREATE TABLE fk_parent.fact(k INTEGER REFERENCES fk_parent.dim(k));
+INSERT INTO fk_parent.fact VALUES(1),(2);
+CREATE TABLE fk_joined.dim(k INTEGER PRIMARY KEY);
+INSERT INTO fk_joined.dim VALUES(1);
+CREATE MATERIALIZED VIEW enforced_schema_fk_mv AS
+SELECT f.k FROM fk_parent.fact f JOIN fk_joined.dim d ON f.k=d.k;
+INSERT INTO fk_joined.dim VALUES(2);
+
+statement ok
+PRAGMA refresh('enforced_schema_fk_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM enforced_schema_fk_mv EXCEPT ALL SELECT f.k FROM fk_parent.fact f JOIN fk_joined.dim d ON f.k=d.k)
+UNION ALL (SELECT f.k FROM fk_parent.fact f JOIN fk_joined.dim d ON f.k=d.k EXCEPT ALL SELECT * FROM enforced_schema_fk_mv));
+----
+0
+
+# Binding declarations uses the caller's schema search path, preserves quoted
+# dots/quotes, and remains distinct across attached catalogs.
+statement ok
+ATTACH ':memory:' AS fk_peer;
+CREATE SCHEMA "FK.Space";
+CREATE TABLE "FK.Space"."d""im"(k INTEGER PRIMARY KEY);
+CREATE TABLE "FK.Space"."f""act"(k INTEGER);
+INSERT INTO "FK.Space"."d""im" VALUES(1);
+INSERT INTO "FK.Space"."f""act" VALUES(1);
+CREATE TABLE fk_peer.main."d""im"(k INTEGER PRIMARY KEY);
+CREATE TABLE fk_peer.main."f""act"(k INTEGER);
+INSERT INTO fk_peer.main."d""im" VALUES(1);
+INSERT INTO fk_peer.main."f""act" VALUES(1),(2);
+CREATE MATERIALIZED VIEW quoted_fk_mv AS
+SELECT f.k FROM fk_peer.main."f""act" f JOIN fk_peer.main."d""im" d ON f.k=d.k;
+
+statement ok
+SET search_path='"FK.Space"';
+
+statement ok
+PRAGMA openivm_declare_rely_fk('"f""act"','["k"]','"d""im"','["k"]');
+
+statement ok
+SET search_path='main';
+
+statement ok
+INSERT INTO fk_peer.main."d""im" VALUES(2);
+
+statement ok
+PRAGMA refresh('quoted_fk_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM quoted_fk_mv EXCEPT ALL SELECT f.k FROM fk_peer.main."f""act" f JOIN fk_peer.main."d""im" d ON f.k=d.k)
+UNION ALL (SELECT f.k FROM fk_peer.main."f""act" f JOIN fk_peer.main."d""im" d ON f.k=d.k EXCEPT ALL SELECT * FROM quoted_fk_mv));
+----
+0
+
+statement error
+PRAGMA openivm_declare_rely_fk('"FK.Space"."f""act"','missing','"FK.Space"."d""im"','k');
+----
+Column with name missing does not exist

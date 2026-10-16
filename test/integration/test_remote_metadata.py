@@ -111,6 +111,15 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
     client = Client(binary, dsn, schema, host)
     base = "SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product"
     try:
+        # A trusted-FK declaration can be the first control-metadata operation:
+        # the selected PostgreSQL schema does not exist yet (nor does control.main).
+        client.run(
+            "CREATE TABLE fk_parent(k INTEGER);\n"
+            "CREATE TABLE fk_child(k INTEGER);\n"
+            "PRAGMA openivm_declare_rely_fk('fk_child','k','fk_parent','k');\n"
+            "PRAGMA openivm_declare_rely_fk('fk_child','[\"k\"]','fk_parent','[\"k\"]');\n"
+        )
+        assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_constraints_cache;") == "1"
         client.run(
             "CREATE TABLE orders (id INTEGER, product VARCHAR, amount INTEGER);\n"
             "INSERT INTO orders VALUES (1, 'a', 10), (2, 'b', 20), (3, 'a', 30), (4, NULL, 4);\n"

@@ -1857,3 +1857,58 @@ statement error
 PRAGMA refresh('main.ike_mv_missing');
 ----
 check view_sql_name, view_catalog and view_schema
+
+# Unsupported identity/type changes must fail before changing a tracked source
+# or its delta, in autocommit and explicit transactions, at both placements.
+foreach placement main SchemaGuardControl
+
+statement ok
+SET openivm_metadata_schema='${placement}';
+SET openivm_internal_schema='SchemaGuardInternal';
+CREATE TABLE schema_guard_src(k INTEGER,v INTEGER);
+INSERT INTO schema_guard_src VALUES(1,10),(2,20);
+CREATE MATERIALIZED VIEW schema_guard_mv AS SELECT k,SUM(v) s FROM schema_guard_src GROUP BY k;
+
+statement error
+ALTER TABLE schema_guard_src RENAME TO renamed_guard_src;
+----
+Cannot rename table on IVM-tracked source
+
+statement error
+ALTER TABLE schema_guard_src ALTER COLUMN v TYPE BIGINT;
+----
+Cannot change column type on IVM-tracked source
+
+statement ok
+BEGIN;
+
+statement error
+ALTER TABLE schema_guard_src ALTER COLUMN k TYPE BIGINT;
+----
+Cannot change column type on IVM-tracked source
+
+statement ok
+ROLLBACK;
+INSERT INTO schema_guard_src VALUES(1,11),(3,30);
+UPDATE schema_guard_src SET v=v+2 WHERE k=1;
+DELETE FROM schema_guard_src WHERE k=2;
+INSERT INTO schema_guard_src VALUES(2,25);
+
+statement ok
+PRAGMA refresh('schema_guard_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM schema_guard_mv EXCEPT ALL SELECT k,SUM(v) FROM schema_guard_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v) FROM schema_guard_src GROUP BY k EXCEPT ALL SELECT * FROM schema_guard_mv));
+----
+0
+
+# Once no consumer needs capture, native ALTER remains available.
+statement ok
+DROP VIEW schema_guard_mv;
+ALTER TABLE schema_guard_src ALTER COLUMN v TYPE BIGINT;
+ALTER TABLE schema_guard_src RENAME TO renamed_guard_src;
+INSERT INTO renamed_guard_src VALUES(4,3000000000);
+DROP TABLE renamed_guard_src;
+
+endloop

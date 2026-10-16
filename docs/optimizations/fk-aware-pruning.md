@@ -132,6 +132,12 @@ The compiler first checks whether FK pruning would eliminate any inclusion-exclu
 terms. If so, it keeps the smaller FK-pruned inclusion-exclusion plan. Otherwise, it
 uses the N-term plan.
 
+Trusted FK declarations resolve table names against the caller's catalog and schema
+search path and store fully qualified identities. A declaration for `a.fact` cannot
+authorize pruning for `b.fact`, even if their columns have identical names. Existing
+declarations stored with unqualified names are not used for pruning; redeclare them
+with the pragma to bind their identities.
+
 ## When It Does Not Apply
 
 - No FK constraints declared between join tables

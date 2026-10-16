@@ -16,6 +16,8 @@
 #include "upsert/refresh_internal.hpp"
 
 #include "duckdb/catalog/catalog_entry/index_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/file_system.hpp"
@@ -48,52 +50,6 @@ namespace duckdb {
 // Global daemon instance — started unconditionally at extension load.
 // The daemon sleeps and periodically checks for scheduled views; no work if none exist.
 static shared_ptr<RefreshDaemon> global_daemon;
-
-static vector<string> ParsePragmaColumnList(string input) {
-	vector<string> columns;
-	StringUtil::Trim(input);
-	if (input.empty()) {
-		return columns;
-	}
-	if (input.front() == '[') {
-		size_t pos = 0;
-		while ((pos = input.find('"', pos)) != string::npos) {
-			pos++;
-			string value;
-			while (pos < input.size()) {
-				char c = input[pos++];
-				if (c == '\\' && pos < input.size()) {
-					char esc = input[pos++];
-					value += (esc == 'n') ? '\n' : esc;
-					continue;
-				}
-				if (c == '"') {
-					StringUtil::Trim(value);
-					if (!value.empty()) {
-						columns.push_back(value);
-					}
-					break;
-				}
-				value += c;
-			}
-		}
-		return columns;
-	}
-	size_t start = 0;
-	while (start <= input.size()) {
-		size_t end = input.find(',', start);
-		string value = input.substr(start, end == string::npos ? string::npos : end - start);
-		StringUtil::Trim(value);
-		if (!value.empty()) {
-			columns.push_back(value);
-		}
-		if (end == string::npos) {
-			break;
-		}
-		start = end + 1;
-	}
-	return columns;
-}
 
 struct ComputeDeltaData : public GlobalTableFunctionState {
 	ComputeDeltaData() : offset(0) {
@@ -506,17 +462,36 @@ static void LoadInternal(ExtensionLoader &loader) {
 	    "openivm_declare_rely_fk",
 	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
 		    string child_table = StringValue::Get(parameters.values[0]);
-		    auto child_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[1]));
+		    auto child_columns = SqlUtils::ParseColumnList(StringValue::Get(parameters.values[1]));
 		    string parent_table = StringValue::Get(parameters.values[2]);
-		    auto parent_columns = ParsePragmaColumnList(StringValue::Get(parameters.values[3]));
+		    auto parent_columns = SqlUtils::ParseColumnList(StringValue::Get(parameters.values[3]));
 		    if (child_columns.empty() || child_columns.size() != parent_columns.size()) {
 			    throw InvalidInputException("openivm_declare_rely_fk requires matching child/parent column lists");
 		    }
+		    auto resolve = [&](const string &reference, const vector<string> &columns) {
+			    auto parts = SqlUtils::ParseQualifiedIdentifier(reference);
+			    if (parts.size() > 3) {
+				    throw ParserException("Invalid trusted-FK table name '%s'", reference);
+			    }
+			    auto &table = Catalog::GetEntry<TableCatalogEntry>(
+			        context, parts.size() == 3 ? parts[0] : INVALID_CATALOG,
+			        parts.size() >= 2 ? parts[parts.size() - 2] : INVALID_SCHEMA, parts.back());
+			    for (auto &column : columns) {
+				    if (!table.ColumnExists(column)) {
+					    throw BinderException("Column with name %s does not exist in trusted-FK table %s", column,
+					                          reference);
+				    }
+			    }
+			    return SqlUtils::FullName(table.catalog.GetName(), table.schema.name, table.name);
+		    };
+		    child_table = resolve(child_table, child_columns);
+		    parent_table = resolve(parent_table, parent_columns);
+		    OPENIVM_DEBUG_PRINT("[FK] Declaring trusted FK %s -> %s\n", child_table.c_str(), parent_table.c_str());
 		    // Declarations may precede the first materialized view, so create the
 		    // metadata schema and table where that view's metadata will live.
 		    Connection con(*context.db);
-		    RefreshMetadata::UseCatalog(context, con);
-		    auto location = RefreshMetadata::CurrentLocation(con);
+		    auto location = RefreshMetadata::ResolveLocation(context, con);
+		    MetadataLocator::RequireWritable(location, "declare a trusted foreign key");
 		    auto constraints_table =
 		        SqlUtils::FullName(location.catalog, location.schema, openivm::CONSTRAINTS_CACHE_TABLE);
 		    string setup;

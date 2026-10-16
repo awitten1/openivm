@@ -100,7 +100,7 @@ Note: **`ORDER BY` + `LIMIT k`** (top-k) is now supported — see the partial-re
   longer shared, and metadata rows.
 
 - **Schema evolution** is supported for `ADD COLUMN`, `DROP COLUMN`, and `RENAME COLUMN`
-  on base tables. `ALTER COLUMN TYPE` is not handled. Dropping a referenced column is
+  on base tables. `RENAME TO` and `ALTER COLUMN TYPE` are rejected on tracked sources. Dropping a referenced column is
   blocked with an error. Renaming a referenced column rewrites stored MV SQL and refresh
   metadata, including supported aux-state and lineage metadata.
 

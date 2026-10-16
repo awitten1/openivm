@@ -1215,9 +1215,11 @@ static unordered_map<string, size_t> BuildTableToLeafMap(const vector<JoinLeafIn
 		if (!get || get->GetTable().get() == nullptr) {
 			continue;
 		}
-		auto table_name = get->GetTable().get()->name;
-		InsertLeafAlias(table_to_leaf, table_name, i);
-		InsertLeafAlias(table_to_leaf, ShortTableName(table_name), i);
+		auto &table = *get->GetTable();
+		InsertLeafAlias(table_to_leaf, SqlUtils::FullName(table.catalog.GetName(), table.schema.name, table.name), i);
+		InsertLeafAlias(table_to_leaf,
+		                SqlUtils::QuoteIdentifier(table.schema.name) + "." + SqlUtils::QuoteIdentifier(table.name), i);
+		InsertLeafAlias(table_to_leaf, SqlUtils::QuoteIdentifier(table.name), i);
 	}
 	return table_to_leaf;
 }
@@ -1235,12 +1237,11 @@ static bool TryFindLeaf(const unordered_map<string, size_t> &table_to_leaf, cons
 			return true;
 		}
 	};
-	auto it = table_to_leaf.find(StringUtil::Lower(table_name));
-	if (assign_leaf(it)) {
-		return true;
+	auto parts = SqlUtils::ParseQualifiedIdentifier(table_name);
+	for (auto &part : parts) {
+		part = SqlUtils::QuoteIdentifier(part);
 	}
-	it = table_to_leaf.find(StringUtil::Lower(ShortTableName(table_name)));
-	return assign_leaf(it);
+	return assign_leaf(table_to_leaf.find(StringUtil::Lower(StringUtil::Join(parts, "."))));
 }
 
 static bool HasJoinEquality(const vector<vector<DeltaJoinKeyProbe>> &key_probes, size_t child_leaf,
@@ -1314,7 +1315,9 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 			}
 			// Check if the referenced table is also a leaf in this join
 			size_t pk_leaf;
-			if (!TryFindLeaf(table_to_leaf, fk.info.table, pk_leaf)) {
+			if (!TryFindLeaf(table_to_leaf,
+			                 SqlUtils::FullName(table_ref->catalog.GetName(), fk.info.schema, fk.info.table),
+			                 pk_leaf)) {
 				continue;
 			}
 			// Malformed catalog metadata disables FK pruning; it must not affect correctness.
@@ -1343,7 +1346,8 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 		// explicit, trusted user declarations the catalog may not carry (e.g.
 		// Spark/Delta base tables have no enforced FK constraints).
 		openivm::ConstraintCache constraint_cache;
-		for (auto &cached : constraint_cache.GetConstraints(context, table_ref.get()->name)) {
+		for (auto &cached : constraint_cache.GetConstraints(
+		         context, SqlUtils::FullName(table_ref->catalog.GetName(), table_ref->schema.name, table_ref->name))) {
 			if (!cached.is_trusted ||
 			    !(StringUtil::CIEquals(cached.kind, "FK") || StringUtil::CIEquals(cached.kind, "RELY_FK"))) {
 				continue;
@@ -1386,7 +1390,9 @@ static bool ConstraintCacheHasTrustedFk(ClientContext &context, const vector<Joi
 		if (!get || get->GetTable().get() == nullptr) {
 			continue;
 		}
-		for (auto &cached : constraint_cache.GetConstraints(context, get->GetTable().get()->name)) {
+		for (auto &cached : constraint_cache.GetConstraints(
+		         context, SqlUtils::FullName(get->GetTable()->catalog.GetName(), get->GetTable()->schema.name,
+		                                     get->GetTable()->name))) {
 			if (cached.is_trusted &&
 			    (StringUtil::CIEquals(cached.kind, "FK") || StringUtil::CIEquals(cached.kind, "RELY_FK"))) {
 				return true;

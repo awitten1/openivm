@@ -38,6 +38,7 @@ public:
 	static string QualifiedPrefix(const string &catalog, const string &schema);
 	static string QuoteQualifiedPrefix(const string &prefix);
 	static string JsonQuote(const string &value);
+	static vector<string> ParseColumnList(const string &raw);
 	static string JsonArray(const vector<string> &values);
 	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);

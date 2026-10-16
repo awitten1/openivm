@@ -22,6 +22,8 @@
 #include "duckdb/main/appender.hpp"
 #include "duckdb/storage/data_table.hpp"
 #include "duckdb/planner/bound_constraint.hpp"
+#include "duckdb/planner/filter/constant_filter.hpp"
+#include "duckdb/planner/table_filter.hpp"
 #include "duckdb/transaction/meta_transaction.hpp"
 #include "duckdb/storage/table/scan_state.hpp"
 #include "duckdb/storage/table/delete_state.hpp"
@@ -215,14 +217,19 @@ string RefreshMetadata::ResolveMetadataSchema(Connection &con, const string &cat
 	return SelectMetadataSchema(FindMetadataSchemas(con, catalog, openivm::VIEWS_TABLE), catalog, preferred);
 }
 
-MetadataLocation RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
-	TransactionalMVLockState::Get(*con.context)
-	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+MetadataLocation RefreshMetadata::ResolveLocation(ClientContext &context, Connection &con, const string &view_catalog) {
 	auto location = MetadataLocator::Resolve(context, con, view_catalog);
 	auto transaction_schemas = TransactionMetadataSchemas(context, location.catalog);
 	if (!transaction_schemas.empty()) {
 		location.schema = SelectMetadataSchema(transaction_schemas, location.catalog, location.schema);
 	}
+	return location;
+}
+
+MetadataLocation RefreshMetadata::UseCatalog(ClientContext &context, Connection &con, const string &view_catalog) {
+	TransactionalMVLockState::Get(*con.context)
+	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
+	auto location = ResolveLocation(context, con, view_catalog);
 	SelectMetadataLocation(con, location);
 	return location;
 }
@@ -846,7 +853,19 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 		auto &transaction = DuckTransaction::Get(context, entry->catalog);
 		auto &storage = entry->GetStorage();
 		TableScanState scan;
-		storage.InitializeScan(context, transaction, scan, columns);
+		TableFilterSet filters;
+		if (lookup == SourceDeltaLookup::LOCAL) {
+			// The durable routing table has one normalized key per source and a
+			// UNIQUE physical target. Validate ownership at publication; writes
+			// only need their own row, in the caller's MVCC snapshot.
+			filters.PushFilter(ColumnIndex(positions[0].GetIndex()),
+			                   make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL,
+			                                             Value(StringUtil::Lower(SqlUtils::DeltaName(table)))));
+			filters.PushFilter(
+			    ColumnIndex(positions[2].GetIndex()),
+			    make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value(StringUtil::Lower(schema))));
+		}
+		storage.InitializeScan(context, transaction, scan, columns, &filters);
 		DataChunk rows;
 		rows.Initialize(Allocator::Get(context), types);
 		while (true) {

@@ -340,6 +340,14 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		auto delta_locus = std::make_pair(delta_entry->schema.name, delta_entry->name);
 
 		switch (alter_info->alter_table_type) {
+		case AlterTableType::RENAME_TABLE:
+		case AlterTableType::ALTER_COLUMN_TYPE:
+			throw CatalogException("Cannot %s on IVM-tracked source '%s': OpenIVM cannot preserve its delta capture "
+			                       "and dependent view definitions across this change. Drop its dependent "
+			                       "materialized views first, alter the source, then recreate the views.",
+			                       alter_info->alter_table_type == AlterTableType::RENAME_TABLE ? "rename table"
+			                                                                                    : "change column type",
+			                       SqlUtils::FullName(source_locus.first, source_locus.second, table_name));
 		case AlterTableType::ADD_COLUMN: {
 			auto *add_info = dynamic_cast<AddColumnInfo *>(alter_info);
 			if (!add_info) {

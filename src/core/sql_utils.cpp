@@ -642,6 +642,64 @@ string SqlUtils::QuoteQualifiedPrefix(const string &prefix) {
 	return quoted;
 }
 
+vector<string> SqlUtils::ParseColumnList(const string &raw) {
+	vector<string> columns;
+	string input = raw;
+	StringUtil::Trim(input);
+	if (input.empty()) {
+		return columns;
+	}
+	if (input.front() == '[') {
+		size_t pos = 1;
+		while (pos < input.size()) {
+			while (pos < input.size() && (std::isspace(static_cast<unsigned char>(input[pos])) || input[pos] == ',')) {
+				pos++;
+			}
+			if (pos >= input.size() || input[pos] == ']') {
+				break;
+			}
+			if (input[pos] != '"') {
+				return {};
+			}
+			pos++;
+			string value;
+			while (pos < input.size()) {
+				char c = input[pos++];
+				if (c == '\\' && pos < input.size()) {
+					char esc = input[pos++];
+					value += (esc == 'n') ? '\n' : esc;
+					continue;
+				}
+				if (c == '"') {
+					columns.push_back(value);
+					break;
+				}
+				value += c;
+			}
+		}
+		return columns;
+	}
+
+	size_t start = 0;
+	while (start <= input.size()) {
+		size_t end = input.find(',', start);
+		string value = input.substr(start, end == string::npos ? string::npos : end - start);
+		StringUtil::Trim(value);
+		if ((value.size() >= 2 && value.front() == '"' && value.back() == '"') ||
+		    (value.size() >= 2 && value.front() == '\'' && value.back() == '\'')) {
+			value = value.substr(1, value.size() - 2);
+		}
+		if (!value.empty()) {
+			columns.push_back(value);
+		}
+		if (end == string::npos) {
+			break;
+		}
+		start = end + 1;
+	}
+	return columns;
+}
+
 string SqlUtils::JsonQuote(const string &value) {
 	string result = "\"";
 	for (char c : value) {
