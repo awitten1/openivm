@@ -151,7 +151,8 @@ MIN/MAX and ARG_MIN/ARG_MAX usually force group-recompute unless insert-only fas
 | `openivm_disable_daemon` | BOOLEAN | `false` | Disable the background refresh daemon |
 | `openivm_files_path` | VARCHAR | — | Path for compiled query reference files |
 | `openivm_metadata_catalog` | VARCHAR | `""` | Database-wide attached catalog (native DuckDB or `TYPE postgres`) for OpenIVM metadata; empty keeps it next to each native view catalog. See `docs/internals/metadata-placement.md` |
-| `openivm_metadata_schema` | VARCHAR | `"main"` | Schema for OpenIVM metadata in the metadata catalog (created on first use) |
+| `openivm_metadata_schema` | VARCHAR | `""` | Schema for control metadata per native catalog; empty keeps the existing schema (`main` for new metadata). Internal MV/delta objects never follow it (`docs/internals/metadata-placement.md`) |
+| `openivm_internal_schema` | VARCHAR | `""` | Schema for internal maintenance tables within each data catalog; empty keeps them beside the MV/source. Stored per view (`openivm_views.internal_schema`) and per source (`openivm_delta_tables.delta_schema`) |
 | `openivm_metadata_lease_seconds` | BIGINT | `600` | Refresh lease for clients sharing a remote metadata catalog |
 | `openivm_cost_decay` | DOUBLE | `0.9` | Decay factor for learned cost model regression (0.0–1.0) |
 | `openivm_skip_empty_deltas` | BOOLEAN | `true` | Skip refresh or join terms when deltas are empty |

@@ -6,11 +6,21 @@
 namespace duckdb {
 
 string CreateMVDependenciesSQL();
-// `remote`: the metadata catalog is a remote SQL database (PostgreSQL). Its tables use
-// portable column types and include the cross-client refresh lease and epoch.
+// Every OpenIVM control-metadata table; openivm_metadata_schema selects their schema.
+const vector<string> &MetadataTableNames();
+// CREATE TABLE IF NOT EXISTS for a control-metadata table. An empty target uses the unqualified table name.
+string CreateMetadataTableSQL(const string &table, const string &target = "", bool remote = false);
+struct CreateMVProfileRecord {
+	string step_name;
+	int64_t duration_ms;
+	string detail;
+};
+
 void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema,
-                          bool remote = false);
-void InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl);
+                          bool remote = false, vector<CreateMVProfileRecord> *profile_steps = nullptr);
+// True when the helper committed a new, empty source delta.
+bool InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl,
+                           const string &mapping_probe);
 string SqlCsvLiteralOrNull(const vector<string> &values);
 void AppendCreateMVSystemTablesDDL(ClientContext &context, const string &catalog, const string &schema,
                                    vector<string> &ddl, const string &view_name, bool is_replace,

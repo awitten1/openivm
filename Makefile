@@ -38,3 +38,11 @@ test_release_internal: test_remote_metadata
 
 test_remote_metadata:
 	python3 test/integration/test_remote_metadata.py ./build/release/duckdb
+
+.PHONY: test_source_delta_publication
+
+test_release_internal: test_source_delta_publication
+
+test_source_delta_publication:
+	cmake --build build/release --target source_delta_publication_test
+	python3 test/integration/test_source_delta_publication.py ./build/release/extension/openivm/source_delta_publication_test

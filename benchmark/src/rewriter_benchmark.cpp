@@ -189,8 +189,7 @@ static NormalizedVerify BuildNormalizedVerify(duckdb::Connection &con, const str
 // cancel rows that exist only on one side.
 static string BuildBagMismatchCountQuery(const string &left, const string &right) {
 	return "SELECT (SELECT COUNT(*) FROM ((" + left + ") EXCEPT ALL (" + right +
-	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left +
-	       ")) __right_diff)";
+	       ")) __left_diff) + (SELECT COUNT(*) FROM ((" + right + ") EXCEPT ALL (" + left + ")) __right_diff)";
 }
 
 static string LowerASCII(string s) {
@@ -564,6 +563,18 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 		}
 		string quoted_native_catalog = duckdb::KeywordHelper::WriteOptionallyQuoted(native_catalog);
 		string native_use = "USE " + quoted_native_catalog + ".main";
+		// OpenIVM keeps control metadata in the native catalog's metadata schema
+		// (openivm_metadata_schema, main by default). Find it rather than assume main.
+		auto metadata_table = [&](const string &table) {
+			string schema = "main";
+			auto found = con.Query("SELECT schema_name FROM duckdb_tables() WHERE database_name = " +
+			                       duckdb::Value(native_catalog).ToSQLString() +
+			                       " AND table_name = 'openivm_views' ORDER BY schema_name LIMIT 1");
+			if (found && !found->HasError() && found->RowCount() > 0) {
+				schema = found->GetValue(0, 0).ToString();
+			}
+			return quoted_native_catalog + "." + duckdb::KeywordHelper::WriteOptionallyQuoted(schema) + "." + table;
+		};
 
 		// DuckLake support is only for the tpcc workload — tpcdi has no DuckLake variants.
 		bool ducklake_ok = false;
@@ -624,21 +635,13 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					con.Query("DROP TABLE IF EXISTS " + cat + ".main." + tn);
 				}
 			}
-			// Data tables are named after the internal key, so the LIKE patterns above miss them.
-			for (auto &lv : leftover_keys) {
-				con.Query("DROP TABLE IF EXISTS " + duckdb::KeywordHelper::WriteOptionallyQuoted(lv.catalog) + "." +
-				          duckdb::KeywordHelper::WriteOptionallyQuoted(lv.schema) + "." +
-				          duckdb::KeywordHelper::WriteOptionallyQuoted("openivm_data_" + lv.key));
-				string key_literal = duckdb::Value(lv.key).ToSQLString();
-				con.Query("DELETE FROM " + quoted_native_catalog + ".main.openivm_delta_tables WHERE view_name = " +
-				          key_literal);
-				con.Query("DELETE FROM " + quoted_native_catalog + ".main.openivm_views WHERE view_name = " +
-				          key_literal);
-			}
-			// Clean metadata tables (always in native catalog) for legacy rows keyed by the SQL name
-			con.Query("DELETE FROM " + quoted_native_catalog + ".main.openivm_views WHERE view_name LIKE 'mv_q%'");
-			con.Query("DELETE FROM " + quoted_native_catalog +
-			          ".main.openivm_delta_tables WHERE view_name LIKE 'mv_q%'");
+			// Clean orphaned metadata rows in the native catalog. Views are keyed internally;
+			// match their SQL names as well as legacy keys equal to the SQL name.
+			string orphan_views = "SELECT view_name FROM " + metadata_table("openivm_views") +
+			                      " WHERE COALESCE(view_sql_name, view_name) LIKE 'mv_q%' OR view_name LIKE 'mv_q%'";
+			con.Query("DELETE FROM " + metadata_table("openivm_delta_tables") + " WHERE view_name IN (" + orphan_views +
+			          ")");
+			con.Query("DELETE FROM " + metadata_table("openivm_views") + " WHERE view_name IN (" + orphan_views + ")");
 		}
 
 		int delta_idx = 0;

@@ -1,4 +1,5 @@
 #include "core/compiled_sql_archive.hpp"
+#include "core/parser_create_mv_helpers.hpp"
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
@@ -53,16 +54,10 @@ static vector<string> ArchiveRetentionStatements(ClientContext &context, const C
 }
 
 vector<string> CompiledSQLArchiveSchemaDDL(const string &catalog, const string &schema) {
-	return {"create table if not exists " + ArchiveTableName(catalog, schema, openivm::COMPILED_PROGRAMS_TABLE) +
-	            " (view_name varchar, view_catalog varchar, view_schema varchar, view_sql_name varchar,"
-	            " operation varchar, version integer, statement_count integer,"
-	            " compilation_id varchar, compiled_at timestamp,"
-	            " last_compilation_id varchar, last_outcome varchar, last_outcome_at timestamp,"
-	            " committed_count bigint default 0,"
-	            " primary key (view_name, operation, version))",
-	        "create table if not exists " + ArchiveTableName(catalog, schema, openivm::COMPILED_STATEMENTS_TABLE) +
-	            " (view_name varchar, operation varchar, version integer, stmt_order integer, sql varchar,"
-	            " primary key (view_name, operation, version, stmt_order))"};
+	return {CreateMetadataTableSQL(openivm::COMPILED_PROGRAMS_TABLE,
+	                               ArchiveTableName(catalog, schema, openivm::COMPILED_PROGRAMS_TABLE)),
+	        CreateMetadataTableSQL(openivm::COMPILED_STATEMENTS_TABLE,
+	                               ArchiveTableName(catalog, schema, openivm::COMPILED_STATEMENTS_TABLE))};
 }
 
 vector<string> BuildCompiledSQLArchiveStatements(ClientContext &context, const CompiledProgram &program,

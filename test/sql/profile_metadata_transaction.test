@@ -106,7 +106,7 @@ statement ok
 SET openivm_metadata_catalog = '';
 
 statement ok
-SET openivm_metadata_schema = 'main';
+RESET openivm_metadata_schema;
 
 restart
 

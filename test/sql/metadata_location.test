@@ -921,7 +921,7 @@ statement ok
 SET openivm_metadata_catalog = '';
 
 statement ok
-SET openivm_metadata_schema = 'main';
+RESET openivm_metadata_schema;
 
 # A durable intent affects the archive outcome, but a clean data rollback must not
 # force recovery. Keep these decisions independent when combining SQL archival and
@@ -978,7 +978,7 @@ statement ok
 SET openivm_metadata_catalog = '';
 
 statement ok
-SET openivm_metadata_schema = 'main';
+RESET openivm_metadata_schema;
 
 restart
 
@@ -991,7 +991,7 @@ ATTACH '__TEST_DIR__/openivm_metadata_control.db' AS control;
 query II
 SELECT current_setting('openivm_metadata_catalog'), current_setting('openivm_metadata_schema');
 ----
-(empty)	main
+(empty)	(empty)
 
 statement ok
 UPDATE orders SET amount = amount - 1 WHERE product = 'x';
@@ -1239,4 +1239,4 @@ statement ok
 SET openivm_metadata_catalog = '';
 
 statement ok
-SET openivm_metadata_schema = 'main';
+RESET openivm_metadata_schema;

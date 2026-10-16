@@ -106,6 +106,7 @@ def drop_schema(binary: Path, dsn: str, schema: str):
 
 def native_host_scenario(binary: Path, dsn: str, root: Path):
     schema = "openivm_it_" + uuid.uuid4().hex[:12]
+    original_schema = schema
     host = str(root / "host.db")
     client = Client(binary, dsn, schema, host)
     base = "SELECT product, SUM(amount), COUNT(*) FROM orders GROUP BY product"
@@ -135,6 +136,20 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
             )
             == "1"
         ), "backing table moved with the metadata"
+        # Capture and additive schema evolution stay local even without the controller.
+        # Reopening the CLI for the next call also exercises durable mapping discovery.
+        client.run(
+            "DETACH control;\n"
+            "ALTER TABLE orders ADD COLUMN note VARCHAR;\n"
+            "BEGIN;\n"
+            "INSERT INTO orders VALUES (900, 'offline', 90, NULL), (901, 'offline', 91, NULL);\n"
+            "UPDATE orders SET amount = amount + 5 WHERE id = 900;\n"
+            "DELETE FROM orders WHERE id = 901;\nCOMMIT;\n"
+        )
+        client.run("PRAGMA refresh('sales');\n")
+        assert client.value(bag_difference("sales", base)) == "0", "detached-controller writes were not captured"
+        client.run("ALTER TABLE orders DROP COLUMN note;\n")
+
         # The compiled-SQL archive is metadata too: committed CREATE and refresh programs
         # are stored in the remote schema, never in the host database.
         assert (
@@ -337,11 +352,34 @@ def native_host_scenario(binary: Path, dsn: str, root: Path):
         assert client.value(bag_difference("sales", base)) == "0", "the late data commit was not recomputed"
         assert client.value(f"SELECT refresh_in_progress FROM control.{schema}.openivm_views;") == "false"
 
+        # Moving the remote schema is one remote transaction. Reopen through the
+        # old frontend marker must follow the committed move without SET commands.
+        moved_schema = schema + "_moved"
+        archived = client.value(
+            f"SELECT count(*),sum(committed_count) FROM control.{schema}.openivm_compiled_programs;"
+        )
+        client.run(f"SET openivm_metadata_schema={sql_literal(moved_schema)};\nPRAGMA refresh('sales');\n")
+        schema = moved_schema
+        client = Client(binary, dsn, schema, host, configure=False)
+        assert client.value(bag_difference("sales", base)) == "0"
+        assert (
+            client.value(f"SELECT count(*),sum(committed_count) FROM control.{schema}.openivm_compiled_programs;")
+            == archived
+        )
+        client.run(
+            "INSERT INTO orders VALUES (990, 'migration', 9);\n"
+            "UPDATE orders SET amount=amount+1 WHERE product='a';\n"
+            "DELETE FROM orders WHERE id=990;\nPRAGMA refresh('sales');\n"
+        )
+        assert client.value(bag_difference("sales", base)) == "0"
+
         client.run("DROP VIEW sales;\n")
         assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_views;") == "0"
         assert client.value(f"SELECT count(*) FROM control.{schema}.openivm_delta_tables;") == "0"
     finally:
         drop_schema(binary, dsn, schema)
+        if schema != original_schema:
+            drop_schema(binary, dsn, original_schema)
 
 
 def ducklake_concurrency_scenario(binary: Path, dsn: str, root: Path):

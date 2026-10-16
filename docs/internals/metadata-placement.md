@@ -10,14 +10,15 @@ Two settings select one explicit location instead:
 ```sql
 ATTACH 'control.duckdb' AS control;
 SET openivm_metadata_catalog = 'control';  -- attached catalog; '' keeps the default placement
-SET openivm_metadata_schema = 'openivm';   -- created on first use; default 'main'
+SET openivm_metadata_schema = 'openivm';   -- created on first use; '' retains the existing schema
 ```
 
 Placement is a property of the database, not of a session: two sessions using different
 locations would split one database's views. Plain `SET` therefore applies globally,
 `SET SESSION` is rejected, and helper connections and the refresh daemon see the value.
-An empty catalog with a schema other than `main` selects that schema in the physical
-default database (the one a new connection starts in), regardless of any session's `USE`.
+With an empty catalog setting, the schema setting applies in each native view's catalog,
+or in the default frontend database for DuckLake views. An empty schema setting retains
+the discovered location and uses `main` for new metadata.
 
 Supported metadata catalogs are attached native DuckDB databases and PostgreSQL databases
 attached with the `postgres` extension (`TYPE postgres`). Other catalog types are
@@ -35,8 +36,8 @@ always in the resolved catalog and schema. Its writes avoid `INSERT OR IGNORE`/`
 so they also run on PostgreSQL. `openivm_compiled_sql_retention` bounds distinct versions
 per view and operation (default 10); pruning program and statement rows shares the
 archive transaction. See [archive controls and cleanup](../build/building.md#archived-compiled-sql).
-Further metadata, such as a dedicated internal schema
-(#82), should take its catalog and schema from `MetadataLocator::Resolve`, not assume `main`.
+Control metadata resolves through `MetadataLocator`; physical maintenance objects follow
+their source or view catalog and the `openivm_internal_schema` setting below.
 
 ## Placement rules
 
@@ -45,10 +46,11 @@ Selecting a metadata location never moves data objects:
 | Object | Location |
 |---|---|
 | Metadata tables | the selected catalog and schema |
-| `openivm_data_<key>`, `openivm_visible_<key>`, MV delta tables, aux state | next to the user-facing view (its catalog and schema) |
-| `openivm_delta_<source>` | next to the source table, so delta capture stays in the writer's transaction |
+| `openivm_data_<key>`, `openivm_visible_<key>`, MV delta tables, aux state | the view's catalog; its schema or `openivm_internal_schema` |
+| `openivm_delta_<source>` | the source's catalog; its schema or `openivm_internal_schema`, so capture stays in the writer's transaction |
 | Internal tables of a view in an external catalog that is neither native nor DuckLake | the physical default database, `main` schema (unchanged) |
-| `openivm_metadata_location` marker | `main` schema of every native catalog that holds the view or a native source; for a view in an external (for example DuckLake) catalog, the physical default database |
+| `openivm_source_deltas` routing table | `main` in each native source catalog; stays local when control metadata moves |
+| `openivm_metadata_location` marker | For a separate metadata catalog, `main` in native view/source catalogs and the frontend database for external views; no marker is needed inside the metadata catalog itself |
 
 Loading the extension still creates the legacy, empty history, profile and dependency
 tables in `main` of the default database, before any setting can apply. With a selected
@@ -58,26 +60,35 @@ A materialized view cannot be created inside a remote (PostgreSQL) metadata cata
 CREATE fails with `remote OpenIVM metadata catalog`. Such a view would share its database
 with the metadata and bypass the refresh protocol below, which is not validated.
 
-Delta capture never reads metadata: a base-table write is captured whenever the source's
-delta table exists, even while the metadata catalog is detached. `DROP TABLE` of a native
+Native delta capture reads the local `main.openivm_source_deltas` routing table, including
+uncommitted mappings in the writer's transaction. The normal write path does not contact
+the control metadata catalog, so writes and `ADD COLUMN` keep working while that catalog
+is detached. If a delta disappears while a writer waits, ownership validation distinguishes
+a failed allocation from a retired published delta; the latter can require a transaction retry. CREATE
+validates ownership against control metadata; final-consumer cleanup removes local routing
+with the source delta. A non-cascading source DROP retains the mapping while its delta
+and consumers remain, so a same-named replacement source keeps capturing changes. `DROP TABLE` of a native
 table without a delta table (one OpenIVM does not track) does not resolve the metadata
 location either, so it also works while the metadata catalog is detached.
 
 ## Discovery on reopen
 
-DuckDB does not persist `ATTACH` or `SET`. When a view is created with an explicit
-location, OpenIVM writes `openivm_metadata_location(metadata_catalog, metadata_schema)` in
-one statement into `main` of the view's catalog and of each native source catalog. A
-DuckLake (or other external) view catalog cannot hold the marker, so it goes into the
-physical default (frontend) database, the legacy candidate for such views.
+DuckDB does not persist `ATTACH` or `SET`. When metadata lives in another catalog,
+OpenIVM writes `openivm_metadata_location(metadata_catalog, metadata_schema)` in one
+statement into `main` of the native view and source catalogs. For external views, the
+frontend database holds the marker when it differs from the metadata catalog. Native
+metadata in the view's own catalog is discovered by schema; it needs no forwarding marker.
+In particular, a native view reading another native database does not redirect that
+source database's own metadata placement.
 
 Resolution order for a view catalog:
 
 1. `openivm_metadata_catalog` / `openivm_metadata_schema`, if set. A marker in the view's
-   catalog that names another location is an error, never a silent split.
+   catalog that names another **catalog** is an error, never a silent split. A schema
+   change within the same catalog uses the atomic migration described below.
 2. Otherwise the marker in the legacy candidate catalog (the native view catalog, else the
    default database).
-3. Otherwise the legacy location `<candidate>.main`.
+3. Otherwise discover the existing native metadata schema, or use `<candidate>.main` for new metadata.
 
 After reopening, attach the metadata catalog under the alias recorded in the marker;
 no `SET` is needed. If the marker names a catalog that is not attached, operations that
@@ -93,14 +104,19 @@ target aborts rather than risk deleting changes another view still needs.
 
 ## Existing databases
 
-A configured location refuses to coexist with views registered elsewhere: CREATE fails
-while another location holds registered views. Views are not migrated automatically. To
-migrate, drop and recreate the views with the settings in place, or, with no concurrent
-writers, copy every `openivm_*` metadata row into the new location in one transaction,
-write the markers, verify, then delete the old rows.
+Changing `openivm_metadata_schema` moves existing control metadata within the same
+catalog on the next CREATE or refresh. The move is atomic: definitions, dependencies,
+watermarks, history, profiles and compiled SQL archives move together, or the old
+placement remains intact. Internal backing and delta tables keep their locations.
+A PostgreSQL move leaves an `openivm_metadata_redirect` locator in the old schema,
+committed with the move, so frontend markers still resolve after reopening.
 
-Without the settings, nothing changes: legacy placement, statements and transactions are
-as before.
+The move runs in autocommit mode. An explicit transaction keeps its existing metadata
+location until commit or rollback. New metadata uses `main` when the schema setting is
+empty; existing metadata is discovered in its current schema.
+
+Changing the metadata **catalog** still requires an explicit migration. Select the
+catalog before creating views; OpenIVM rejects a conflicting catalog ownership marker.
 
 ## Why metadata and MV data cannot commit together
 
@@ -369,3 +385,187 @@ container in CI (`.github/workflows/RemoteMetadata.yml`); without `OPENIVM_POSTG
 `make test` skips it. No managed PostgreSQL provider, managed DuckLake service or
 provider-side extension execution has been tested. Running OpenIVM still requires a client process with the extension
 loaded; storing metadata remotely removes only the persistent local frontend file.
+
+## Internal maintenance objects
+
+Internal objects never move with the metadata schema, and never cross catalogs.
+`openivm_internal_schema` selects a dedicated schema for them inside each data
+catalog:
+
+```sql
+SET openivm_internal_schema = 'openivm_internal';
+CREATE MATERIALIZED VIEW sales.product_totals AS
+    SELECT product, SUM(amount) AS total FROM sales.orders GROUP BY product;
+-- sales.product_totals stays in schema sales; its tables go to openivm_internal.
+```
+
+| Object | Unset (default) | `openivm_internal_schema = 'I'` |
+|---|---|---|
+| User-facing materialized view | The requested catalog and schema | Unchanged |
+| Backing table `openivm_data_<key>` | The MV's catalog and schema | `I` in the MV's catalog |
+| Publication table `openivm_visible_<key>` and its delta | The MV's catalog and schema | `I` in the MV's catalog |
+| MV delta table `openivm_delta_<key>` | The MV's catalog and schema | `I` in the MV's catalog |
+| Auxiliary state (DISTINCT counts, semi/anti match counts) | The MV's catalog and schema | `I` in the MV's catalog |
+| Unique index on grouped backing tables | The backing table | The backing table |
+| Native source delta | `openivm_delta_<table>` beside the source | `openivm_delta_<hex(schema)>_<table>` in `I` of the source's catalog |
+| DuckLake source changes | DuckLake snapshots; no delta table | Unchanged |
+
+For a DuckLake MV, `I` is a schema of the DuckLake catalog, created in the lake's
+own transaction. Native objects are created in the native catalog's transaction,
+so an explicit transaction's `ROLLBACK` removes them and a newly created `I`.
+
+`<key>` is an internal view key derived from the view's catalog, schema and name,
+so same-named views in different schemas or catalogs have separate internal
+objects. A source delta in an internal schema encodes its source schema in hex,
+so same-named sources of different schemas have different preferred names.
+When a preferred name is occupied (including by a legacy colocated delta),
+OpenIVM allocates a free name with an `__openivm_<number>` suffix. It checks source
+ownership before reusing an existing delta rather than adopting a table by name.
+CREATE holds the database mutation gate through ownership publication and commit.
+Native writers first take shared admission for their qualified source. If no
+owned delta exists, admission stays with the writer until commit or rollback;
+independent untracked writers can run and commit together. CREATE takes exclusive
+publication admission for its sources before allocating deltas. A writer arriving
+between allocation and publication therefore waits, then reconciles ownership
+against both its own snapshot and a fresh committed read before choosing capture.
+Tracked writers release their temporary source admission before taking the
+existing mutation gate, then reserve the source again and recheck ownership under
+that gate. Both writer paths retain their source admission through commit, so a
+later final-consumer DROP cannot hide intervening source writes from old snapshots.
+
+Autocommit CREATE discovers sources through a read-only bind in the caller
+context, including its temporary tables and search path. It retains those source
+guards while ending the discovery snapshot and starting the transaction that
+compiles and executes creation. No lifecycle writes run in the discovery phase.
+This prevents initial loading from an older snapshot after waiting for an
+uncaptured writer. Lake-only discovery also ends its read snapshot before shared
+native metadata initialization, even though it requires no native source guards.
+The staged executor retains the same source guards while
+suspending the planning transaction, through publication or allocation cleanup.
+An explicit transaction keeps its snapshot: first-source capture requires a retry
+if an admitted writer committed changes to that qualified source after
+the snapshot and there is no existing delta to cover them. Admission records a
+source commit marker only after an executed DML plan successfully commits;
+planning-only admission from plain `EXPLAIN` or `PREPARE`, rollback, read-only
+metadata probes and commits to other sources do not mark that source. The native
+DML input pipeline marks execution, so `EXPLAIN ANALYZE` and executed prepared
+statements still record commits. Cached prepared plans reacquire source admission
+and verify their capture target before executing in a later transaction. The marker
+uses the native manager's latest commit ID as a conservative upper bound, because the
+writer's transaction object may already be reclaimed before the commit callback.
+It remains protected by admission until recorded. Admission release discards idle
+markers when no native snapshot can predate them; a new attachment with the same
+catalog name has a distinct catalog identity and does not inherit the old markers.
+Transactions that already hold untracked-write admission also receive a retry
+error if a later statement would wait on a conflicting lifecycle gate, avoiding
+a cycle between publication and pending writes.
+
+In autocommit, shared metadata initialization inspects and updates the helper's
+catalog snapshot. The native target's internal schema is also initialized before
+source planning opens the caller's snapshot. Newly allocated, empty source deltas
+use the creation watermark without a caller-side scan of the helper's newer table;
+existing deltas retain the caller-visible watermark calculation. Explicit
+transactions keep schema creation and metadata upgrades in the caller transaction.
+Before allocating a source delta, it reconciles transaction-local ownership with
+a fresh committed read, so an explicit transaction with an older metadata snapshot
+reuses the shared delta. If that identity conflicts with its local ownership or is
+not visible in its catalog snapshot, the transaction must be retried rather than
+allocating a second delta.
+Successful source-delta drops are recorded for the caller transaction. A later
+replacement or DROP followed by CREATE can therefore allocate a new delta (even
+in another internal schema) without mistaking its own cleanup for a stale
+snapshot. Commit and rollback both clear that record; concurrent allocation
+still requires reconciliation with committed ownership.
+DROP's transaction-local metadata replay retains complete ownership, including
+committed siblings outside the affected view's dependency closure. Cleanup checks
+this replayed state before deleting a shared source delta, so transaction-local
+ownership additions and removals are considered alongside committed consumers.
+Replay retains the fully qualified metadata targets of CREATE, replacement,
+view DROP, and source-table CASCADE. A helper redirects only mutations for its
+selected metadata catalog and schema to temporary shadows, rebuilding those
+shadows when it inspects another location. Qualified CASCADE deletions therefore
+remain visible to a later final-consumer DROP in the same transaction.
+Delta ownership probes explicitly name the selected metadata location or its
+temporary replay tables. Source planning may change a helper's search path without
+redirecting replacement, DROP, or commit-time consumer checks to a user schema.
+Ordinary table DROP binds through the native planner after earlier batch statements
+execute. Scratch tables are therefore resolved in the temporary catalog, rather
+than assigned the control metadata schema before their CREATE has executed.
+The physical DROP executor uses native DROP binding for the same identity and
+transaction-write checks. Plan serialization retains that resolved DROP identity,
+including temporary targets, without repeating binding during deserialization.
+CREATE/ALTER lifecycle statements also bind at their
+native statement position, after preceding source DDL or BEGIN has executed.
+Their generated SQL binds and executes sequentially on the caller's active
+executor and transaction, so a step can use an object created by its predecessor
+and a later CREATE sees uncommitted DROP. A failed step invalidates the lifecycle's
+transaction, preventing partial writes from being committed. Native query profiling
+reports the enclosing lifecycle operator's time; dynamically compiled steps do not
+add operators to DuckDB's already initialized profiling tree.
+Source watermarks are recorded as evaluated timestamp values when the caller
+executes CREATE or replacement. Replay uses those values without reading physical
+delta tables that may still be invisible outside the caller transaction.
+`openivm_delta_tables` records each source's catalog and schema, the physical delta
+name (`delta_table_name`), and, for moved deltas, the internal schema (`delta_schema`).
+Older rows without a stored physical name retain their original naming rule.
+`openivm_views.internal_schema` records where a view's internal tables live.
+Metadata identity comparisons follow DuckDB's ASCII-only identifier case folding:
+`items` and `ITEMS` identify the same table, while quoted schemas `"Ä"` and `"ä"`
+remain distinct. Unicode string case folding and application collations must not
+combine their ownership or CASCADE cleanup.
+
+Stored original-SQL definitions qualify each source using the CREATE caller's
+catalog lookup and search path. This includes public parent-MV names, which differ
+from their physical publication tables, and individual same-named references in
+different schemas. Refresh and reopen therefore retain the original source
+identities even when the active schema is the native metadata schema. Legacy
+unqualified definitions use persisted source locations; if a bare name identifies
+multiple source locations, refresh reports the ambiguity and requests
+`CREATE OR REPLACE` with qualified sources instead of choosing one silently.
+
+**Existing objects.** The setting applies to objects created while it is set.
+OpenIVM finds existing tables where they are, through `openivm_views.internal_schema`
+and `openivm_delta_tables.delta_schema` (empty means beside the view or source), so
+nothing has to be moved by hand:
+
+- A source delta is shared by every view over that source. A new view reuses the
+  existing delta wherever it lives; one source never gets a second delta.
+- `CREATE OR REPLACE` keeps the replaced view's internal location, so views built
+  on it keep reading the same tables. Drop and recreate a view to move it.
+- Source-delta allocation and ownership publication share the mutation gate, so
+  concurrent CREATEs cannot allocate separate deltas for the same source.
+- DROP acquires that gate before resolving ownership or checking remaining
+  consumers and retains it through cleanup and commit, including staged cleanup.
+  A concurrent CREATE's newly published ownership therefore protects its delta.
+- View, source-table and schema CASCADE follow qualified physical dependencies
+  across every metadata catalog and remove descendants before their parents.
+  Source-delta cleanup excludes removed consumers by their metadata table and
+  view key, preserving unrelated consumers in other registries. Autocommit may
+  stage cross-catalog cleanup; explicit transactions retain native catalog-write
+  checks and rollback, rather than committing cleanup through a helper.
+- Replacement removes deltas of sources no longer used when no view in any
+  metadata catalog consumes them. Native cleanup in the caller's catalog rolls
+  back with replacement. Cleanup in another native catalog runs after commit,
+  re-checks committed ownership, and is discarded on rollback.
+- Deltas of OpenIVM's own tables (a parent MV's publication) stay beside them and
+  belong to that MV until it is dropped, even after its last child is dropped or
+  replaced. Cleanup checks owners and consumers across all metadata locations,
+  including transaction-local metadata replay.
+- Publication emits signed deltas for consumers in every metadata catalog, using
+  the same qualified source identity and consumer watermarks as cleanup. A slower
+  consumer keeps its pending deltas when another consumer refreshes. Replacement
+  also discovers consumers across catalogs before preserving publication state.
+  Generated internal targets always include their catalog and schema, including
+  for unqualified MVs created in the caller's control-metadata schema.
+
+An MV in an external catalog other than DuckLake keeps its internal objects in the
+`main` schema of the native frontend database, never in the metadata schema.
+
+Inspect actual locations with:
+
+```sql
+SELECT database_name, schema_name, table_name
+FROM duckdb_tables()
+WHERE starts_with(table_name, 'openivm_')
+ORDER BY database_name, schema_name, table_name;
+```

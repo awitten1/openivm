@@ -1,4 +1,5 @@
 #include "core/metadata_location.hpp"
+#include "core/refresh_metadata.hpp"
 
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
@@ -17,6 +18,7 @@
 #include <random>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace duckdb {
 
@@ -65,9 +67,8 @@ AttachedCatalog DescribeCatalog(Connection &con, const string &catalog) {
 	if (catalog.empty()) {
 		return info;
 	}
-	auto result = con.Query("SELECT database_name, type, readonly FROM duckdb_databases() WHERE NOT internal AND "
-	                        "lower(database_name) = lower(" +
-	                        Value(catalog).ToSQLString() + ")");
+	auto result = con.Query("SELECT database_name, type, readonly FROM duckdb_databases() WHERE NOT internal AND " +
+	                        SqlUtils::IdentifierEqualsSQL("database_name", Value(catalog).ToSQLString()));
 	if (result->HasError()) {
 		throw CatalogException("OpenIVM could not resolve metadata catalog: %s", result->GetError());
 	}
@@ -112,30 +113,6 @@ MetadataLocation FromCatalog(const AttachedCatalog &info, const string &schema, 
 	return location;
 }
 
-bool TryConfigured(ClientContext &context, Connection &con, MetadataLocation &out) {
-	auto catalog = SettingText(context, openivm::METADATA_CATALOG_SETTING);
-	auto schema = SettingText(context, openivm::METADATA_SCHEMA_SETTING);
-	if (schema.empty()) {
-		schema = DEFAULT_SCHEMA;
-	}
-	if (catalog.empty() && StringUtil::CIEquals(schema, DEFAULT_SCHEMA)) {
-		return false;
-	}
-	if (catalog.empty()) {
-		// Placement is database-wide, so it must not follow a session's USE.
-		catalog = MetadataLocator::PhysicalDefaultCatalog(DatabaseInstance::GetDatabase(context));
-	}
-	auto info = DescribeCatalog(con, catalog);
-	if (!info.found) {
-		throw CatalogException("OpenIVM metadata catalog '%s' (openivm_metadata_catalog) is not attached. ATTACH it "
-		                       "before creating, refreshing or dropping materialized views.",
-		                       catalog);
-	}
-	RequireSupportedType(info);
-	out = FromCatalog(info, schema, true, true);
-	return true;
-}
-
 // A marker records which metadata location owns the OpenIVM objects of a native catalog.
 bool ReadMarker(Connection &con, const string &catalog, MetadataLocation &out) {
 	auto info = DescribeCatalog(con, catalog);
@@ -162,48 +139,83 @@ bool ReadMarker(Connection &con, const string &catalog, MetadataLocation &out) {
 		                       info.name, target_catalog, target_schema, target_catalog);
 	}
 	RequireSupportedType(target);
-	out = FromCatalog(target, target_schema, true, false);
+	if (!StringUtil::CIEquals(target.type, NATIVE_CATALOG_TYPE)) {
+		unordered_set<string> visited;
+		while (con.TableInfo(target.name, target_schema, openivm::METADATA_REDIRECT_TABLE)) {
+			if (!visited.insert(StringUtil::Lower(target_schema)).second) {
+				throw CatalogException("OpenIVM metadata schema redirect cycle in catalog '%s'", target.name);
+			}
+			auto redirect = con.Query("SELECT metadata_schema FROM " +
+			                          SqlUtils::FullName(target.name, target_schema, openivm::METADATA_REDIRECT_TABLE));
+			if (redirect->HasError()) {
+				throw CatalogException(redirect->GetError());
+			}
+			if (redirect->RowCount() != 1 || redirect->GetValue(0, 0).IsNull()) {
+				throw CatalogException("OpenIVM metadata redirect in '%s.%s' must contain one non-NULL schema",
+				                       target.name, target_schema);
+			}
+			target_schema = redirect->GetValue(0, 0).ToString();
+		}
+	}
+	out = FromCatalog(target,
+	                  StringUtil::CIEquals(target.type, NATIVE_CATALOG_TYPE)
+	                      ? RefreshMetadata::ResolveMetadataSchema(con, target.name, target_schema)
+	                      : target_schema,
+	                  true, false);
 	OPENIVM_DEBUG_PRINT("[METADATA] Marker in %s selects %s\n", info.name.c_str(), out.DisplayName().c_str());
 	return true;
 }
 
 } // namespace
 
+MetadataLocation MetadataLocator::At(Connection &con, const string &catalog, const string &schema) {
+	auto info = DescribeCatalog(con, catalog);
+	if (!info.found) {
+		throw CatalogException("OpenIVM metadata catalog '%s' is not attached", catalog);
+	}
+	RequireSupportedType(info);
+	return FromCatalog(info, schema, true, false);
+}
+
 MetadataLocation MetadataLocator::Resolve(ClientContext &context, Connection &con, const string &view_catalog) {
-	auto catalog = view_catalog;
-	if (catalog.empty()) {
-		catalog = ClientData::Get(context).catalog_search_path->GetDefault().catalog;
-	}
-	MetadataLocation location;
-	if (TryConfigured(context, con, location)) {
-		// External (DuckLake) view catalogs keep their marker in the physical default database.
-		auto marker_catalog = catalog;
-		if (!catalog.empty() && !IsNativeCatalog(con, catalog)) {
-			marker_catalog = PhysicalDefaultCatalog(DatabaseInstance::GetDatabase(context));
-		}
-		MetadataLocation marked;
-		if (!marker_catalog.empty() && ReadMarker(con, marker_catalog, marked) && !marked.Matches(location)) {
-			throw CatalogException("OpenIVM metadata for catalog '%s' is recorded in %s, but openivm_metadata_catalog/"
-			                       "openivm_metadata_schema select %s. Reset the settings or migrate the metadata; "
-			                       "OpenIVM does not split one catalog's materialized views across metadata locations.",
-			                       catalog, marked.DisplayName(), location.DisplayName());
-		}
-		return location;
-	}
-	// External catalogs resolve through the physical frontend, even if this helper was
-	// already switched to a controller while resolving another pipeline target.
+	auto catalog =
+	    view_catalog.empty() ? ClientData::Get(context).catalog_search_path->GetDefault().catalog : view_catalog;
 	auto info = DescribeCatalog(con, catalog);
 	if (!info.found || !StringUtil::CIEquals(info.type, NATIVE_CATALOG_TYPE)) {
 		info = DescribeCatalog(con, PhysicalDefaultCatalog(DatabaseInstance::GetDatabase(context)));
 	}
-	if (!info.found) {
-		return location;
-	}
 	MetadataLocation marked;
-	if (ReadMarker(con, info.name, marked)) {
-		return marked;
+	bool has_marker = info.found && ReadMarker(con, info.name, marked);
+	auto configured_catalog = SettingText(context, openivm::METADATA_CATALOG_SETTING);
+	auto configured_schema = SettingText(context, openivm::METADATA_SCHEMA_SETTING);
+	if (!configured_catalog.empty()) {
+		if (has_marker && !StringUtil::CIEquals(marked.catalog, configured_catalog)) {
+			throw CatalogException("OpenIVM metadata for catalog '%s' is recorded in %s, but openivm_metadata_catalog "
+			                       "selects '%s'. Reset the setting or explicitly migrate the metadata catalog.",
+			                       catalog, marked.DisplayName(), configured_catalog);
+		}
+		info = DescribeCatalog(con, configured_catalog);
+	} else if (has_marker) {
+		info = DescribeCatalog(con, marked.catalog);
 	}
-	return FromCatalog(info, DEFAULT_SCHEMA, false, false);
+	if (!info.found) {
+		throw CatalogException(
+		    "OpenIVM metadata catalog '%s' is not attached. ATTACH it before using materialized views.",
+		    configured_catalog);
+	}
+	RequireSupportedType(info);
+	// A remote catalog is shared by independent deployments. Without this frontend's
+	// marker, an explicitly selected schema is a new namespace, not a migration
+	// request for another deployment's registry.
+	if (!StringUtil::CIEquals(info.type, NATIVE_CATALOG_TYPE)) {
+		auto schema =
+		    has_marker ? marked.schema : (configured_schema.empty() ? string(DEFAULT_SCHEMA) : configured_schema);
+		return FromCatalog(info, schema, true, !configured_catalog.empty());
+	}
+	auto preferred = configured_schema.empty() && has_marker ? marked.schema : configured_schema;
+	return FromCatalog(info, RefreshMetadata::ResolveMetadataSchema(con, info.name, preferred),
+	                   has_marker || !configured_catalog.empty() || !configured_schema.empty(),
+	                   !configured_catalog.empty());
 }
 
 void MetadataLocator::Use(Connection &con, const MetadataLocation &location) {
@@ -231,7 +243,7 @@ void MetadataLocator::Use(Connection &con, const MetadataLocation &location) {
 	OPENIVM_DEBUG_PRINT("[METADATA] Selected %s\n", target.c_str());
 }
 
-vector<MetadataLocation> MetadataLocator::All(Connection &con) {
+vector<MetadataLocation> MetadataLocator::All(Connection &con, const string &table) {
 	vector<MetadataLocation> result;
 	auto add = [&](const MetadataLocation &location) {
 		for (auto &existing : result) {
@@ -239,15 +251,12 @@ vector<MetadataLocation> MetadataLocator::All(Connection &con) {
 				return;
 			}
 		}
-		if (!con.TableInfo(location.catalog, location.schema, openivm::DELTA_TABLES_TABLE)) {
+		if (!con.TableInfo(location.catalog, location.schema, table)) {
 			return;
 		}
 		result.push_back(location);
 	};
-	MetadataLocation configured;
-	if (TryConfigured(*con.context, con, configured)) {
-		add(configured);
-	}
+	add(Resolve(*con.context, con, ""));
 	// Source metadata lives in native catalogs. Enumerating external tables also
 	// opens their metadata transactions and can block on unrelated DuckLake writes.
 	auto rows = con.Query("SELECT database_name, readonly FROM duckdb_databases() WHERE type='duckdb' "
@@ -265,7 +274,9 @@ vector<MetadataLocation> MetadataLocator::All(Connection &con) {
 		if (ReadMarker(con, info.name, marked)) {
 			add(marked);
 		}
-		add(FromCatalog(info, DEFAULT_SCHEMA, false, false));
+		for (auto &schema : RefreshMetadata::FindMetadataSchemas(con, info.name, table)) {
+			add(FromCatalog(info, schema, false, false));
+		}
 	}
 	return result;
 }
@@ -322,7 +333,7 @@ void MetadataLocator::RejectExplicitTransaction(ClientContext &context, const Me
 vector<string> MetadataLocator::MarkerDDL(Connection &con, const MetadataLocation &location,
                                           const string &data_catalog) {
 	if (!location.explicit_placement || data_catalog.empty() || !IsNativeCatalog(con, data_catalog) ||
-	    location.Matches(data_catalog, DEFAULT_SCHEMA)) {
+	    StringUtil::CIEquals(location.catalog, data_catalog)) {
 		return {};
 	}
 	// One statement, so the marker is never observed half-written.

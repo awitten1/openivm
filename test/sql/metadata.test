@@ -616,7 +616,7 @@ SELECT count(*) = any_value(p.statement_count) AND max(s.stmt_order) = count(*) 
        min(s.stmt_order) FILTER (WHERE s.sql ILIKE 'create table %openivm_data_%_6d765f61726368_%as %') <
            min(s.stmt_order) FILTER (WHERE s.sql ILIKE 'create view %mv_arch%'),
        min(s.stmt_order) FILTER (WHERE s.sql ILIKE 'create view %mv_arch%') <
-           min(s.stmt_order) FILTER (WHERE s.sql ILIKE 'insert or replace into openivm_delta_tables%'),
+           min(s.stmt_order) FILTER (WHERE s.sql ILIKE 'insert or replace into openivm_metadata_test.main.openivm_delta_tables%'),
        count(*) FILTER (WHERE s.sql ILIKE 'create unique index%')
 FROM openivm_compiled_statements s JOIN openivm_compiled_programs p USING (view_name, operation, version)
 WHERE p.view_sql_name = 'mv_arch' AND p.operation = 'create';

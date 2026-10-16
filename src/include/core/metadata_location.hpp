@@ -2,6 +2,7 @@
 #define OPENIVM_METADATA_LOCATION_HPP
 
 #include "duckdb.hpp"
+#include "core/openivm_constants.hpp"
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/main/connection.hpp"
 
@@ -13,7 +14,6 @@ namespace openivm {
 // Database-wide placement of OpenIVM metadata (definitions, dependencies, watermarks,
 // refresh history, profiles). Empty catalog + schema 'main' keeps the legacy placement.
 constexpr const char *METADATA_CATALOG_SETTING = "openivm_metadata_catalog";
-constexpr const char *METADATA_SCHEMA_SETTING = "openivm_metadata_schema";
 // Refresh lease duration for remote (shared) metadata catalogs.
 constexpr const char *METADATA_LEASE_SETTING = "openivm_metadata_lease_seconds";
 // Test-only crash and lease-takeover injection for the split metadata/data refresh protocol.
@@ -24,6 +24,9 @@ constexpr const char *TEST_CONCURRENT_SQL_SETTING = "openivm_test_concurrent_sql
 // the OpenIVM objects of that catalog. Read on every resolution so a reopened
 // database finds its metadata without session configuration.
 constexpr const char *METADATA_MARKER_TABLE = "openivm_metadata_location";
+// An atomic remote schema move leaves a pointer alongside the old schema so
+// frontend markers can follow it without a cross-database metadata write.
+constexpr const char *METADATA_REDIRECT_TABLE = "openivm_metadata_redirect";
 // One row per view whose refresh is owned by a client of a remote metadata catalog.
 constexpr const char *REFRESH_LEASE_TABLE = "openivm_refresh_leases";
 } // namespace openivm
@@ -32,6 +35,11 @@ constexpr const char *REFRESH_LEASE_TABLE = "openivm_refresh_leases";
 // tables never follow it: backing tables stay next to the user-facing view and source
 // delta tables next to their base tables.
 struct MetadataLocation {
+	MetadataLocation() = default;
+	MetadataLocation(string catalog_p, string schema_p)
+	    : catalog(std::move(catalog_p)), schema(std::move(schema_p)), catalog_type("duckdb") {
+	}
+
 	string catalog;
 	string schema;
 	// duckdb_databases().type: "duckdb" (native file/memory) or "postgres" (remote SQL).
@@ -56,13 +64,14 @@ public:
 	// The metadata location for a view stored in `view_catalog` (empty: the caller's
 	// default catalog). Throws when the selected catalog is missing or unsupported,
 	// or when a durable marker contradicts the configured placement.
+	static MetadataLocation At(Connection &con, const string &catalog, const string &schema);
 	static MetadataLocation Resolve(ClientContext &context, Connection &con, const string &view_catalog);
 	// Point `con` at `location` so unqualified metadata table names resolve there.
 	// Creates the selected schema of an explicit placement when it does not exist yet.
 	static void Use(Connection &con, const MetadataLocation &location);
 	// Every location that holds OpenIVM delta-table metadata: the configured location,
 	// marker targets and legacy native catalogs. Delta cleanup must consult all of them.
-	static vector<MetadataLocation> All(Connection &con);
+	static vector<MetadataLocation> All(Connection &con, const string &table = openivm::DELTA_TABLES_TABLE);
 
 	// Configured placement only refuses to coexist with materialized views registered
 	// in another location; existing databases must be migrated explicitly.

@@ -84,12 +84,12 @@ public:
 		AddStep("total_refresh", total_start);
 	}
 
-	void Flush(DatabaseInstance &db) {
+	void Flush(ClientContext &context) {
 		if (!enabled || steps.empty()) {
 			return;
 		}
-		Connection profile_con(db);
-		RefreshMetadata::UseCatalog(*profile_con.context, profile_con, view_catalog);
+		Connection profile_con(*context.db);
+		RefreshMetadata::UseCatalog(context, profile_con, view_catalog);
 		// Persist all steps together instead of synchronizing the WAL for every row.
 		profile_con.BeginTransaction();
 		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
@@ -332,7 +332,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		if (TrySkipEmptyRefresh(context, probe_meta, probe_con, view_catalog_name, view_schema_name, vn,
 		                        attached_db_catalog_name, attached_db_schema_name, &delta_activity)) {
 			profiler.AddTotal();
-			profiler.Flush(*context.db.get());
+			profiler.Flush(context);
 			return;
 		}
 		if (!delta_activity.active_delta_table_names.empty() || delta_activity.requires_full_refresh) {
@@ -374,6 +374,8 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 	// Returns the error, or an empty string once committed.
 	auto run_metadata = [&](const string &statements) -> string {
 		Connection meta_con(*context.db.get());
+		TransactionalMVLockState::Get(*meta_con.context)
+		    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 		if (!split_protocol) {
 			auto result = meta_con.Query(statements);
 			return result->HasError() ? result->GetError() : string();
@@ -725,7 +727,10 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			// interruption marker set by meta_pre_sql makes the retry recompute the view.
 			advance_watermarks(RequireUnchangedSources(context, source_pins, display_name));
 		}
-		if (cross_system && IsSnapshotPublication(*exec_con.context, view_catalog_name, view_schema_name, vn)) {
+		// Publication tables live in the MV's internal location.
+		auto internal_schema = probe_meta.GetInternalSchema(vn);
+		auto internal_schema_name = internal_schema.empty() ? view_schema_name : internal_schema;
+		if (cross_system && IsSnapshotPublication(*exec_con.context, view_catalog_name, internal_schema_name, vn)) {
 			lease.Require(display_name);
 			auto publication_start = std::chrono::steady_clock::now();
 			auto publication = probe_con.Query("SELECT published_query FROM openivm_views WHERE view_name='" +
@@ -733,7 +738,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			if (publication->HasError() || publication->RowCount() != 1 || publication->GetValue(0, 0).IsNull()) {
 				throw CatalogException("Could not read snapshot publication query for '%s'", vn);
 			}
-			auto prefix = SqlUtils::QualifiedPrefix(view_catalog_name, view_schema_name);
+			auto prefix = SqlUtils::QualifiedPrefix(view_catalog_name, internal_schema_name);
 			publish_sql = BuildSnapshotPublicationSQL(
 			    exec_con, view_catalog_name, prefix + SqlUtils::QuoteIdentifier(PublishedViewName(vn)),
 			    prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(vn)),
@@ -880,7 +885,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			                 "statements=" + to_string(archived.statements.size()));
 		}
 		profiler.AddTotal();
-		profiler.Flush(*context.db.get());
+		profiler.Flush(context);
 		return;
 	} catch (SimulatedCrashException &) {
 		// A crashed process loses its open transaction and runs no compensation; the
@@ -930,7 +935,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 		}
 		profiler.AddTotal();
-		profiler.Flush(*context.db.get());
+		profiler.Flush(context);
 		// Record the failed execution in its own metadata transaction. If that write
 		// also fails, say so in the refresh error rather than dropping it silently.
 		string archive_error;
@@ -988,22 +993,13 @@ struct AuxCatalogTarget {
 	string schema_name;
 };
 
-static AuxCatalogTarget ResolveAuxCatalogTarget(RefreshMetadata &metadata, Connection &con,
+static AuxCatalogTarget ResolveAuxCatalogTarget(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                                 const string &view_catalog_name, const string &view_schema_name) {
-	string default_db;
-	string default_schema = "main";
-	auto db_res = con.Query("SELECT current_database()");
-	if (!db_res->HasError() && db_res->RowCount() > 0 && !db_res->GetValue(0, 0).IsNull()) {
-		default_db = db_res->GetValue(0, 0).ToString();
-	}
-	auto schema_res = con.Query("SELECT current_schema()");
-	if (!schema_res->HasError() && schema_res->RowCount() > 0 && !schema_res->GetValue(0, 0).IsNull()) {
-		default_schema = schema_res->GetValue(0, 0).ToString();
-	}
-
+	// Auxiliary state follows the MV, never the configured metadata schema.
+	string default_db = RefreshMetadata::CurrentLocation(con).catalog;
 	AuxCatalogTarget target;
 	target.catalog_name = view_catalog_name.empty() ? default_db : view_catalog_name;
-	target.schema_name = view_schema_name.empty() ? default_schema : view_schema_name;
+	target.schema_name = view_schema_name.empty() ? string(DEFAULT_SCHEMA) : view_schema_name;
 	bool target_is_ducklake = metadata.IsDuckLakeCatalog(view_catalog_name);
 	// Native view catalogs keep their aux state even when metadata lives elsewhere; other
 	// external catalogs use the physical default database, never the metadata location.
@@ -1013,6 +1009,10 @@ static AuxCatalogTarget ResolveAuxCatalogTarget(RefreshMetadata &metadata, Conne
 	    !metadata.IsNativeCatalog(view_catalog_name)) {
 		target.catalog_name = physical_default_db;
 		target.schema_name = DEFAULT_SCHEMA;
+	}
+	auto internal_schema = metadata.GetInternalSchema(view_name);
+	if (!internal_schema.empty() && StringUtil::CIEquals(target.catalog_name, view_catalog_name)) {
+		target.schema_name = internal_schema;
 	}
 	return target;
 }
@@ -1027,7 +1027,7 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
 	if (metadata.GetViewType(view_name) == RefreshType::FULL_REFRESH) {
 		return false;
 	}
-	auto aux_target = ResolveAuxCatalogTarget(metadata, con, view_catalog_name, view_schema_name);
+	auto aux_target = ResolveAuxCatalogTarget(metadata, con, view_name, view_catalog_name, view_schema_name);
 	if (metadata.AuxStateNeedsRepair(view_name, aux_target.catalog_name, aux_target.schema_name)) {
 		return false;
 	}
@@ -1234,6 +1234,8 @@ static void RefreshViewsLocked(ClientContext &context, const FunctionParameters 
 		                    view_schema_name.c_str(), cross_system ? 1 : 0);
 	}
 
+	// A newly configured openivm_metadata_schema takes effect for this refresh.
+	RefreshMetadata::PrepareMetadataSchema(context, view_catalog_name, false);
 	RefreshMetadata::UseCatalog(context, con, view_catalog_name);
 	// Only external data catalogs need a separate native metadata transaction.
 	auto metadata_catalog = con.Query("SELECT current_database()");

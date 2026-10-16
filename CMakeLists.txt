@@ -141,6 +141,9 @@ if(NOT EMSCRIPTEN)
     add_executable(benchmark_metadata_test test/integration/benchmark_metadata_test.cpp)
     target_link_libraries(benchmark_metadata_test ${OPENIVM_LINK_LIBS})
     target_include_directories(benchmark_metadata_test PUBLIC benchmark/src)
+
+    add_executable(source_delta_publication_test test/integration/source_delta_publication_test.cpp)
+    target_link_libraries(source_delta_publication_test ${OPENIVM_LINK_LIBS})
 endif()
 
 # Benchmark tools are currently supported on Unix native platforms.

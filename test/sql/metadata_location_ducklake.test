@@ -211,7 +211,7 @@ statement ok
 SET openivm_metadata_catalog = '';
 
 statement ok
-SET openivm_metadata_schema = 'main';
+RESET openivm_metadata_schema;
 
 restart
 
@@ -227,7 +227,7 @@ ATTACH '__TEST_DIR__/openivm_metadata_dl_control.db' AS control;
 query II
 SELECT current_setting('openivm_metadata_catalog'), current_setting('openivm_metadata_schema');
 ----
-(empty)	main
+(empty)	(empty)
 
 statement ok
 DELETE FROM dl.main.events WHERE id = 401;
