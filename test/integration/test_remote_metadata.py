@@ -104,6 +104,37 @@ def drop_schema(binary: Path, dsn: str, schema: str):
     )
 
 
+def native_rely_generation_scenario(binary: Path, dsn: str, root: Path):
+    schema = "openivm_fk_" + uuid.uuid4().hex[:12]
+    client = Client(binary, dsn, schema, str(root / "fk_host.db"))
+    try:
+        client.run(
+            "CREATE TABLE fk_parent(k INTEGER);\n"
+            "CREATE TABLE fk_child(k INTEGER);\n"
+            "PRAGMA openivm_declare_rely_fk('fk_child','k','fk_parent','k');\n"
+        )
+        client.run(
+            "INSERT INTO fk_parent VALUES(1);\n"
+            "INSERT INTO fk_child VALUES(1);\n"
+            "DETACH control;\n"
+            "DROP TABLE fk_child;\n"
+            "CREATE TABLE fk_child(k INTEGER);\n"
+            "INSERT INTO fk_child VALUES(1),(2);\n"
+        )
+        client.run(
+            "CREATE MATERIALIZED VIEW fk_incarnation AS SELECT f.k FROM fk_child f JOIN fk_parent p ON f.k=p.k;\n"
+            "INSERT INTO fk_parent VALUES(2);\n"
+            "PRAGMA refresh('fk_incarnation');\n"
+        )
+        assert (
+            client.value(bag_difference("fk_incarnation", "SELECT f.k FROM fk_child f JOIN fk_parent p ON f.k=p.k"))
+            == "0"
+        )
+        client.run("DROP VIEW fk_incarnation;\n")
+    finally:
+        drop_schema(binary, dsn, schema)
+
+
 def native_host_scenario(binary: Path, dsn: str, root: Path):
     schema = "openivm_it_" + uuid.uuid4().hex[:12]
     original_schema = schema
@@ -755,6 +786,7 @@ def main():
         return
     with tempfile.TemporaryDirectory(prefix="openivm-remote-metadata-") as directory:
         root = Path(directory)
+        native_rely_generation_scenario(binary, dsn, root)
         native_host_scenario(binary, dsn, root)
         ducklake_concurrency_scenario(binary, dsn, root)
         ducklake_concurrent_writer_scenario(binary, dsn, root)

@@ -22,12 +22,8 @@ struct CachedConstraint {
 	bool is_trusted = true;            // false only for un-enforced
 };
 
-class ConstraintCache {
-public:
-	ConstraintCache() = default;
-
-	vector<CachedConstraint> GetConstraints(ClientContext &context, const string &table_name);
-};
+vector<CachedConstraint> ReadConstraintDeclarations(ClientContext &context, const case_insensitive_set_t &sources);
+TableFunction DeclareRelyFKFunction();
 
 } // namespace openivm
 } // namespace duckdb

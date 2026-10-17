@@ -202,3 +202,21 @@ PRAGMA refresh('sales_by_product');  -- 2 terms pruned, 1 remaining
 - Ahmet Kara, Milos Nikolic, Dan Olteanu, Haozhe Zhang. "Insert-Only versus
   Insert-Delete in Dynamic Query Evaluation." Proc. ACM Manag. Data 2(3), 2024
   (SIGMOD). https://dl.acm.org/doi/10.1145/3695837
+
+## Declaration lifetime
+
+Native declarations bind both endpoints to durable table-incarnation tokens in
+`main.openivm_source_generations` of each source database. DROP, replacement, and column schema changes
+invalidate tokens locally, including while the control metadata catalog is
+detached. Rolling back the lifecycle change restores the token. Recreating a
+same-named table does not inherit its predecessor's assertions; declare them again.
+The tokens survive reopening the database. DuckLake endpoints use their durable
+DuckLake table IDs instead.
+
+A declaration whose sources and control metadata share one native catalog is
+transactional. Declarations spanning catalogs require autocommit and allocate
+local tokens before publishing the assertion through the existing staged DDL
+executor. A failed publication can leave an unused token, which grants no pruning
+rights without a matching assertion. Runtime declarations require native DuckDB or
+DuckLake identities; other target engines can supply FK facts explicitly to the
+compile-only interface.

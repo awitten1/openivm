@@ -55,3 +55,13 @@ Repair is only allowed when no source deltas are pending. If deltas are pending,
 - `RENAME TO` (renaming a table) and `ALTER COLUMN TYPE` are rejected on IVM-tracked sources before changing the source or its delta. Drop dependent materialized views before making these changes, then recreate them. Untracked tables retain normal DuckDB behavior.
 - Adding a column with a `DEFAULT` value does not backfill the delta table. Only new INSERTs after the ALTER will include the new column.
 - `SELECT *` in an existing MV does not expand to include newly added base-table columns. Use `CREATE OR REPLACE MATERIALIZED VIEW` to pick up new columns.
+
+## Native source replacement
+
+Native `CREATE OR REPLACE TABLE ... AS SELECT ...` captures the previous rows as
+retractions and the replacement rows as insertions in the caller's transaction.
+Self-reading replacements evaluate the original bound source. Empty replacements,
+`DROP TABLE` followed by compatible CTAS, and transaction rollback preserve delta
+capture. Replacement column names and types must match the retained delta schema;
+incompatible schemas fail before the source is replaced. Drop dependent MVs before
+changing the source schema, then recreate them.

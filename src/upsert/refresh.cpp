@@ -489,11 +489,9 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		string archive_catalog;
 		string archive_schema;
 		if (archive_enabled && !cross_system) {
-			auto location_error = ResolveCompiledSQLArchiveLocation(exec_con, archive_catalog, archive_schema);
-			if (!location_error.empty()) {
-				throw CatalogException("OpenIVM could not resolve the compiled-SQL archive location: %s",
-				                       location_error);
-			}
+			auto location = RefreshMetadata::CurrentLocation(exec_con);
+			archive_catalog = location.catalog;
+			archive_schema = location.schema;
 		}
 		// Refresh SQL uses fully qualified internal data/delta names. DuckLake-targeted
 		// MVs write those objects in DuckLake; native MVs keep them in the physical DB.
@@ -1381,12 +1379,7 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	}
 	// The archive write joins the caller's transaction: it commits with the refresh,
 	// a failure aborts it, and a rollback leaves no archive row.
-	string archive_catalog;
-	string archive_schema;
-	auto location_error = ResolveCompiledSQLArchiveLocation(metadata_con, archive_catalog, archive_schema);
-	if (!location_error.empty()) {
-		throw CatalogException("OpenIVM could not resolve the compiled-SQL archive location: %s", location_error);
-	}
+	auto archive_location = RefreshMetadata::CurrentLocation(metadata_con);
 	auto location = metadata.GetStoredViewLocation(view_name, view_catalog_name, view_schema_name);
 	archived.view_name = view_name;
 	archived.view_catalog = location.catalog_name;
@@ -1395,7 +1388,7 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	archived.operation = "refresh";
 	archived.compilation_id = NewCompilationId(view_name);
 	for (auto &statement : BuildCompiledSQLArchiveStatements(context, archived, CompiledProgramOutcome::COMMITTED,
-	                                                         archive_catalog, archive_schema)) {
+	                                                         archive_location.catalog, archive_location.schema)) {
 		stamped += statement + ";\n";
 	}
 	OPENIVM_DEBUG_PRINT("[REFRESH] Compiled transaction-local program for %s at %s\n", view_name.c_str(),

@@ -159,11 +159,12 @@ static const vector<std::pair<string, string>> &MetadataTableDefinitions() {
 	     " primary key (view_name, operation, version, stmt_order))"},
 	    {openivm::REFRESH_LEASE_TABLE,
 	     "(view_name varchar primary key, owner varchar not null, lease_until timestamp not null)"},
-	    {openivm::CONSTRAINTS_CACHE_TABLE, "(table_name VARCHAR, constraint_kind VARCHAR,"
-	                                       " columns_json VARCHAR, referenced_table VARCHAR,"
-	                                       " referenced_columns_json VARCHAR,"
-	                                       " is_trusted BOOLEAN DEFAULT true,"
-	                                       " PRIMARY KEY (table_name, constraint_kind, columns_json))"},
+	    {openivm::CONSTRAINTS_CACHE_TABLE,
+	     "(table_name VARCHAR, constraint_kind VARCHAR,"
+	     " columns_json VARCHAR, referenced_table VARCHAR,"
+	     " referenced_columns_json VARCHAR,"
+	     " is_trusted BOOLEAN DEFAULT true, child_generation VARCHAR, parent_generation VARCHAR,"
+	     " PRIMARY KEY (table_name, constraint_kind, columns_json))"},
 	};
 	return definitions;
 }

@@ -759,7 +759,7 @@ static pair<string, string> CreateIndependentSources(Connection &con, bool dedic
 	return {source, independent};
 }
 
-static void TestIndependentUntrackedWriters(bool cross_catalog, bool commit) {
+static void TestIndependentUntrackedWriters(bool cross_catalog, bool commit, bool ctas = false) {
 	std::cerr << "CASE independent untracked writers cross_catalog=" << cross_catalog << " commit=" << commit
 	          << std::endl;
 	DuckDB db(nullptr);
@@ -767,9 +767,16 @@ static void TestIndependentUntrackedWriters(bool cross_catalog, bool commit) {
 	auto sources = CreateIndependentSources(first, true, cross_catalog);
 	const auto &source = sources.first;
 	const auto &independent = sources.second;
-	Execute(first, "BEGIN; " + ConflictingSourceDML(source));
-	auto competing = std::async(std::launch::async,
-	                            [&]() { Execute(second, "BEGIN; " + ConflictingSourceDML(independent) + " COMMIT;"); });
+	Execute(first,
+	        "BEGIN; " + (ctas ? "CREATE OR REPLACE TABLE " + source + " AS SELECT i FROM (VALUES (3),(3),(4),(4)) r(i);"
+	                          : ConflictingSourceDML(source)));
+	auto competing = std::async(std::launch::async, [&]() {
+		Execute(second, "BEGIN; " +
+		                    (ctas ? "CREATE OR REPLACE TABLE " + independent +
+		                                " AS SELECT i FROM (VALUES (3),(3),(4),(4)) r(i);"
+		                          : ConflictingSourceDML(independent)) +
+		                    " COMMIT;");
+	});
 	// Completion must precede release of the first transaction. The deadline
 	// only bounds failure when a regression serializes these independent writers.
 	bool completed = competing.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
@@ -3082,12 +3089,32 @@ static void TestLateLifecycleBindFailure(bool explicit_transaction) {
 	Execute(owner, "DROP VIEW mv;");
 }
 
+static void TestSourceGenerationSnapshots() {
+	for (bool schema_drop : {false, true}) {
+		DuckDB db(nullptr);
+		Connection setup(db), old(db), declarer(db);
+		Execute(setup, "LOAD openivm; SET openivm_disable_daemon=true; CREATE SCHEMA src; CREATE TABLE src.parent(k "
+		               "INTEGER); CREATE TABLE src.child(k INTEGER);");
+		Execute(old, "BEGIN; SELECT * FROM src.child;");
+		Execute(declarer, "PRAGMA openivm_declare_rely_fk('src.child','k','src.parent','k');");
+		auto result = old.Query(schema_drop ? "DROP SCHEMA src CASCADE;"
+		                                    : "CREATE OR REPLACE TABLE src.child AS SELECT 1::INTEGER k;");
+		if (!result->HasError() || result->GetError().find("retry") == string::npos) {
+			throw InvalidInputException("Old snapshot retired a source with an invisible FK generation: %s",
+			                            result->ToString());
+		}
+		Execute(old, "ROLLBACK;");
+		Execute(setup, "SELECT * FROM src.child;");
+	}
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		std::cerr << "Usage: source_delta_publication_test <fresh-database-path>" << std::endl;
 		return 2;
 	}
 	try {
+		TestSourceGenerationSnapshots();
 		TestQuotedNamespaceNormalization();
 		TestQualifiedTableReferences();
 		TestIdentifierComparisons();
@@ -3203,6 +3230,8 @@ int main(int argc, char **argv) {
 		for (bool cross_catalog : {false, true}) {
 			TestIndependentUntrackedWriters(cross_catalog, false);
 			TestIndependentUntrackedWriters(cross_catalog, true);
+			TestIndependentUntrackedWriters(cross_catalog, false, true);
+			TestIndependentUntrackedWriters(cross_catalog, true, true);
 		}
 		for (bool dedicated_schema : {false, true}) {
 			for (const auto &operation : vector<string> {"insert", "delete", "update", "merge"}) {

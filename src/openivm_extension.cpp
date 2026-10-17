@@ -1,4 +1,5 @@
 #include "core/parser_create_mv_helpers.hpp"
+#include "match/constraint_cache.hpp"
 #define DUCKDB_EXTENSION_MAIN
 
 #include "core/openivm_extension.hpp"
@@ -458,58 +459,17 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(refresh);
 	loader.RegisterFunction(PragmaFunction::PragmaCall("refresh_pipeline", RefreshPipelineQuery, {LogicalType::VARCHAR},
 	                                                   LogicalType::VARCHAR));
-	auto declare_rely_fk = PragmaFunction::PragmaCall(
+	loader.RegisterFunction(openivm::DeclareRelyFKFunction());
+	loader.RegisterFunction(PragmaFunction::PragmaCall(
 	    "openivm_declare_rely_fk",
-	    [](ClientContext &context, const FunctionParameters &parameters) -> string {
-		    string child_table = StringValue::Get(parameters.values[0]);
-		    auto child_columns = SqlUtils::ParseColumnList(StringValue::Get(parameters.values[1]));
-		    string parent_table = StringValue::Get(parameters.values[2]);
-		    auto parent_columns = SqlUtils::ParseColumnList(StringValue::Get(parameters.values[3]));
-		    if (child_columns.empty() || child_columns.size() != parent_columns.size()) {
-			    throw InvalidInputException("openivm_declare_rely_fk requires matching child/parent column lists");
+	    [](ClientContext &, const FunctionParameters &parameters) {
+		    vector<string> arguments;
+		    for (auto &value : parameters.values) {
+			    arguments.push_back(value.ToSQLString());
 		    }
-		    auto resolve = [&](const string &reference, const vector<string> &columns) {
-			    auto parts = SqlUtils::ParseQualifiedIdentifier(reference);
-			    if (parts.size() > 3) {
-				    throw ParserException("Invalid trusted-FK table name '%s'", reference);
-			    }
-			    auto &table = Catalog::GetEntry<TableCatalogEntry>(
-			        context, parts.size() == 3 ? parts[0] : INVALID_CATALOG,
-			        parts.size() >= 2 ? parts[parts.size() - 2] : INVALID_SCHEMA, parts.back());
-			    for (auto &column : columns) {
-				    if (!table.ColumnExists(column)) {
-					    throw BinderException("Column with name %s does not exist in trusted-FK table %s", column,
-					                          reference);
-				    }
-			    }
-			    return SqlUtils::FullName(table.catalog.GetName(), table.schema.name, table.name);
-		    };
-		    child_table = resolve(child_table, child_columns);
-		    parent_table = resolve(parent_table, parent_columns);
-		    OPENIVM_DEBUG_PRINT("[FK] Declaring trusted FK %s -> %s\n", child_table.c_str(), parent_table.c_str());
-		    // Declarations may precede the first materialized view, so create the
-		    // metadata schema and table where that view's metadata will live.
-		    Connection con(*context.db);
-		    auto location = RefreshMetadata::ResolveLocation(context, con);
-		    MetadataLocator::RequireWritable(location, "declare a trusted foreign key");
-		    auto constraints_table =
-		        SqlUtils::FullName(location.catalog, location.schema, openivm::CONSTRAINTS_CACHE_TABLE);
-		    string setup;
-		    if (!StringUtil::CIEquals(location.schema, DEFAULT_SCHEMA)) {
-			    setup = "CREATE SCHEMA IF NOT EXISTS " + SqlUtils::QuoteIdentifier(location.catalog) + "." +
-			            SqlUtils::QuoteIdentifier(location.schema) + ";\n";
-		    }
-		    setup += CreateMetadataTableSQL(openivm::CONSTRAINTS_CACHE_TABLE, constraints_table) + ";\n";
-		    return setup + "INSERT OR REPLACE INTO " + constraints_table +
-		           " (table_name, constraint_kind, columns_json, referenced_table, "
-		           "referenced_columns_json, is_trusted) VALUES ('" +
-		           SqlUtils::EscapeValue(child_table) + "', 'RELY_FK', '" +
-		           SqlUtils::EscapeValue(SqlUtils::JsonArray(child_columns)) + "', '" +
-		           SqlUtils::EscapeValue(parent_table) + "', '" +
-		           SqlUtils::EscapeValue(SqlUtils::JsonArray(parent_columns)) + "', true);";
+		    return "SELECT * FROM openivm_register_rely_fk(" + StringUtil::Join(arguments, ",") + ")";
 	    },
-	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR});
-	loader.RegisterFunction(declare_rely_fk);
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}));
 	auto refresh_cost = PragmaFunction::PragmaCall("refresh_cost", RefreshCostQuery, {LogicalType::VARCHAR});
 	loader.RegisterFunction(refresh_cost);
 	auto refresh_history =

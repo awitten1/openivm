@@ -748,7 +748,7 @@ static void SetSourceDelta(const string &delta_key, const string &schema, const 
 	    stored_name.empty() ? RefreshMetadata::SourceDeltaTableName(schema, base, delta_schema) : stored_name;
 }
 
-enum class SourceDeltaLookup { LOCAL, LOCAL_LEGACY, REGISTERED };
+enum class SourceDeltaLookup { LOCAL, LOCAL_LEGACY_CANDIDATE, LOCAL_LEGACY, REGISTERED };
 
 static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &context, const string &catalog,
                                                            const string &schema, const string &table,
@@ -760,6 +760,8 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 		return Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, SqlUtils::DeltaName(table),
 		                                            OnEntryNotFound::RETURN_NULL);
 	}
+	const auto delta_key_name = SqlUtils::DeltaName(table);
+	const auto qualified_delta_key = SqlUtils::FullName(catalog, schema, delta_key_name);
 	optional_ptr<TableCatalogEntry> delta;
 	unordered_map<string, unordered_set<string>> delta_owners;
 	auto consume = [&](const vector<Value> &values, const string &metadata_catalog) {
@@ -796,7 +798,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 	vector<MetadataLocation> locations;
 	if (lookup == SourceDeltaLookup::REGISTERED) {
 		locations = RefreshMetadata::MetadataLocations(context, openivm::DELTA_TABLES_TABLE);
-	} else if (lookup == SourceDeltaLookup::LOCAL_LEGACY) {
+	} else if (lookup == SourceDeltaLookup::LOCAL_LEGACY || lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
 		// Older native ownership rows can be read locally without following a
 		// controller marker or contacting a detached/remote metadata catalog.
 		auto &source_catalog = Catalog::GetCatalog(context, catalog);
@@ -874,7 +876,24 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 			if (!rows.size()) {
 				break;
 			}
+			UnifiedVectorFormat names;
+			if (lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
+				rows.data[positions[0].GetIndex()].ToUnifiedFormat(rows.size(), names);
+			}
 			for (idx_t row = 0; row < rows.size(); row++) {
+				if (lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
+					auto index = names.sel->get_index(row);
+					if (!names.validity.RowIsValid(index)) {
+						continue;
+					}
+					auto name = UnifiedVectorFormat::GetData<string_t>(names)[index];
+					auto matches = [&](const string &key) {
+						return StringUtil::CIEquals(name.GetData(), name.GetSize(), key.data(), key.size());
+					};
+					if (!matches(delta_key_name) && !matches(qualified_delta_key)) {
+						continue;
+					}
+				}
 				for (idx_t field = 0; field < values.size(); field++) {
 					values[field] =
 					    positions[field].IsValid() ? rows.GetValue(positions[field].GetIndex(), row) : Value();
@@ -882,6 +901,10 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 				consume(values, location.catalog);
 			}
 		}
+	}
+	if (delta && lookup == SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE) {
+		// Only legacy tracked sources need the complete cross-registry ownership check.
+		return FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL_LEGACY);
 	}
 	if (delta) {
 		auto physical_key = StringUtil::Lower(SqlUtils::FullName(catalog, delta->schema.name, delta->name));
@@ -900,13 +923,137 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDelta(ClientContext &context, const string &catalog,
                                                                  const string &schema, const string &table) {
 	auto delta = FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL);
-	return delta ? delta : FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL_LEGACY);
+	return delta ? delta
+	             : FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::LOCAL_LEGACY_CANDIDATE);
 }
 
 optional_ptr<TableCatalogEntry> RefreshMetadata::FindRegisteredSourceDelta(ClientContext &context,
                                                                            const string &catalog, const string &schema,
                                                                            const string &table) {
 	return FindSourceDeltaImpl(context, catalog, schema, table, SourceDeltaLookup::REGISTERED);
+}
+
+string RefreshMetadata::SourceGenerationDDL(const string &catalog, const string &schema, const string &table) {
+	auto registry = SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::SOURCE_GENERATIONS_TABLE);
+	return "CREATE TABLE IF NOT EXISTS " + registry +
+	       " (source_schema VARCHAR NOT NULL, table_name VARCHAR NOT NULL, generation VARCHAR NOT NULL, "
+	       "PRIMARY KEY(source_schema,table_name)); INSERT INTO " +
+	       registry + " VALUES (" + Value(StringUtil::Lower(schema)).ToSQLString() + ", " +
+	       Value(StringUtil::Lower(table)).ToSQLString() + ", uuid()::VARCHAR) ON CONFLICT DO NOTHING;";
+}
+
+string RefreshMetadata::SourceGeneration(ClientContext &context, const string &catalog, const string &schema,
+                                         const string &table) {
+	auto registry = Catalog::GetEntry<TableCatalogEntry>(
+	    context, catalog, DEFAULT_SCHEMA, openivm::SOURCE_GENERATIONS_TABLE, OnEntryNotFound::RETURN_NULL);
+	if (!registry) {
+		return "";
+	}
+	TableFilterSet filters;
+	filters.PushFilter(ColumnIndex(0),
+	                   make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value(StringUtil::Lower(schema))));
+	filters.PushFilter(ColumnIndex(1),
+	                   make_uniq<ConstantFilter>(ExpressionType::COMPARE_EQUAL, Value(StringUtil::Lower(table))));
+	vector<StorageIndex> columns {StorageIndex(0), StorageIndex(1), StorageIndex(2)};
+	TableScanState scan;
+	auto &transaction = DuckTransaction::Get(context, registry->catalog);
+	auto &storage = registry->GetStorage();
+	storage.InitializeScan(context, transaction, scan, columns, &filters);
+	DataChunk rows;
+	rows.Initialize(Allocator::Get(context), registry->GetTypes());
+	storage.Scan(transaction, rows, scan);
+	return rows.size() ? rows.GetValue(2, 0).ToString() : string();
+}
+
+// Registry deletions must participate in the caller's snapshot, rollback and
+// local uniqueness bookkeeping, including DROP -> CREATE in one transaction.
+static void DeleteRegistryRows(ClientContext &context, TableCatalogEntry &entry,
+                               const std::function<bool(DataChunk &, idx_t)> &matches) {
+	auto &storage = entry.GetStorage();
+	auto &transaction = DuckTransaction::Get(context, entry.catalog);
+	vector<StorageIndex> columns;
+	auto types = entry.GetTypes();
+	for (idx_t i = 0; i < types.size(); i++) {
+		columns.emplace_back(i);
+	}
+	columns.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
+	types.push_back(LogicalType::ROW_TYPE);
+	TableScanState scan;
+	storage.InitializeScan(context, transaction, scan, columns);
+	DataChunk rows;
+	rows.Initialize(Allocator::Get(context), types);
+	vector<unique_ptr<BoundConstraint>> constraints;
+	auto state = storage.InitializeDelete(entry, context, constraints);
+	while (true) {
+		rows.Reset();
+		storage.Scan(transaction, rows, scan);
+		if (!rows.size()) {
+			break;
+		}
+		Vector row_ids(LogicalType::ROW_TYPE);
+		DataChunk deleted;
+		deleted.Initialize(Allocator::Get(context), entry.GetTypes());
+		idx_t count = 0;
+		for (idx_t row = 0; row < rows.size(); row++) {
+			if (matches(rows, row)) {
+				row_ids.SetValue(count, rows.GetValue(types.size() - 1, row));
+				for (idx_t column = 0; column + 1 < types.size(); column++) {
+					deleted.SetValue(column, count, rows.GetValue(column, row));
+				}
+				count++;
+			}
+		}
+		if (count) {
+			MetaTransaction::Get(context).ModifyDatabase(entry.catalog.GetAttached(),
+			                                             DatabaseModificationType::DELETE_DATA);
+			LocalAppendState append_state;
+			storage.InitializeLocalStorage(append_state, entry, context, constraints);
+			deleted.SetCardinality(count);
+			LocalStorage::Get(context, entry.catalog).GetStorage(storage)->AppendToDeleteIndexes(row_ids, deleted);
+			storage.Delete(*state, context, row_ids, count);
+		}
+	}
+}
+
+void RefreshMetadata::InvalidateSourceGeneration(ClientContext &context, const string &catalog, const string &schema,
+                                                 const string &table, bool drop_schema) {
+	auto &state = TransactionalMVLockState::Get(context);
+	// A declaration can commit after an explicit transaction took its snapshot.
+	// Never retire a source while leaving such an invisible assertion's token live.
+	Connection committed(*context.db);
+	if (committed.TableInfo(catalog, DEFAULT_SCHEMA, openivm::SOURCE_GENERATIONS_TABLE)) {
+		auto query = "SELECT table_name,generation FROM " +
+		             SqlUtils::FullName(catalog, DEFAULT_SCHEMA, openivm::SOURCE_GENERATIONS_TABLE) +
+		             " WHERE source_schema=" + Value(StringUtil::Lower(schema)).ToSQLString();
+		if (!drop_schema) {
+			query += " AND table_name=" + Value(StringUtil::Lower(table)).ToSQLString();
+		}
+		auto rows = committed.Query(query);
+		if (rows->HasError()) {
+			throw CatalogException(rows->GetError());
+		}
+		for (idx_t row = 0; row < rows->RowCount(); row++) {
+			auto name = rows->GetValue(0, row).ToString();
+			if (!state.HasInvalidatedSourceGeneration(catalog, schema, name) &&
+			    SourceGeneration(context, catalog, schema, name) != rows->GetValue(1, row).ToString()) {
+				throw TransactionException("OpenIVM source incarnation changed after this transaction's snapshot; "
+				                           "retry before dropping or replacing %s",
+				                           SqlUtils::FullName(catalog, schema, name));
+			}
+		}
+	}
+	auto registry = Catalog::GetEntry<TableCatalogEntry>(
+	    context, catalog, DEFAULT_SCHEMA, openivm::SOURCE_GENERATIONS_TABLE, OnEntryNotFound::RETURN_NULL);
+	if (registry) {
+		DeleteRegistryRows(context, *registry, [&](DataChunk &rows, idx_t row) {
+			auto matches = StringUtil::CIEquals(rows.GetValue(0, row).ToString(), schema) &&
+			               (drop_schema || StringUtil::CIEquals(rows.GetValue(1, row).ToString(), table));
+			if (matches) {
+				state.RecordSourceGenerationInvalidation(catalog, schema, rows.GetValue(1, row).ToString());
+			}
+			return matches;
+		});
+	}
 }
 
 string RefreshMetadata::SourceDeltaMappingDDL(const string &catalog, const string &schema, const string &table,
@@ -930,58 +1077,12 @@ void RefreshMetadata::RemoveSourceDeltaMapping(ClientContext &context, const str
 	if (!mapping) {
 		return;
 	}
-	auto &storage = mapping->GetStorage();
-	auto &transaction = DuckTransaction::Get(context, mapping->catalog);
-	vector<StorageIndex> columns;
-	for (auto column : {"source_schema", "table_name", "delta_schema", "delta_table_name"}) {
-		columns.emplace_back(mapping->GetColumn(column).StorageOid());
-	}
-	columns.emplace_back(COLUMN_IDENTIFIER_ROW_ID);
-	TableScanState scan;
-	storage.InitializeScan(context, transaction, scan, columns);
-	DataChunk rows;
-	rows.Initialize(Allocator::Get(context), {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
-	                                          LogicalType::VARCHAR, LogicalType::ROW_TYPE});
-	vector<unique_ptr<BoundConstraint>> constraints;
-	auto state = storage.InitializeDelete(*mapping, context, constraints);
-	while (true) {
-		rows.Reset();
-		storage.Scan(transaction, rows, scan);
-		if (!rows.size()) {
-			break;
-		}
-		Vector row_ids(LogicalType::ROW_TYPE);
-		DataChunk deleted;
-		deleted.Initialize(Allocator::Get(context), mapping->GetTypes());
-		idx_t count = 0;
-		for (idx_t row = 0; row < rows.size(); row++) {
-			// DROP TABLE without CASCADE retains the delta and its consumers. A
-			// same-named replacement source must continue capturing into that delta.
-			auto source_matches = drop_schema && StringUtil::CIEquals(rows.GetValue(0, row).ToString(), schema);
-			auto delta_matches = StringUtil::CIEquals(rows.GetValue(2, row).ToString(), schema) &&
-			                     (drop_schema || StringUtil::CIEquals(rows.GetValue(3, row).ToString(), name));
-			if (source_matches || delta_matches) {
-				row_ids.SetValue(count, rows.GetValue(4, row));
-				for (idx_t column = 0; column < 4; column++) {
-					deleted.SetValue(column, count, rows.GetValue(column, row));
-				}
-				count++;
-			}
-		}
-		if (count) {
-			MetaTransaction::Get(context).ModifyDatabase(mapping->catalog.GetAttached(),
-			                                             DatabaseModificationType::DELETE_DATA);
-			// Match native DELETE's uniqueness bookkeeping: later lifecycle steps can
-			// reinsert the same source key before this transaction commits.
-			LocalAppendState append_state;
-			storage.InitializeLocalStorage(append_state, *mapping, context, constraints);
-			deleted.SetCardinality(count);
-			LocalStorage::Get(context, mapping->catalog).GetStorage(storage)->AppendToDeleteIndexes(row_ids, deleted);
-			storage.Delete(*state, context, row_ids, count);
-			OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Removed %llu local source mappings in %s\n",
-			                    (unsigned long long)count, catalog.c_str());
-		}
-	}
+	DeleteRegistryRows(context, *mapping, [&](DataChunk &rows, idx_t row) {
+		// Non-cascading source DROP retains the delta and its consumers.
+		return (drop_schema && StringUtil::CIEquals(rows.GetValue(0, row).ToString(), schema)) ||
+		       (StringUtil::CIEquals(rows.GetValue(2, row).ToString(), schema) &&
+		        (drop_schema || StringUtil::CIEquals(rows.GetValue(3, row).ToString(), name)));
+	});
 }
 
 optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForMutation(ClientContext &context,

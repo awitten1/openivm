@@ -137,6 +137,11 @@ public:
 	// CREATE additionally validates control metadata ownership, including legacy physical names.
 	static optional_ptr<TableCatalogEntry> FindRegisteredSourceDelta(ClientContext &context, const string &catalog,
 	                                                                 const string &schema, const string &table);
+	static string SourceGenerationDDL(const string &catalog, const string &schema, const string &table);
+	static string SourceGeneration(ClientContext &context, const string &catalog, const string &schema,
+	                               const string &table);
+	static void InvalidateSourceGeneration(ClientContext &context, const string &catalog, const string &schema,
+	                                       const string &table, bool drop_schema = false);
 	static string SourceDeltaMappingDDL(const string &catalog, const string &schema, const string &table,
 	                                    const string &delta_schema, const string &delta_table);
 	static void RemoveSourceDeltaMapping(ClientContext &context, const string &catalog, const string &schema,

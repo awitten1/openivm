@@ -1319,9 +1319,9 @@ struct LifecycleSourceState : public GlobalSourceState {
 
 class PhysicalLifecycleProgram : public PhysicalOperator {
 public:
-	PhysicalLifecycleProgram(PhysicalPlan &physical_plan, string program)
+	PhysicalLifecycleProgram(PhysicalPlan &physical_plan, string program, bool staged)
 	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, {LogicalType::BOOLEAN}, 1),
-	      program(std::move(program)) {
+	      program(std::move(program)), staged(staged) {
 	}
 
 	bool IsSource() const override {
@@ -1339,6 +1339,14 @@ public:
 			return SourceResultType::FINISHED;
 		}
 		auto &client = context.client;
+		if (staged) {
+			MutationLockGuard guard(client);
+			ExecuteStagedDDL(client, {Value(program)});
+			chunk.SetValue(0, 0, Value::BOOLEAN(true));
+			chunk.SetCardinality(1);
+			state.finished = true;
+			return SourceResultType::FINISHED;
+		}
 		auto &executor = Executor::Get(client);
 		state.metrics = make_uniq<LifecycleMetricsScope>(client);
 		try {
@@ -1437,15 +1445,17 @@ public:
 
 private:
 	const string program;
+	const bool staged;
 };
 
 class LogicalLifecycleProgram : public LogicalExtensionOperator {
 public:
-	LogicalLifecycleProgram(idx_t table_index, string program) : table_index(table_index), program(std::move(program)) {
+	LogicalLifecycleProgram(idx_t table_index, string program, bool staged = false)
+	    : table_index(table_index), program(std::move(program)), staged(staged) {
 	}
 
 	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override {
-		return planner.Make<PhysicalLifecycleProgram>(program);
+		return planner.Make<PhysicalLifecycleProgram>(program, staged);
 	}
 
 	vector<ColumnBinding> GetColumnBindings() override {
@@ -1477,6 +1487,7 @@ protected:
 private:
 	const idx_t table_index;
 	const string program;
+	const bool staged;
 };
 
 } // namespace
@@ -1488,6 +1499,12 @@ unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder 
 	binder.GetStatementProperties().always_require_rebind = true;
 	OPENIVM_DEBUG_PRINT("[LIFECYCLE] Prepared deferred caller-transaction program\n");
 	return make_uniq<LogicalLifecycleProgram>(binder.GenerateTableIndex(), program);
+}
+
+unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder &binder, idx_t bind_index,
+                                                 const string &program, bool staged) {
+	binder.GetStatementProperties().always_require_rebind = true;
+	return make_uniq<LogicalLifecycleProgram>(bind_index, program, staged);
 }
 
 static string BuildDropEntryStatement(const DropInfo &drop_info, const string &function) {
@@ -1595,6 +1612,11 @@ static void ExecuteDropView(ClientContext &context, TableFunctionInput &input, D
 				}
 			});
 		}
+	}
+	if (catalog.IsDuckCatalog() && (info.type == CatalogType::TABLE_ENTRY || info.type == CatalogType::SCHEMA_ENTRY)) {
+		RefreshMetadata::InvalidateSourceGeneration(context, catalog.GetName(),
+		                                            info.type == CatalogType::SCHEMA_ENTRY ? info.name : info.schema,
+		                                            info.name, info.type == CatalogType::SCHEMA_ENTRY);
 	}
 	catalog.DropEntry(context, info);
 	if (catalog.IsDuckCatalog() && (info.type == CatalogType::TABLE_ENTRY || info.type == CatalogType::SCHEMA_ENTRY)) {

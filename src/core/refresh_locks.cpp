@@ -414,6 +414,17 @@ void TransactionalMVLockState::CleanupSourceDeltaAllocations(const vector<Refres
 	CleanupUnusedSourceDeltas(owner, sources, {});
 }
 
+void TransactionalMVLockState::RecordSourceGenerationInvalidation(const string &catalog, const string &schema,
+                                                                  const string &table) {
+	lock_guard<mutex> guard(state_lock);
+	invalidated_source_generations.insert(StringUtil::Lower(SqlUtils::FullName(catalog, schema, table)));
+}
+bool TransactionalMVLockState::HasInvalidatedSourceGeneration(const string &catalog, const string &schema,
+                                                              const string &table) {
+	lock_guard<mutex> guard(state_lock);
+	return invalidated_source_generations.count(StringUtil::Lower(SqlUtils::FullName(catalog, schema, table))) != 0;
+}
+
 void TransactionalMVLockState::RecordSourceDeltaDrop(const string &catalog, const string &schema, const string &table) {
 	lock_guard<mutex> guard(state_lock);
 	dropped_source_deltas.insert(StringUtil::Lower(SqlUtils::FullName(catalog, schema, table)));
@@ -451,8 +462,8 @@ void TransactionalMVLockState::TransactionRollback(MetaTransaction &transaction,
 RebindQueryInfo TransactionalMVLockState::OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
                                                             RebindQueryInfo current_rebind) {
 	auto &plan = info.prepared_statement.physical_plan;
-	if (plan && PlanCapturesTrackedDeltas(plan->Root())) {
-		AcquireMutationLock();
+	if (plan) {
+		AdmitPlanMutations(context, plan->Root());
 	}
 	return RebindQueryInfo::DO_NOT_REBIND;
 }
@@ -464,6 +475,7 @@ void TransactionalMVLockState::Release() {
 	deferred_source_delta_cleanup.clear();
 	allocated_source_deltas.clear();
 	dropped_source_deltas.clear();
+	invalidated_source_generations.clear();
 	source_write_admissions.clear();
 	source_publication_locks.clear();
 	mutation_guard.reset();

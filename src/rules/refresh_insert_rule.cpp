@@ -18,6 +18,7 @@
 #include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_execute.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/planner/operator/logical_merge_into.hpp"
@@ -306,6 +307,57 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
                                                   duckdb::unique_ptr<LogicalOperator> &plan) {
 	auto root = plan.get();
 
+	if (root->type == LogicalOperatorType::LOGICAL_CREATE_TABLE) {
+		auto &create = root->Cast<LogicalCreateTable>();
+		auto &catalog = create.schema.catalog;
+		if (!catalog.IsDuckCatalog() || create.info->Base().temporary) {
+			return;
+		}
+		auto &info = create.info->Base();
+		// MV lifecycle programs publish their own signed output changes. Their
+		// backing/publication rebuilds are not replacements of user sources.
+		if (SqlUtils::IsDelta(info.table) || IncrementalTableNames::IsDataTable(info.table) ||
+		    StringUtil::StartsWith(info.table, openivm::VISIBLE_TABLE_PREFIX)) {
+			return;
+		}
+		auto old_table = Catalog::GetEntry<TableCatalogEntry>(input.context, catalog.GetName(), create.schema.name,
+		                                                      info.table, OnEntryNotFound::RETURN_NULL);
+		if (old_table && info.on_conflict != OnCreateConflict::REPLACE_ON_CONFLICT) {
+			return;
+		}
+		auto delta = TransactionalMVLockState::Get(input.context)
+		                 .FindSourceDeltaForWrite(catalog.GetName(), create.schema.name, info.table);
+		auto token =
+		    RefreshMetadata::SourceGeneration(input.context, catalog.GetName(), create.schema.name, info.table);
+		if (delta) {
+			idx_t count = 0;
+			for (auto &column : delta->GetColumns().Physical()) {
+				if (column.Name() == openivm::MULTIPLICITY_COL || column.Name() == openivm::TIMESTAMP_COL) {
+					continue;
+				}
+				count++;
+				if (!info.columns.ColumnExists(column.Name()) ||
+				    info.columns.GetColumn(column.Name()).Type() != column.Type()) {
+					throw BinderException("OpenIVM replacement schema is incompatible with retained deltas for source "
+					                      "'%s'; drop dependent materialized views before changing its schema",
+					                      info.table);
+				}
+			}
+			if (count != info.columns.PhysicalColumnCount()) {
+				throw BinderException("OpenIVM replacement schema is incompatible with retained deltas for source "
+				                      "'%s'; drop dependent materialized views before changing its schema",
+				                      info.table);
+			}
+		}
+		if (delta || !token.empty() || !create.children.empty() ||
+		    info.on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT) {
+			auto wrapper = make_uniq<LogicalSourceLifecycle>(old_table, delta);
+			wrapper->children.push_back(std::move(plan));
+			plan = std::move(wrapper);
+		}
+		return;
+	}
+
 	// Handle ALTER TABLE: sync delta table schema or block if referenced column is affected
 	if (root->type == LogicalOperatorType::LOGICAL_ALTER) {
 		auto *simple = dynamic_cast<LogicalSimple *>(root);
@@ -333,8 +385,16 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		// skip schema synchronization when one of them is unavailable.
 		auto delta_entry = RefreshMetadata::FindSourceDeltaForMutation(input.context, source_locus.first,
 		                                                               source_locus.second, table_name);
+		auto wrap_generation = [&]() {
+			if (source->catalog.IsDuckCatalog()) {
+				auto wrapper = make_uniq<LogicalSourceLifecycle>(source, delta_entry);
+				wrapper->children.push_back(std::move(plan));
+				plan = std::move(wrapper);
+			}
+		};
 		if (!delta_entry) {
-			return; // not an IVM-tracked table
+			wrap_generation();
+			return;
 		}
 		// The physical delta may sit in an internal schema; metadata still keys it by delta_name.
 		auto delta_locus = std::make_pair(delta_entry->schema.name, delta_entry->name);
@@ -428,14 +488,15 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		default:
 			break;
 		}
+		wrap_generation();
 		return;
 	}
 
 	// SQL EXECUTE runs a cached plan that this rule does not see again; gate it as below.
 	if (root->type == LogicalOperatorType::LOGICAL_EXECUTE) {
 		auto &prepared = root->Cast<LogicalExecute>().prepared;
-		if (prepared && prepared->physical_plan && PlanCapturesTrackedDeltas(prepared->physical_plan->Root())) {
-			TransactionalMVLockState::Get(input.context).AcquireMutationLock();
+		if (prepared && prepared->physical_plan) {
+			AdmitPlanMutations(input.context, prepared->physical_plan->Root());
 		}
 		return;
 	}

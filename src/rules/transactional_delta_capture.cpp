@@ -3,6 +3,10 @@
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_locks.hpp"
+#include "core/refresh_metadata.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_simple.hpp"
+#include "duckdb/execution/operator/schema/physical_create_table.hpp"
 #include "core/sql_utils.hpp"
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
@@ -29,6 +33,25 @@ namespace duckdb {
 
 namespace {
 
+static void PrepareSourceLifecycle(ClientContext &context, const string &catalog, const string &schema,
+                                   const string &table, const string &planned_delta) {
+	auto &state = TransactionalMVLockState::Get(context);
+	state.MarkSourceWriteExecuted(catalog, schema, table, planned_delta);
+	if (planned_delta.empty() && RefreshMetadata::SourceGeneration(context, catalog, schema, table).empty()) {
+		Connection committed(*context.db);
+		string fresh;
+		committed.context->RunFunctionInTransaction(
+		    [&]() { fresh = RefreshMetadata::SourceGeneration(*committed.context, catalog, schema, table); });
+		if (!fresh.empty() && !state.HasInvalidatedSourceGeneration(catalog, schema, table)) {
+			throw TransactionException(
+			    "OpenIVM source incarnation changed after this transaction's snapshot; retry the replacement");
+		}
+		return;
+	}
+	state.AcquireMutationLock();
+	RefreshMetadata::InvalidateSourceGeneration(context, catalog, schema, table);
+}
+
 class PhysicalSourceWriteExecution : public PhysicalOperator {
 public:
 	PhysicalSourceWriteExecution(PhysicalPlan &physical_plan, PhysicalOperator &child, TableCatalogEntry &base_table,
@@ -41,8 +64,27 @@ public:
 		children.push_back(child);
 	}
 
+	PhysicalSourceWriteExecution(PhysicalPlan &physical_plan, PhysicalOperator &child, string catalog, string schema,
+	                             string table)
+	    : PhysicalOperator(physical_plan, PhysicalOperatorType::EXTENSION, child.GetTypes(),
+	                       child.estimated_cardinality),
+	      catalog(std::move(catalog)), schema(std::move(schema)), table(std::move(table)), lifecycle(true) {
+		children.push_back(child);
+	}
+	bool IsLifecycle() const {
+		return lifecycle;
+	}
+	void Admit(ClientContext &context) const {
+		if (TransactionalMVLockState::Get(context).FindSourceDeltaForWrite(catalog, schema, table)) {
+			throw TransactionException("OpenIVM source capture changed since preparation; retry the statement");
+		}
+	}
 	unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const override {
-		TransactionalMVLockState::Get(context).MarkSourceWriteExecuted(catalog, schema, table, planned_delta);
+		if (lifecycle) {
+			PrepareSourceLifecycle(context, catalog, schema, table, planned_delta);
+		} else {
+			TransactionalMVLockState::Get(context).MarkSourceWriteExecuted(catalog, schema, table, planned_delta);
+		}
 		return make_uniq<GlobalOperatorState>();
 	}
 
@@ -65,6 +107,7 @@ private:
 	const string schema;
 	const string table;
 	const string planned_delta;
+	const bool lifecycle = false;
 };
 
 static void EnterDeltaWritePhase(ClientContext &context) {
@@ -99,11 +142,15 @@ public:
 
 class TransactionalDeltaAppender {
 public:
-	TransactionalDeltaAppender(TableCatalogEntry &base_table_p, TableCatalogEntry &delta_table_p,
+	TransactionalDeltaAppender(const ColumnList &columns, TableCatalogEntry &delta_table_p,
 	                           vector<unique_ptr<Expression>> generated_expressions_p)
 	    : delta_table(delta_table_p), delta_types(delta_table.GetTypes()),
 	      generated_expressions(std::move(generated_expressions_p)) {
-		BuildDeltaColumnMap(base_table_p);
+		BuildDeltaColumnMap(columns);
+	}
+	TransactionalDeltaAppender(TableCatalogEntry &base_table, TableCatalogEntry &delta_table,
+	                           vector<unique_ptr<Expression>> generated_expressions)
+	    : TransactionalDeltaAppender(base_table.GetColumns(), delta_table, std::move(generated_expressions)) {
 	}
 
 	void EnterWritePhase(ClientContext &context, TransactionalDeltaAppendState &state) const {
@@ -197,10 +244,10 @@ public:
 	}
 
 private:
-	void BuildDeltaColumnMap(TableCatalogEntry &base_table) {
+	void BuildDeltaColumnMap(const ColumnList &base_columns) {
 		case_insensitive_map_t<idx_t> base_column_index;
 		idx_t base_index = 0;
-		for (auto &column : base_table.GetColumns().Physical()) {
+		for (auto &column : base_columns.Physical()) {
 			base_column_index[column.Name()] = base_index++;
 		}
 
@@ -225,6 +272,13 @@ private:
 				delta_column_map.push_back(DConstants::INVALID_INDEX);
 				generated_column_map.back() = generated_index++;
 				continue;
+			}
+			if (base_columns.GetColumn(column.Name()).Type() != column.Type()) {
+				throw BinderException("OpenIVM source column '%s' has type %s, but its retained delta has type %s. "
+				                      "Drop dependent materialized views before changing the source schema, then "
+				                      "recreate them.",
+				                      column.Name(), base_columns.GetColumn(column.Name()).Type().ToString(),
+				                      column.Type().ToString());
 			}
 			delta_column_map.push_back(entry->second);
 		}
@@ -881,6 +935,143 @@ private:
 	vector<LogicalType> delegated_types;
 };
 
+struct CreateCaptureGlobalState : GlobalSinkState {
+	unique_ptr<GlobalSinkState> delegated;
+};
+struct CreateCaptureLocalState : LocalSinkState {
+	CreateCaptureLocalState(ExecutionContext &context, PhysicalOperator &create,
+	                        const TransactionalDeltaAppender *appender)
+	    : delegated(create.GetLocalSinkState(context)) {
+		if (appender) {
+			append = make_uniq<TransactionalDeltaAppendState>(context.client, appender->GeneratedExpressions(),
+			                                                  appender->DeltaTypes());
+		}
+	}
+	unique_ptr<LocalSinkState> delegated;
+	unique_ptr<TransactionalDeltaAppendState> append;
+};
+
+// Native CREATE retains its own catalog replacement and SELECT snapshot. Capture
+// preimages before creating the new allocation and stream its postimages into
+// the same caller transaction, including empty and self-reading replacements.
+class PhysicalSourceLifecycle : public PhysicalOperator {
+public:
+	PhysicalSourceLifecycle(PhysicalPlan &plan, PhysicalOperator &create, optional_ptr<TableCatalogEntry> old_table,
+	                        optional_ptr<TableCatalogEntry> delta, const ColumnList &columns, string catalog,
+	                        string schema, string table)
+	    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, create.GetTypes(), 1), create(create),
+	      old_table(old_table), delta(delta), catalog(std::move(catalog)), schema(std::move(schema)),
+	      table(std::move(table)) {
+		for (auto &child : create.children) {
+			children.push_back(child);
+		}
+		if (delta && create.IsSink()) {
+			appender = make_uniq<TransactionalDeltaAppender>(columns, *delta, vector<unique_ptr<Expression>>());
+		}
+	}
+	void Prepare(ClientContext &context) const {
+		PrepareSourceLifecycle(context, catalog, schema, table,
+		                       delta ? SqlUtils::FullName(catalog, delta->schema.name, delta->name) : string());
+		if (!old_table || !delta) {
+			return;
+		}
+		TransactionalDeltaAppender retract(*old_table.get_mutable(), *delta.get_mutable(), {});
+		TransactionalDeltaAppendState append(context, retract.GeneratedExpressions(), retract.DeltaTypes());
+		retract.EnterWritePhase(context, append);
+		auto &transaction = DuckTransaction::Get(context, old_table->catalog);
+		auto &storage = old_table.get_mutable()->GetStorage();
+		vector<StorageIndex> columns;
+		for (auto &column : old_table->GetColumns().Physical()) {
+			columns.emplace_back(column.StorageOid());
+		}
+		TableScanState scan;
+		storage.InitializeScan(context, transaction, scan, columns);
+		DataChunk rows;
+		rows.Initialize(Allocator::Get(context), old_table->GetTypes());
+		while (true) {
+			rows.Reset();
+			storage.Scan(transaction, rows, scan);
+			if (!rows.size()) {
+				break;
+			}
+			retract.Append(context, rows, -1, append);
+		}
+		retract.Finalize(context, append);
+		OPENIVM_DEBUG_PRINT("[CTAS] Captured replacement preimages for %s.%s.%s\n", catalog.c_str(), schema.c_str(),
+		                    table.c_str());
+	}
+	bool IsSink() const override {
+		return create.IsSink();
+	}
+	bool IsSource() const override {
+		return true;
+	}
+	bool ParallelSink() const override {
+		return create.ParallelSink();
+	}
+	bool SinkOrderDependent() const override {
+		return create.SinkOrderDependent();
+	}
+	unique_ptr<GlobalSinkState> GetGlobalSinkState(ClientContext &context) const override {
+		Prepare(context);
+		auto state = make_uniq<CreateCaptureGlobalState>();
+		state->delegated = create.GetGlobalSinkState(context);
+		return std::move(state);
+	}
+	unique_ptr<LocalSinkState> GetLocalSinkState(ExecutionContext &context) const override {
+		return make_uniq<CreateCaptureLocalState>(context, create, appender.get());
+	}
+	SinkResultType Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const override {
+		auto &global = input.global_state.Cast<CreateCaptureGlobalState>();
+		auto &local = input.local_state.Cast<CreateCaptureLocalState>();
+		OperatorSinkInput delegated {*global.delegated, *local.delegated, input.interrupt_state};
+		auto result = create.Sink(context, chunk, delegated);
+		if (result != SinkResultType::BLOCKED && appender) {
+			appender->EnterWritePhase(context.client, *local.append);
+			appender->Append(context.client, chunk, 1, *local.append);
+		}
+		return result;
+	}
+	SinkCombineResultType Combine(ExecutionContext &context, OperatorSinkCombineInput &input) const override {
+		auto &global = input.global_state.Cast<CreateCaptureGlobalState>();
+		auto &local = input.local_state.Cast<CreateCaptureLocalState>();
+		OperatorSinkCombineInput delegated {*global.delegated, *local.delegated, input.interrupt_state};
+		auto result = create.Combine(context, delegated);
+		if (result == SinkCombineResultType::FINISHED && appender) {
+			appender->Finalize(context.client, *local.append);
+		}
+		return result;
+	}
+	SinkFinalizeType Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
+	                          OperatorSinkFinalizeInput &input) const override {
+		auto &global = input.global_state.Cast<CreateCaptureGlobalState>();
+		OperatorSinkFinalizeInput delegated {*global.delegated, input.interrupt_state};
+		return create.Finalize(pipeline, event, context, delegated);
+	}
+	unique_ptr<GlobalSourceState> GetGlobalSourceState(ClientContext &context) const override {
+		if (create.IsSink()) {
+			create.sink_state = std::move(sink_state->Cast<CreateCaptureGlobalState>().delegated);
+		} else {
+			Prepare(context);
+		}
+		return create.GetGlobalSourceState(context);
+	}
+	SourceResultType GetDataInternal(ExecutionContext &context, DataChunk &chunk,
+	                                 OperatorSourceInput &input) const override {
+		return create.GetData(context, chunk, input);
+	}
+	string GetName() const override {
+		return "OPENIVM_SOURCE_LIFECYCLE";
+	}
+
+private:
+	PhysicalOperator &create;
+	optional_ptr<TableCatalogEntry> old_table;
+	optional_ptr<TableCatalogEntry> delta;
+	unique_ptr<TransactionalDeltaAppender> appender;
+	const string catalog, schema, table;
+};
+
 static vector<unique_ptr<Expression>> BindGeneratedExpressions(ClientContext &context, TableCatalogEntry &base_table,
                                                                TableCatalogEntry &delta_table) {
 	case_insensitive_set_t physical_columns;
@@ -909,27 +1100,84 @@ static vector<unique_ptr<Expression>> BindGeneratedExpressions(ClientContext &co
 
 } // namespace
 
-bool PlanCapturesTrackedDeltas(PhysicalOperator &op) {
-	if (dynamic_cast<PhysicalTransactionalDeltaCapture *>(&op)) {
-		return true;
+void AdmitPlanMutations(ClientContext &context, PhysicalOperator &op) {
+	if (auto source = dynamic_cast<PhysicalSourceWriteExecution *>(&op)) {
+		if (source->IsLifecycle()) {
+			// Cached untracked CTAS must reserve its source before the native sink
+			// runs. Shared admission avoids serializing independent creations.
+			source->Admit(context);
+			return;
+		}
 	}
-	if (dynamic_cast<PhysicalMergeActionDeltaCapture *>(&op)) {
-		return true;
+	if (dynamic_cast<PhysicalSourceLifecycle *>(&op) || dynamic_cast<PhysicalTransactionalDeltaCapture *>(&op) ||
+	    dynamic_cast<PhysicalMergeActionDeltaCapture *>(&op)) {
+		TransactionalMVLockState::Get(context).AcquireMutationLock();
+		return;
 	}
 	if (op.type == PhysicalOperatorType::MERGE_INTO) {
-		// MERGE keeps its action sinks, which the capture decorates, outside its children.
 		for (auto &action : op.Cast<PhysicalMergeInto>().actions) {
-			if (action->op && PlanCapturesTrackedDeltas(*action->op)) {
-				return true;
+			if (action->op) {
+				AdmitPlanMutations(context, *action->op);
 			}
 		}
 	}
 	for (auto &child : op.children) {
-		if (PlanCapturesTrackedDeltas(child.get())) {
-			return true;
-		}
+		AdmitPlanMutations(context, child.get());
 	}
-	return false;
+}
+
+LogicalSourceLifecycle::LogicalSourceLifecycle(optional_ptr<TableCatalogEntry> old_table,
+                                               optional_ptr<TableCatalogEntry> delta)
+    : old_table(old_table), delta(delta) {
+}
+PhysicalOperator &LogicalSourceLifecycle::CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) {
+	if (children[0]->type == LogicalOperatorType::LOGICAL_ALTER) {
+		auto &source = *old_table;
+		auto &alter = planner.CreatePlan(*children[0]);
+		return planner.Make<PhysicalSourceLifecycle>(alter, nullptr, delta, ColumnList(), source.catalog.GetName(),
+		                                             source.schema.name, source.name);
+	}
+	auto &op = children[0]->Cast<LogicalCreateTable>();
+	auto &base = op.info->Base();
+	auto catalog = op.schema.catalog.GetName();
+	auto schema = op.schema.name;
+	auto table = base.table;
+	if (!delta) {
+		// Untracked CTAS retains DuckDB's native ordering/batch strategy. Its
+		// output marker only records admission and retires any FK incarnation.
+		auto &native = planner.CreatePlan(static_cast<LogicalOperator &>(op));
+		return planner.Make<PhysicalSourceWriteExecution>(native, catalog, schema, table);
+	}
+	auto columns = base.columns.Copy();
+	planner.dependencies.AddDependency(*delta);
+	if (old_table) {
+		planner.dependencies.AddDependency(*old_table);
+	}
+	PhysicalOperator *create;
+	if (op.children.empty()) {
+		create = &planner.Make<PhysicalCreateTable>(op, op.schema, std::move(op.info), op.estimated_cardinality);
+	} else {
+		auto &input = planner.CreatePlan(*op.children[0]);
+		// Capture streams through native INSERT while respecting the caller's
+		// requested insertion ordering, without a second batch-buffering layer.
+		auto &insert = planner.Make<PhysicalInsert>(op, op.schema, std::move(op.info), op.estimated_cardinality,
+		                                            !PhysicalPlanGenerator::PreserveInsertionOrder(context, input));
+		insert.children.push_back(input);
+		create = &insert;
+	}
+	return planner.Make<PhysicalSourceLifecycle>(*create, old_table, delta, columns, catalog, schema, table);
+}
+vector<ColumnBinding> LogicalSourceLifecycle::GetColumnBindings() {
+	return children[0]->GetColumnBindings();
+}
+void LogicalSourceLifecycle::ResolveTypes() {
+	types = children[0]->types;
+}
+string LogicalSourceLifecycle::GetName() const {
+	return "OPENIVM_SOURCE_LIFECYCLE";
+}
+string LogicalSourceLifecycle::GetExtensionName() const {
+	return "openivm_source_lifecycle";
 }
 
 LogicalSourceWriteExecution::LogicalSourceWriteExecution(TableCatalogEntry &base_table_p,

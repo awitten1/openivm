@@ -141,6 +141,8 @@ public:
 	void RecordSourceDeltaAllocation(const RefreshMetadata::DeltaSource &source);
 	vector<RefreshMetadata::DeltaSource> TakeSourceDeltaAllocations();
 	void CleanupSourceDeltaAllocations(const vector<RefreshMetadata::DeltaSource> &sources);
+	void RecordSourceGenerationInvalidation(const string &catalog, const string &schema, const string &table);
+	bool HasInvalidatedSourceGeneration(const string &catalog, const string &schema, const string &table);
 	void RecordSourceDeltaDrop(const string &catalog, const string &schema, const string &table);
 	bool HasDroppedSourceDelta(const string &catalog, const string &schema, const string &table);
 	optional_ptr<TableCatalogEntry> FindDeferredSourceDelta(const string &catalog, const string &schema,
@@ -171,6 +173,7 @@ private:
 	vector<RefreshMetadata::DeltaSource> deferred_source_delta_cleanup;
 	vector<RefreshMetadata::DeltaSource> allocated_source_deltas;
 	unordered_set<string> dropped_source_deltas;
+	unordered_set<string> invalidated_source_generations;
 };
 
 } // namespace duckdb

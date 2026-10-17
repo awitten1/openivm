@@ -1912,3 +1912,142 @@ INSERT INTO renamed_guard_src VALUES(4,3000000000);
 DROP TABLE renamed_guard_src;
 
 endloop
+
+# Native CTAS captures old/new bags, including duplicate rows, replacement
+# self-reads, empty results, reordered columns, commit and rollback.
+foreach metadata main CTAS_Control
+
+statement ok
+SET openivm_metadata_schema='${metadata}';
+SET openivm_internal_schema='CTAS_Internal';
+CREATE TABLE ctas_src(k INTEGER,v INTEGER);
+INSERT INTO ctas_src VALUES(1,10),(1,10),(2,20);
+CREATE MATERIALIZED VIEW ctas_mv AS SELECT k,SUM(v) s,COUNT(*) c FROM ctas_src GROUP BY k;
+
+statement ok
+CREATE OR REPLACE TABLE ctas_src AS SELECT k,v+1 AS v FROM ctas_src;
+INSERT INTO ctas_src VALUES(1,30),(3,40);
+UPDATE ctas_src SET v=v+2 WHERE k=1;
+DELETE FROM ctas_src WHERE k=3;
+
+statement ok
+PRAGMA refresh('ctas_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ctas_mv EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM ctas_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM ctas_src GROUP BY k EXCEPT ALL SELECT * FROM ctas_mv));
+----
+0
+
+statement ok
+BEGIN;
+CREATE OR REPLACE TABLE ctas_src AS SELECT v,k FROM ctas_src WHERE false;
+ROLLBACK;
+
+statement ok
+PRAGMA refresh('ctas_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ctas_mv EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM ctas_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM ctas_src GROUP BY k EXCEPT ALL SELECT * FROM ctas_mv));
+----
+0
+
+statement ok
+BEGIN;
+CREATE OR REPLACE TABLE ctas_src AS SELECT 8::INTEGER k,9::INTEGER v;
+COMMIT;
+DROP TABLE ctas_src;
+CREATE TABLE ctas_src AS SELECT 4::INTEGER k,5::INTEGER v UNION ALL SELECT 4,5;
+
+statement ok
+PRAGMA refresh('ctas_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ctas_mv EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM ctas_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM ctas_src GROUP BY k EXCEPT ALL SELECT * FROM ctas_mv));
+----
+0
+
+statement error
+CREATE OR REPLACE TABLE ctas_src AS SELECT 1::INTEGER k,3000000000::BIGINT v;
+----
+replacement schema is incompatible
+
+statement ok
+PRAGMA refresh('ctas_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ctas_mv EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM ctas_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM ctas_src GROUP BY k EXCEPT ALL SELECT * FROM ctas_mv));
+----
+0
+
+statement ok
+CREATE TABLE IF NOT EXISTS ctas_src AS SELECT 99::INTEGER k,99::INTEGER v;
+CREATE OR REPLACE TABLE ctas_src AS SELECT * FROM ctas_src WHERE false;
+
+statement ok
+PRAGMA refresh('ctas_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM ctas_mv EXCEPT ALL SELECT k,SUM(v),COUNT(*) FROM ctas_src GROUP BY k)
+UNION ALL (SELECT k,SUM(v),COUNT(*) FROM ctas_src GROUP BY k EXCEPT ALL SELECT * FROM ctas_mv));
+----
+0
+
+statement ok
+DROP VIEW ctas_mv;
+DROP TABLE ctas_src;
+
+endloop
+
+# A failed native replacement must roll back its preimage deltas and incarnation
+# invalidation, even if the caller attempts COMMIT after the execution error.
+statement ok
+CREATE TABLE failed_ctas_parent(k INTEGER PRIMARY KEY);
+CREATE TABLE failed_ctas_child(k INTEGER REFERENCES failed_ctas_parent(k));
+INSERT INTO failed_ctas_parent VALUES(1);
+INSERT INTO failed_ctas_child VALUES(1);
+CREATE MATERIALIZED VIEW failed_ctas_mv AS SELECT k FROM failed_ctas_parent;
+
+statement ok
+PRAGMA openivm_declare_rely_fk('failed_ctas_child','k','failed_ctas_parent','k');
+
+statement ok
+CREATE TEMP TABLE original_ctas_token AS SELECT generation FROM main.openivm_source_generations WHERE table_name='failed_ctas_parent';
+BEGIN;
+
+statement error
+CREATE OR REPLACE TABLE failed_ctas_parent AS SELECT 2::INTEGER k;
+----
+depend
+
+statement ok
+COMMIT;
+
+query I
+SELECT count(*) FROM ((SELECT generation FROM main.openivm_source_generations WHERE table_name='failed_ctas_parent' EXCEPT ALL SELECT * FROM original_ctas_token)
+UNION ALL (SELECT * FROM original_ctas_token EXCEPT ALL SELECT generation FROM main.openivm_source_generations WHERE table_name='failed_ctas_parent'));
+----
+0
+
+statement ok
+PRAGMA refresh('failed_ctas_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM failed_ctas_mv EXCEPT ALL SELECT * FROM failed_ctas_parent)
+UNION ALL (SELECT * FROM failed_ctas_parent EXCEPT ALL SELECT * FROM failed_ctas_mv));
+----
+0
+
+# Untracked CTAS retains DuckDB's native insertion-order/batch strategy.
+statement ok
+SET preserve_insertion_order=true;
+SET threads=4;
+CREATE TABLE ordered_untracked_ctas AS SELECT i FROM range(100000) r(i);
+
+query I
+SELECT bool_and(i=rn-1) FROM (SELECT i,row_number() OVER() rn FROM ordered_untracked_ctas);
+----
+true

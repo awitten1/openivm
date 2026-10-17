@@ -103,6 +103,8 @@ string BuildDropViewStatement(const DropInfo &drop_info);
 string BuildDropTableStatement(const DropInfo &drop_info);
 string BuildDropSchemaStatement(const DropInfo &drop_info);
 unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder &binder, const string &program);
+unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder &binder, idx_t bind_index,
+                                                 const string &program, bool staged);
 TableFunction DropEntryFunction(CatalogType type);
 
 } // namespace duckdb

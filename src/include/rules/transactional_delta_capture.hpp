@@ -9,6 +9,25 @@ class TableCatalogEntry;
 
 enum class DeltaCaptureMode : uint8_t { INSERT, DELETE, UPDATE };
 
+class LogicalSourceLifecycle : public LogicalExtensionOperator {
+public:
+	LogicalSourceLifecycle(optional_ptr<TableCatalogEntry> old_table, optional_ptr<TableCatalogEntry> delta);
+	PhysicalOperator &CreatePlan(ClientContext &context, PhysicalPlanGenerator &planner) override;
+	vector<ColumnBinding> GetColumnBindings() override;
+	string GetName() const override;
+	string GetExtensionName() const override;
+	bool SupportSerialization() const override {
+		return false;
+	}
+
+protected:
+	void ResolveTypes() override;
+
+private:
+	optional_ptr<TableCatalogEntry> old_table;
+	optional_ptr<TableCatalogEntry> delta;
+};
+
 // Admission is acquired while optimizing, including for EXPLAIN and PREPARE.
 // This wrapper marks a source write only when the DML plan is executed.
 class LogicalSourceWriteExecution : public LogicalExtensionOperator {
@@ -78,9 +97,9 @@ protected:
 	void ResolveTypes() override;
 };
 
-// Whether a physical plan writes a tracked base table through OpenIVM delta capture.
-// Cached plans (prepared statements) execute without the optimizer rule that inserts it.
-bool PlanCapturesTrackedDeltas(PhysicalOperator &op);
+// Admit cached source lifecycles before their native sinks run, and acquire the
+// mutation gate for plans that capture tracked deltas. This is one plan walk.
+void AdmitPlanMutations(ClientContext &context, PhysicalOperator &op);
 
 } // namespace duckdb
 

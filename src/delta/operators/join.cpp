@@ -1285,7 +1285,8 @@ static vector<vector<DeltaJoinKeyProbe>> BuildJoinKeyProbes(LogicalOperator *joi
 }
 
 static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector<JoinLeafInfo> &leaves,
-                                            LogicalOperator *join_root) {
+                                            LogicalOperator *join_root,
+                                            const vector<openivm::CachedConstraint> &declarations) {
 	vector<FKRelation> relations;
 
 	// Build map: table_name -> leaf index (for matching FK targets to leaves)
@@ -1345,9 +1346,11 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 		// relationships (populated via PRAGMA openivm_declare_rely_fk). These are
 		// explicit, trusted user declarations the catalog may not carry (e.g.
 		// Spark/Delta base tables have no enforced FK constraints).
-		openivm::ConstraintCache constraint_cache;
-		for (auto &cached : constraint_cache.GetConstraints(
-		         context, SqlUtils::FullName(table_ref->catalog.GetName(), table_ref->schema.name, table_ref->name))) {
+		for (auto &cached : declarations) {
+			if (!StringUtil::CIEquals(cached.table_name, SqlUtils::FullName(table_ref->catalog.GetName(),
+			                                                                table_ref->schema.name, table_ref->name))) {
+				continue;
+			}
 			if (!cached.is_trusted ||
 			    !(StringUtil::CIEquals(cached.kind, "FK") || StringUtil::CIEquals(cached.kind, "RELY_FK"))) {
 				continue;
@@ -1378,28 +1381,6 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 		}
 	}
 	return relations;
-}
-
-// Cheap pre-check for the FK-pruning gate: does any join leaf carry a trusted
-// FK / RELY_FK in the openivm_constraints_cache? A declared RELY_FK is an
-// explicit signal that pruning is worthwhile even when multiple leaves changed.
-static bool ConstraintCacheHasTrustedFk(ClientContext &context, const vector<JoinLeafInfo> &leaves) {
-	openivm::ConstraintCache constraint_cache;
-	for (auto &leaf : leaves) {
-		LogicalGet *get = GetLeafScan(leaf);
-		if (!get || get->GetTable().get() == nullptr) {
-			continue;
-		}
-		for (auto &cached : constraint_cache.GetConstraints(
-		         context, SqlUtils::FullName(get->GetTable()->catalog.GetName(), get->GetTable()->schema.name,
-		                                     get->GetTable()->name))) {
-			if (cached.is_trusted &&
-			    (StringUtil::CIEquals(cached.kind, "FK") || StringUtil::CIEquals(cached.kind, "RELY_FK"))) {
-				return true;
-			}
-		}
-	}
-	return false;
 }
 
 static vector<FKRelation> DetectCompileFactsFKRelations(const openivm::CompileFacts &facts,
@@ -1533,12 +1514,13 @@ static uint64_t ComputeFactsUnchangedMask(const openivm::CompileFacts &facts, co
 }
 
 static bool RegularNtermPreservesFKPruning(ClientContext &context, const openivm::CompileFacts &facts,
-                                           const vector<JoinLeafInfo> &leaves, LogicalOperator *join_root) {
+                                           const vector<JoinLeafInfo> &leaves, LogicalOperator *join_root,
+                                           const vector<openivm::CachedConstraint> &declarations) {
 	if (!SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true)) {
 		return true;
 	}
 	if (facts.fk_relations.empty()) {
-		bool has_cache_fk = ConstraintCacheHasTrustedFk(context, leaves);
+		bool has_cache_fk = !declarations.empty();
 		if (has_cache_fk) {
 			OPENIVM_DEBUG_PRINT("[DeltaJoin] Keeping inclusion-exclusion for trusted cached FK pruning\n");
 		}
@@ -1561,11 +1543,10 @@ static bool RegularNtermPreservesFKPruning(ClientContext &context, const openivm
 // ============================================================================
 // BuildInclusionExclusionTerms: create 2^N - 1 delta terms
 // ============================================================================
-static vector<unique_ptr<LogicalOperator>>
-BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, Binder &binder,
-                             const vector<JoinLeafInfo> &leaves, bool has_left_join,
-                             const vector<ColumnBinding> &existing_multiplicity_bindings,
-                             vector<TransitioningKeyCTEDefinition> &transition_ctes) {
+static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
+    DeltaOperatorInput input, ClientContext &context, Binder &binder, const vector<JoinLeafInfo> &leaves,
+    bool has_left_join, const vector<ColumnBinding> &existing_multiplicity_bindings,
+    vector<TransitioningKeyCTEDefinition> &transition_ctes, const vector<openivm::CachedConstraint> &declarations) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -1587,14 +1568,14 @@ BuildInclusionExclusionTerms(DeltaOperatorInput input, ClientContext &context, B
 	// main win case: one-sided PK/dimension changes, OR when an explicit FK is
 	// declared (compile facts, or a trusted RELY_FK in the constraints cache).
 	bool has_compile_fk_facts = compile_only && !compile_facts.fk_relations.empty();
-	bool has_cache_fk = !has_compile_fk_facts && ConstraintCacheHasTrustedFk(context, leaves);
+	bool has_cache_fk = !declarations.empty();
 	// The one-leaf cutoff avoids catalog work; FK pruning remains semantically valid on either side of it.
 	bool fk_pruning_worthwhile =
 	    has_compile_fk_facts || has_cache_fk || non_empty_leaf_count == 1; // mull-ignore: cxx_eq_to_ne
 	if (fk_pruning_enabled && fk_pruning_worthwhile) {
 		auto fk_relations = has_compile_fk_facts
 		                        ? DetectCompileFactsFKRelations(compile_facts, leaves, input.plan.get())
-		                        : DetectFKRelations(context, leaves, input.plan.get());
+		                        : DetectFKRelations(context, leaves, input.plan.get(), declarations);
 		if (!fk_relations.empty()) {
 			uint64_t insert_only_mask = has_compile_fk_facts ? ComputeFactsInsertOnlyMask(compile_facts, leaves)
 			                                                 : delta_status.insert_only_mask;
@@ -2166,6 +2147,18 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 	}
 	auto compile_facts = openivm::CompileFactsContextSlot::Get(context);
 	auto unchanged_mask = ComputeFactsUnchangedMask(compile_facts, leaves);
+	vector<openivm::CachedConstraint> declarations;
+	if (SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true) && compile_facts.fk_relations.empty()) {
+		case_insensitive_set_t sources;
+		for (auto &leaf : leaves) {
+			auto get = GetLeafScan(leaf);
+			if (get && get->GetTable()) {
+				auto &table = *get->GetTable();
+				sources.insert(SqlUtils::FullName(table.catalog.GetName(), table.schema.name, table.name));
+			}
+		}
+		declarations = openivm::ReadConstraintDeclarations(context, sources);
+	}
 	bool regular_nterm_base = !all_ducklake && compile_facts.compile_only &&
 	                          input.context.model.type == RefreshType::SIMPLE_PROJECTION &&
 	                          SqlUtils::GetBoolSetting(context, "openivm_regular_nterm", true);
@@ -2180,7 +2173,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 		                SqlUtils::GetBoolSetting(context, "openivm_regular_nterm_left", true);
 	} else {
 		regular_nterm = regular_nterm_base && join_facts.only_inner_joins &&
-		                RegularNtermPreservesFKPruning(context, compile_facts, leaves, input.plan.get());
+		                RegularNtermPreservesFKPruning(context, compile_facts, leaves, input.plan.get(), declarations);
 	}
 	if (regular_nterm) {
 		for (auto &leaf : leaves) {
@@ -2203,7 +2196,7 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 		                              join_facts.existing_multiplicity_bindings);
 	} else {
 		terms = BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join,
-		                                     join_facts.existing_multiplicity_bindings, transition_ctes);
+		                                     join_facts.existing_multiplicity_bindings, transition_ctes, declarations);
 	}
 
 	// 4. UNION ALL

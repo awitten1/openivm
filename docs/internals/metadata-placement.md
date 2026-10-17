@@ -49,6 +49,7 @@ Selecting a metadata location never moves data objects:
 | `openivm_data_<key>`, `openivm_visible_<key>`, MV delta tables, aux state | the view's catalog; its schema or `openivm_internal_schema` |
 | `openivm_delta_<source>` | the source's catalog; its schema or `openivm_internal_schema`, so capture stays in the writer's transaction |
 | Internal tables of a view in an external catalog that is neither native nor DuckLake | the physical default database, `main` schema (unchanged) |
+| `openivm_source_generations` FK incarnation tokens | `main` in each native source catalog; invalidated locally on DROP/REPLACE |
 | `openivm_source_deltas` routing table | `main` in each native source catalog; stays local when control metadata moves |
 | `openivm_metadata_location` marker | For a separate metadata catalog, `main` in native view/source catalogs and the frontend database for external views; no marker is needed inside the metadata catalog itself |
 

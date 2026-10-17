@@ -5,6 +5,7 @@
 
 namespace duckdb {
 namespace openivm {
+constexpr const char *SOURCE_GENERATIONS_TABLE = "openivm_source_generations";
 static constexpr const char *SOURCE_DELTA_MAP_TABLE = "openivm_source_deltas";
 constexpr const char *RUNNING_INPUT_PREFIX = "openivm_running_";
 constexpr const char *ROWS_POSITION_PREFIX = "openivm_rows_position_";
