@@ -935,6 +935,32 @@ private:
 	vector<LogicalType> delegated_types;
 };
 
+static vector<unique_ptr<Expression>> BindGeneratedExpressions(ClientContext &context, TableCatalogEntry &base_table,
+                                                               TableCatalogEntry &delta_table) {
+	case_insensitive_set_t physical_columns;
+	for (auto &column : base_table.GetColumns().Physical()) {
+		physical_columns.insert(column.Name());
+	}
+	vector<unique_ptr<Expression>> generated_expressions;
+	auto binder = Binder::CreateBinder(context);
+	physical_index_set_t bound_columns;
+	CheckBinder generated_binder(*binder, context, base_table.name, base_table.GetColumns(), bound_columns);
+	for (auto &column : delta_table.GetColumns().Physical()) {
+		if (column.Name() == openivm::MULTIPLICITY_COL || column.Name() == openivm::TIMESTAMP_COL ||
+		    physical_columns.find(column.Name()) != physical_columns.end()) {
+			continue;
+		}
+		auto &base_column = base_table.GetColumns().GetColumn(column.Name());
+		if (!base_column.Generated()) {
+			throw InternalException("OpenIVM delta column '%s' is absent from the base table storage", column.Name());
+		}
+		generated_binder.target_type = base_column.Type();
+		auto generated_expression = base_column.GeneratedExpression().Copy();
+		generated_expressions.push_back(generated_binder.Bind(generated_expression));
+	}
+	return generated_expressions;
+}
+
 struct CreateCaptureGlobalState : GlobalSinkState {
 	unique_ptr<GlobalSinkState> delegated;
 };
@@ -956,9 +982,9 @@ struct CreateCaptureLocalState : LocalSinkState {
 // the same caller transaction, including empty and self-reading replacements.
 class PhysicalSourceLifecycle : public PhysicalOperator {
 public:
-	PhysicalSourceLifecycle(PhysicalPlan &plan, PhysicalOperator &create, optional_ptr<TableCatalogEntry> old_table,
-	                        optional_ptr<TableCatalogEntry> delta, const ColumnList &columns, string catalog,
-	                        string schema, string table)
+	PhysicalSourceLifecycle(PhysicalPlan &plan, ClientContext &context, PhysicalOperator &create,
+	                        optional_ptr<TableCatalogEntry> old_table, optional_ptr<TableCatalogEntry> delta,
+	                        const ColumnList &columns, string catalog, string schema, string table)
 	    : PhysicalOperator(plan, PhysicalOperatorType::EXTENSION, create.GetTypes(), 1), create(create),
 	      old_table(old_table), delta(delta), catalog(std::move(catalog)), schema(std::move(schema)),
 	      table(std::move(table)) {
@@ -968,6 +994,10 @@ public:
 		if (delta && create.IsSink()) {
 			appender = make_uniq<TransactionalDeltaAppender>(columns, *delta, vector<unique_ptr<Expression>>());
 		}
+		if (old_table && delta) {
+			retractions = make_uniq<TransactionalDeltaAppender>(*old_table, *delta,
+			                                                    BindGeneratedExpressions(context, *old_table, *delta));
+		}
 	}
 	void Prepare(ClientContext &context) const {
 		PrepareSourceLifecycle(context, catalog, schema, table,
@@ -975,7 +1005,7 @@ public:
 		if (!old_table || !delta) {
 			return;
 		}
-		TransactionalDeltaAppender retract(*old_table.get_mutable(), *delta.get_mutable(), {});
+		auto &retract = *retractions;
 		TransactionalDeltaAppendState append(context, retract.GeneratedExpressions(), retract.DeltaTypes());
 		retract.EnterWritePhase(context, append);
 		auto &transaction = DuckTransaction::Get(context, old_table->catalog);
@@ -1069,34 +1099,9 @@ private:
 	optional_ptr<TableCatalogEntry> old_table;
 	optional_ptr<TableCatalogEntry> delta;
 	unique_ptr<TransactionalDeltaAppender> appender;
+	unique_ptr<TransactionalDeltaAppender> retractions;
 	const string catalog, schema, table;
 };
-
-static vector<unique_ptr<Expression>> BindGeneratedExpressions(ClientContext &context, TableCatalogEntry &base_table,
-                                                               TableCatalogEntry &delta_table) {
-	case_insensitive_set_t physical_columns;
-	for (auto &column : base_table.GetColumns().Physical()) {
-		physical_columns.insert(column.Name());
-	}
-	vector<unique_ptr<Expression>> generated_expressions;
-	auto binder = Binder::CreateBinder(context);
-	physical_index_set_t bound_columns;
-	CheckBinder generated_binder(*binder, context, base_table.name, base_table.GetColumns(), bound_columns);
-	for (auto &column : delta_table.GetColumns().Physical()) {
-		if (column.Name() == openivm::MULTIPLICITY_COL || column.Name() == openivm::TIMESTAMP_COL ||
-		    physical_columns.find(column.Name()) != physical_columns.end()) {
-			continue;
-		}
-		auto &base_column = base_table.GetColumns().GetColumn(column.Name());
-		if (!base_column.Generated()) {
-			throw InternalException("OpenIVM delta column '%s' is absent from the base table storage", column.Name());
-		}
-		generated_binder.target_type = base_column.Type();
-		auto generated_expression = base_column.GeneratedExpression().Copy();
-		generated_expressions.push_back(generated_binder.Bind(generated_expression));
-	}
-	return generated_expressions;
-}
 
 } // namespace
 
@@ -1134,8 +1139,8 @@ PhysicalOperator &LogicalSourceLifecycle::CreatePlan(ClientContext &context, Phy
 	if (children[0]->type == LogicalOperatorType::LOGICAL_ALTER) {
 		auto &source = *old_table;
 		auto &alter = planner.CreatePlan(*children[0]);
-		return planner.Make<PhysicalSourceLifecycle>(alter, nullptr, delta, ColumnList(), source.catalog.GetName(),
-		                                             source.schema.name, source.name);
+		return planner.Make<PhysicalSourceLifecycle>(context, alter, nullptr, delta, ColumnList(),
+		                                             source.catalog.GetName(), source.schema.name, source.name);
 	}
 	auto &op = children[0]->Cast<LogicalCreateTable>();
 	auto &base = op.info->Base();
@@ -1165,7 +1170,7 @@ PhysicalOperator &LogicalSourceLifecycle::CreatePlan(ClientContext &context, Phy
 		insert.children.push_back(input);
 		create = &insert;
 	}
-	return planner.Make<PhysicalSourceLifecycle>(*create, old_table, delta, columns, catalog, schema, table);
+	return planner.Make<PhysicalSourceLifecycle>(context, *create, old_table, delta, columns, catalog, schema, table);
 }
 vector<ColumnBinding> LogicalSourceLifecycle::GetColumnBindings() {
 	return children[0]->GetColumnBindings();

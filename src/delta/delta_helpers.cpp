@@ -357,7 +357,18 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 			// Map to multiplicity column instead.
 			column_ids.push_back(ColumnIndex(mul_oid));
 		} else {
-			column_ids.push_back(id);
+			// Replacement and ALTER can change source ordinals without changing
+			// the retained delta layout. Column identity is its name, not its slot.
+			auto &column = table_entry.GetColumn(old_get->GetColumnName(id));
+			ColumnIndex mapped(column.Oid(), id.GetChildIndexes());
+			if (id.HasType()) {
+				if (id.IsPushdownExtract()) {
+					mapped.SetPushdownExtractType(id.GetType());
+				} else {
+					mapped.SetType(id.GetType());
+				}
+			}
+			column_ids.push_back(std::move(mapped));
 		}
 	}
 	column_ids.push_back(ColumnIndex(mul_oid));

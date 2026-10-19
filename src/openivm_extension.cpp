@@ -38,6 +38,7 @@
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/planner/planner_extension.hpp"
 #include "core/parser.hpp"
+#include "core/parser_plan_helpers.hpp"
 #include "core/parser_ddl.hpp"
 #include "rules/incremental_rewrite_rule.hpp"
 #include "rules/refresh_insert_rule.hpp"
@@ -416,6 +417,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	OptimizerExtension::Register(db_config, std::move(refresh_insert_rule));
 
 	loader.RegisterFunction(SourceWatermarkFunction());
+	loader.RegisterFunction(SourceColumnsFunction());
 	loader.RegisterFunction(DropEntryFunction(CatalogType::VIEW_ENTRY));
 	loader.RegisterFunction(DropEntryFunction(CatalogType::TABLE_ENTRY));
 	loader.RegisterFunction(DropEntryFunction(CatalogType::SCHEMA_ENTRY));

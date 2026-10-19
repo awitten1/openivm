@@ -18,6 +18,11 @@
 namespace duckdb {
 
 struct PlanRewriteNeeds;
+class Planner;
+
+// Compiler-only source boundary; generated columns retain their logical identity.
+void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement);
+TableFunction SourceColumnsFunction();
 
 struct DuckLakeSourceTableInfo {
 	string table_name;

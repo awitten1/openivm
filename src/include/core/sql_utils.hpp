@@ -13,8 +13,14 @@ namespace duckdb {
 // Utility functions for SQL string manipulation.
 // Originally from the compiler extension; inlined here to remove the external dependency.
 
+class BaseTableRef;
+
 class SqlUtils {
 public:
+	// Visit real relation references, excluding CTE names in their lexical scope.
+	static void VisitSourceReferences(SQLStatement &statement, const std::function<void(BaseTableRef &)> &callback);
+	static void RewriteSourceReferences(SQLStatement &statement,
+	                                    const std::function<void(unique_ptr<TableRef> &)> &callback);
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
 	static string ExtractTableName(const string &sql);
 	static string EscapeSingleQuotes(const string &input);

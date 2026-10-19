@@ -343,7 +343,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 					                      info.table);
 				}
 			}
-			if (count != info.columns.PhysicalColumnCount()) {
+			if (count != info.columns.LogicalColumnCount()) {
 				throw BinderException("OpenIVM replacement schema is incompatible with retained deltas for source "
 				                      "'%s'; drop dependent materialized views before changing its schema",
 				                      info.table);

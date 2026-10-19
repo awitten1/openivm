@@ -65,3 +65,16 @@ Self-reading replacements evaluate the original bound source. Empty replacements
 capture. Replacement column names and types must match the retained delta schema;
 incompatible schemas fail before the source is replaced. Drop dependent MVs before
 changing the source schema, then recreate them.
+
+Generated columns retain their column identity during compilation. Signed source
+deltas store their evaluated values, so a replacement can turn a generated column
+into a physical column, or change its generated expression, without reinterpreting
+pending old-row retractions. An explicit expression such as `v * 2` in the MV
+remains that expression; it does not become a reference to a generated column with
+an equivalent definition. Replacement columns may be reordered: delta scans map
+columns by name rather than assuming the source and delta have identical ordinals.
+
+MVs compiled by older versions retain their stored, expanded expressions. Recreate
+those generated-column MVs from their original definitions to adopt this boundary;
+the expanded SQL cannot distinguish a former column reference from an explicitly
+written expression.

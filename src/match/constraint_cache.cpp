@@ -19,9 +19,10 @@ static optional_ptr<TableCatalogEntry> ResolveSource(ClientContext &context, con
 	if (parts.size() > 3) {
 		throw ParserException("Invalid trusted-FK table name '%s'", name);
 	}
-	return Catalog::GetEntry<TableCatalogEntry>(context, parts.size() == 3 ? parts[0] : INVALID_CATALOG,
-	                                            parts.size() >= 2 ? parts[parts.size() - 2] : INVALID_SCHEMA,
-	                                            parts.back(), OnEntryNotFound::RETURN_NULL);
+	auto catalog = parts.size() == 3 ? parts[0] : INVALID_CATALOG;
+	auto schema = parts.size() >= 2 ? parts[parts.size() - 2] : INVALID_SCHEMA;
+	Binder::BindSchemaOrCatalog(context, catalog, schema);
+	return Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, parts.back(), OnEntryNotFound::RETURN_NULL);
 }
 
 static string Generation(ClientContext &context, TableCatalogEntry &table) {

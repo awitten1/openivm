@@ -60,6 +60,27 @@ vector<string> CompiledSQLArchiveSchemaDDL(const string &catalog, const string &
 	                               ArchiveTableName(catalog, schema, openivm::COMPILED_STATEMENTS_TABLE))};
 }
 
+// Lifecycle SQL and the parameterized writer use the same version description.
+// Only literal rendering differs; the writer keeps long program text parameterized.
+static string DescribeCompiledVersionSQL(const CompiledProgram &program, CompiledProgramOutcome outcome,
+                                         const string &programs, const string &version, const string &from,
+                                         const std::function<string(const Value &)> &render) {
+	auto view = render(Value(program.view_name));
+	auto operation = render(Value(program.operation));
+	auto compilation = render(Value(program.compilation_id));
+	return "INSERT INTO " + programs +
+	       " (view_name, view_catalog, view_schema, view_sql_name, operation, version, statement_count,"
+	       " compilation_id, compiled_at, last_compilation_id, last_outcome, last_outcome_at, committed_count) "
+	       "SELECT " +
+	       view + ", " + render(Value(program.view_catalog)) + ", " + render(Value(program.view_schema)) + ", " +
+	       render(Value(program.view_sql_name)) + ", " + operation + ", " + version + ", " +
+	       to_string(program.statements.size()) + ", " + compilation + ", " + openivm::UTC_NOW_SQL + ", " +
+	       compilation + ", " + render(Value(CompiledProgramOutcomeName(outcome))) + ", " + openivm::UTC_NOW_SQL +
+	       ", " + (outcome == CompiledProgramOutcome::COMMITTED ? "1" : "0") + from + " WHERE " + version +
+	       " IS NOT NULL AND NOT EXISTS (SELECT 1 FROM " + programs + " p WHERE p.view_name = " + view +
+	       " AND p.operation = " + operation + " AND p.version = " + version + ")";
+}
+
 vector<string> BuildCompiledSQLArchiveStatements(ClientContext &context, const CompiledProgram &program,
                                                  CompiledProgramOutcome outcome, const string &catalog,
                                                  const string &schema) {
@@ -98,18 +119,9 @@ vector<string> BuildCompiledSQLArchiveStatements(ClientContext &context, const C
 	                 " FULL OUTER JOIN openivm_old o ON n.stmt_order = o.stmt_order"
 	                 " WHERE n.stmt_order IS NULL OR o.stmt_order IS NULL OR n.sql IS DISTINCT FROM o.sql)");
 	// Describe a newly stored version.
-	result.push_back("INSERT INTO " + programs +
-	                 " (view_name, view_catalog, view_schema, view_sql_name, operation, version, statement_count,"
-	                 " compilation_id, compiled_at, last_compilation_id, last_outcome, last_outcome_at,"
-	                 " committed_count) SELECT " +
-	                 literal(program.view_name) + ", " + literal(program.view_catalog) + ", " +
-	                 literal(program.view_schema) + ", " + literal(program.view_sql_name) + ", " +
-	                 literal(program.operation) + ", latest.version, " + to_string(program.statements.size()) + ", " +
-	                 compilation_id + ", " + openivm::UTC_NOW_SQL + ", " + compilation_id + ", " + outcome_name + ", " +
-	                 openivm::UTC_NOW_SQL + ", " + committed + " FROM (SELECT " + latest_version +
-	                 " AS version) latest WHERE latest.version IS NOT NULL AND NOT EXISTS (SELECT 1 FROM " + programs +
-	                 " p WHERE p.view_name = " + literal(program.view_name) +
-	                 " AND p.operation = " + literal(program.operation) + " AND p.version = latest.version)");
+	result.push_back(DescribeCompiledVersionSQL(program, outcome, programs, "latest.version",
+	                                            " FROM (SELECT " + latest_version + " AS version) latest",
+	                                            [](const Value &value) { return value.ToSQLString(); }));
 	// An unchanged program reuses the latest version; record this operation's outcome there.
 	result.push_back("UPDATE " + programs + " SET last_compilation_id = " + compilation_id +
 	                 ", last_outcome = " + outcome_name + ", last_outcome_at = " + openivm::UTC_NOW_SQL +
@@ -183,20 +195,12 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 	Value outcome_name(CompiledProgramOutcomeName(outcome));
 	auto committed = Value::BIGINT(outcome == CompiledProgramOutcome::COMMITTED ? 1 : 0);
 	auto describe_version = [&]() {
-		// Keep an existing description, as in the SQL form. NOT EXISTS rather than INSERT OR
-		// IGNORE: remote (PostgreSQL) metadata catalogs do not support conflict clauses.
-		return execute("INSERT INTO " + programs +
-		                   " (view_name, view_catalog, view_schema, view_sql_name, operation, version, statement_count,"
-		                   " compilation_id, compiled_at, last_compilation_id, last_outcome, last_outcome_at,"
-		                   " committed_count) SELECT $1, $2, $3, $4, $5, $6, $7, $8, " +
-		                   string(openivm::UTC_NOW_SQL) + ", $8, $9, " + openivm::UTC_NOW_SQL +
-		                   ", $10 WHERE NOT EXISTS" + " (SELECT 1 FROM " + programs +
-		                   " p WHERE p.view_name = $1 AND p.operation = $5" + " AND p.version = $6)",
-		               {view_name, Value(program.view_catalog), Value(program.view_schema),
-		                Value(program.view_sql_name), operation, Value::INTEGER(version),
-		                Value::INTEGER(static_cast<int32_t>(program.statements.size())), compilation_id, outcome_name,
-		                committed},
-		               error);
+		vector<Value> parameters {Value::INTEGER(version)};
+		auto sql = DescribeCompiledVersionSQL(program, outcome, programs, "$1", "", [&](const Value &value) {
+			parameters.push_back(value);
+			return "$" + to_string(parameters.size());
+		});
+		return execute(sql, std::move(parameters), error);
 	};
 	if (changed) {
 		vector<Value> sql_values;

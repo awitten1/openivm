@@ -2051,3 +2051,184 @@ query I
 SELECT bool_and(i=rn-1) FROM (SELECT i,row_number() OVER() rn FROM ordered_untracked_ctas);
 ----
 true
+
+# Generated source values must be evaluated for old-row retractions, including
+# replacement with physical columns and replacement of the generated expression.
+foreach metadata main Generated_Control
+
+statement ok
+SET openivm_metadata_schema='${metadata}';
+CREATE TABLE generated_replace_src(k INTEGER,v INTEGER,g INTEGER GENERATED ALWAYS AS(v*2));
+INSERT INTO generated_replace_src(k,v) VALUES(1,2),(1,2),(2,3),(NULL,NULL);
+CREATE MATERIALIZED VIEW generated_replace_mv AS SELECT k,SUM(g) s,COUNT(*) c FROM generated_replace_src GROUP BY k;
+
+statement ok
+BEGIN;
+CREATE OR REPLACE TABLE generated_replace_src AS SELECT k,v,g FROM generated_replace_src;
+INSERT INTO generated_replace_src VALUES(1,4,8);
+ROLLBACK;
+
+statement ok
+PRAGMA refresh('generated_replace_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_replace_mv EXCEPT ALL SELECT k,SUM(g),COUNT(*) FROM generated_replace_src GROUP BY k)
+UNION ALL (SELECT k,SUM(g),COUNT(*) FROM generated_replace_src GROUP BY k EXCEPT ALL SELECT * FROM generated_replace_mv));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE generated_replace_src AS SELECT k,v,g+1 AS g FROM generated_replace_src;
+INSERT INTO generated_replace_src VALUES(1,4,8),(3,5,10);
+UPDATE generated_replace_src SET g=g+3 WHERE k=1;
+DELETE FROM generated_replace_src WHERE k=3;
+
+statement ok
+PRAGMA refresh('generated_replace_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_replace_mv EXCEPT ALL SELECT k,SUM(g),COUNT(*) FROM generated_replace_src GROUP BY k)
+UNION ALL (SELECT k,SUM(g),COUNT(*) FROM generated_replace_src GROUP BY k EXCEPT ALL SELECT * FROM generated_replace_mv));
+----
+0
+
+statement ok
+CREATE OR REPLACE TABLE generated_replace_src(k INTEGER,v INTEGER,g INTEGER GENERATED ALWAYS AS(v*3));
+INSERT INTO generated_replace_src(k,v) VALUES(1,4),(1,4),(2,5),(NULL,NULL);
+UPDATE generated_replace_src SET v=v+1 WHERE k=1;
+DELETE FROM generated_replace_src WHERE k=2;
+
+statement ok
+PRAGMA refresh('generated_replace_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_replace_mv EXCEPT ALL SELECT k,SUM(g),COUNT(*) FROM generated_replace_src GROUP BY k)
+UNION ALL (SELECT k,SUM(g),COUNT(*) FROM generated_replace_src GROUP BY k EXCEPT ALL SELECT * FROM generated_replace_mv));
+----
+0
+
+statement ok
+BEGIN;
+CREATE OR REPLACE TABLE generated_replace_src(k INTEGER,v INTEGER,g INTEGER GENERATED ALWAYS AS(v*4));
+INSERT INTO generated_replace_src(k,v) VALUES(9,9);
+ROLLBACK;
+BEGIN;
+CREATE OR REPLACE TABLE generated_replace_src(k INTEGER,v INTEGER,g INTEGER GENERATED ALWAYS AS(v*5));
+INSERT INTO generated_replace_src(k,v) VALUES(1,6),(1,6),(2,7);
+COMMIT;
+
+statement ok
+PRAGMA refresh('generated_replace_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_replace_mv EXCEPT ALL SELECT k,SUM(g),COUNT(*) FROM generated_replace_src GROUP BY k)
+UNION ALL (SELECT k,SUM(g),COUNT(*) FROM generated_replace_src GROUP BY k EXCEPT ALL SELECT * FROM generated_replace_mv));
+----
+0
+
+statement ok
+DROP VIEW generated_replace_mv;
+DROP TABLE generated_replace_src;
+
+endloop
+
+# Source-column identity survives CTE expansion, qualified references, self joins
+# and reordered physical replacements. An explicitly written v*2 remains v*2.
+statement ok
+SET openivm_metadata_schema='Generated_Control';
+SET openivm_archive_compiled_sql=true;
+CREATE SCHEMA "Generated.Schema";
+CREATE TABLE "Generated.Schema"."Values"(k INTEGER,g INTEGER GENERATED ALWAYS AS(v*2),v INTEGER);
+INSERT INTO "Generated.Schema"."Values"(k,v) VALUES(1,2),(1,2),(2,3),(NULL,NULL);
+
+statement ok
+CREATE MATERIALIZED VIEW generated_projection AS SELECT "Generated.Schema"."Values".k,"Generated.Schema"."Values".g FROM "Generated.Schema"."Values";
+
+statement ok
+CREATE MATERIALIZED VIEW generated_join AS SELECT a.k,a.g,b.g AS bg FROM "Generated.Schema"."Values" a JOIN "Generated.Schema"."Values" b ON a.k=b.k AND a.g=b.g;
+
+statement ok
+CREATE MATERIALIZED VIEW generated_expression AS SELECT k,v*2 AS manual FROM "Generated.Schema"."Values";
+
+statement ok
+CREATE MATERIALIZED VIEW generated_cte AS WITH "Values" AS (SELECT * FROM "Generated.Schema"."Values") SELECT k,g FROM "Values";
+
+statement ok
+CREATE OR REPLACE TABLE "Generated.Schema"."Values" AS SELECT v,g+1 AS g,k FROM "Generated.Schema"."Values";
+INSERT INTO "Generated.Schema"."Values" VALUES(5,11,3),(6,13,4);
+UPDATE "Generated.Schema"."Values" SET g=g+2 WHERE k=1;
+DELETE FROM "Generated.Schema"."Values" WHERE k=4;
+
+statement ok
+PRAGMA refresh_pipeline('generated_projection','generated_join','generated_expression','generated_cte');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_projection EXCEPT ALL SELECT "Generated.Schema"."Values".k,"Generated.Schema"."Values".g FROM "Generated.Schema"."Values")
+UNION ALL (SELECT "Generated.Schema"."Values".k,"Generated.Schema"."Values".g FROM "Generated.Schema"."Values" EXCEPT ALL SELECT * FROM generated_projection));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_join EXCEPT ALL SELECT a.k,a.g,b.g AS bg FROM "Generated.Schema"."Values" a JOIN "Generated.Schema"."Values" b ON a.k=b.k AND a.g=b.g)
+UNION ALL (SELECT a.k,a.g,b.g AS bg FROM "Generated.Schema"."Values" a JOIN "Generated.Schema"."Values" b ON a.k=b.k AND a.g=b.g EXCEPT ALL SELECT * FROM generated_join));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_expression EXCEPT ALL SELECT k,v*2 AS manual FROM "Generated.Schema"."Values")
+UNION ALL (SELECT k,v*2 AS manual FROM "Generated.Schema"."Values" EXCEPT ALL SELECT * FROM generated_expression));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_cte EXCEPT ALL SELECT * FROM (WITH "Values" AS (SELECT * FROM "Generated.Schema"."Values") SELECT k,g FROM "Values") expected)
+UNION ALL (SELECT * FROM (WITH "Values" AS (SELECT * FROM "Generated.Schema"."Values") SELECT k,g FROM "Values") expected EXCEPT ALL SELECT * FROM generated_cte));
+----
+0
+
+query I
+SELECT count(*) FROM Generated_Control.openivm_views WHERE view_sql_name LIKE 'generated_%' AND type=3;
+----
+0
+
+query I
+SELECT count(*) FROM Generated_Control.openivm_compiled_statements WHERE sql LIKE '%openivm_source_columns%';
+----
+0
+
+# Several definitions may contribute retractions and insertions before one run.
+statement ok
+CREATE OR REPLACE TABLE "Generated.Schema"."Values"(k INTEGER,g INTEGER GENERATED ALWAYS AS(v*7),v INTEGER);
+INSERT INTO "Generated.Schema"."Values"(k,v) VALUES(1,3),(1,3),(2,4);
+CREATE OR REPLACE TABLE "Generated.Schema"."Values" AS SELECT k,g+3 AS g,v FROM "Generated.Schema"."Values";
+CREATE OR REPLACE TABLE "Generated.Schema"."Values"(k INTEGER,g INTEGER GENERATED ALWAYS AS(v*9),v INTEGER);
+INSERT INTO "Generated.Schema"."Values"(k,v) VALUES(1,5),(1,5),(2,6),(3,7);
+UPDATE "Generated.Schema"."Values" SET v=v+1 WHERE k=1;
+DELETE FROM "Generated.Schema"."Values" WHERE k=3;
+
+statement ok
+PRAGMA refresh_pipeline('generated_projection','generated_join','generated_expression','generated_cte');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_projection EXCEPT ALL SELECT k,g FROM "Generated.Schema"."Values")
+UNION ALL (SELECT k,g FROM "Generated.Schema"."Values" EXCEPT ALL SELECT * FROM generated_projection));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_join EXCEPT ALL SELECT a.k,a.g,b.g AS bg FROM "Generated.Schema"."Values" a JOIN "Generated.Schema"."Values" b ON a.k=b.k AND a.g=b.g)
+UNION ALL (SELECT a.k,a.g,b.g AS bg FROM "Generated.Schema"."Values" a JOIN "Generated.Schema"."Values" b ON a.k=b.k AND a.g=b.g EXCEPT ALL SELECT * FROM generated_join));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_expression EXCEPT ALL SELECT k,v*2 AS manual FROM "Generated.Schema"."Values")
+UNION ALL (SELECT k,v*2 AS manual FROM "Generated.Schema"."Values" EXCEPT ALL SELECT * FROM generated_expression));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_cte EXCEPT ALL SELECT k,g FROM "Generated.Schema"."Values")
+UNION ALL (SELECT k,g FROM "Generated.Schema"."Values" EXCEPT ALL SELECT * FROM generated_cte));
+----
+0

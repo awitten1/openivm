@@ -378,3 +378,44 @@ SELECT count(*) FROM ((SELECT * FROM renamed_fk_mv EXCEPT ALL SELECT c.k FROM re
 UNION ALL (SELECT c.k FROM rename_child c JOIN alter_parent p ON c.k=p.k EXCEPT ALL SELECT * FROM renamed_fk_mv));
 ----
 0
+
+# Match native SQL's two-part catalog.table resolution, including quoted aliases
+# and ambiguity with an equally named schema in the current database.
+statement ok
+ATTACH ':memory:' AS "FK.Data";
+CREATE TABLE "FK.Data".child(k INTEGER);
+CREATE TABLE "FK.Data".parent(k INTEGER);
+INSERT INTO "FK.Data".parent VALUES(1);
+INSERT INTO "FK.Data".child VALUES(1),(1);
+
+statement ok
+PRAGMA openivm_declare_rely_fk('"FK.Data".child','k','"FK.Data".parent','k');
+
+statement ok
+CREATE MATERIALIZED VIEW qualified_catalog_fk_mv AS SELECT c.k FROM "FK.Data".child c JOIN "FK.Data".parent p ON c.k=p.k;
+INSERT INTO "FK.Data".parent VALUES(2),(3);
+INSERT INTO "FK.Data".child VALUES(2),(3),(3);
+UPDATE "FK.Data".child SET k=2 WHERE k=3;
+DELETE FROM "FK.Data".child WHERE k=1;
+
+statement ok
+PRAGMA refresh('qualified_catalog_fk_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM qualified_catalog_fk_mv EXCEPT ALL SELECT c.k FROM "FK.Data".child c JOIN "FK.Data".parent p ON c.k=p.k)
+UNION ALL (SELECT c.k FROM "FK.Data".child c JOIN "FK.Data".parent p ON c.k=p.k EXCEPT ALL SELECT * FROM qualified_catalog_fk_mv));
+----
+0
+
+statement ok
+CREATE SCHEMA "FK.Data";
+
+statement error
+PRAGMA openivm_declare_rely_fk('"FK.Data".child','k','"FK.Data".parent','k');
+----
+Ambiguous reference to catalog or schema
+
+statement ok
+PRAGMA openivm_declare_rely_fk('"FK.Data".main.child','k','"FK.Data".main.parent','k');
+DROP SCHEMA "FK.Data";
+DROP VIEW qualified_catalog_fk_mv;

@@ -2,6 +2,21 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/cte_node.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/pivotref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
 
 #include <cctype>
@@ -11,6 +26,190 @@
 #include <sstream>
 
 namespace duckdb {
+
+// A `BaseTableRef` whose unqualified name matches a CTE visible at that point is a reference to
+// the CTE, not a scan of a same-named relation, so it must never be treated as an unpinned scan.
+struct SourceRefVisitor {
+	const std::function<void(unique_ptr<TableRef> &)> &callback;
+	case_insensitive_set_t cte_names;
+};
+
+static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visitor);
+
+static void SourceVisitExpression(ParsedExpression &expression, const SourceRefVisitor &visitor) {
+	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		auto &subquery = expression.Cast<SubqueryExpression>();
+		if (subquery.subquery && subquery.subquery->node) {
+			SourceVisitQueryNode(*subquery.subquery->node, visitor);
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](ParsedExpression &child) { SourceVisitExpression(child, visitor); });
+}
+
+static void SourceVisitTableRef(unique_ptr<TableRef> &ref, const SourceRefVisitor &visitor) {
+	switch (ref->type) {
+	case TableReferenceType::BASE_TABLE: {
+		auto &base_table = ref->Cast<BaseTableRef>();
+		bool unqualified = base_table.catalog_name.empty() && base_table.schema_name.empty();
+		if (unqualified && visitor.cte_names.find(base_table.table_name) != visitor.cte_names.end()) {
+			break;
+		}
+		visitor.callback(ref);
+		break;
+	}
+	case TableReferenceType::JOIN: {
+		auto &join = ref->Cast<JoinRef>();
+		if (join.left) {
+			SourceVisitTableRef(join.left, visitor);
+		}
+		if (join.right) {
+			SourceVisitTableRef(join.right, visitor);
+		}
+		if (join.condition) {
+			SourceVisitExpression(*join.condition, visitor);
+		}
+		break;
+	}
+	case TableReferenceType::SUBQUERY: {
+		auto &subquery = ref->Cast<SubqueryRef>();
+		if (subquery.subquery && subquery.subquery->node) {
+			SourceVisitQueryNode(*subquery.subquery->node, visitor);
+		}
+		break;
+	}
+	case TableReferenceType::PIVOT: {
+		auto &pivot = ref->Cast<PivotRef>();
+		if (pivot.source) {
+			SourceVisitTableRef(pivot.source, visitor);
+		}
+		break;
+	}
+	case TableReferenceType::TABLE_FUNCTION: {
+		auto &table_function = ref->Cast<TableFunctionRef>();
+		if (table_function.function) {
+			SourceVisitExpression(*table_function.function, visitor);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visitor) {
+	// Each CTE body sees preceding siblings, but not its own name.
+	SourceRefVisitor scoped {visitor.callback, visitor.cte_names};
+	for (auto &cte : node.cte_map.map) {
+		if (cte.second->query && cte.second->query->node) {
+			SourceVisitQueryNode(*cte.second->query->node, scoped);
+		}
+		scoped.cte_names.insert(cte.first);
+	}
+	switch (node.type) {
+	case QueryNodeType::SELECT_NODE: {
+		auto &select = node.Cast<SelectNode>();
+		if (select.from_table) {
+			SourceVisitTableRef(select.from_table, scoped);
+		}
+		auto visit = [&](unique_ptr<ParsedExpression> &expression) {
+			if (expression) {
+				SourceVisitExpression(*expression, scoped);
+			}
+		};
+		for (auto &expression : select.select_list) {
+			visit(expression);
+		}
+		for (auto &expression : select.groups.group_expressions) {
+			visit(expression);
+		}
+		visit(select.where_clause);
+		visit(select.having);
+		visit(select.qualify);
+		break;
+	}
+	case QueryNodeType::SET_OPERATION_NODE: {
+		auto &set_operation = node.Cast<SetOperationNode>();
+		for (auto &child : set_operation.children) {
+			if (child) {
+				SourceVisitQueryNode(*child, scoped);
+			}
+		}
+		break;
+	}
+	case QueryNodeType::RECURSIVE_CTE_NODE: {
+		auto &recursive_cte = node.Cast<RecursiveCTENode>();
+		SourceRefVisitor recursive_scope {visitor.callback, scoped.cte_names};
+		recursive_scope.cte_names.insert(recursive_cte.ctename);
+		if (recursive_cte.left) {
+			SourceVisitQueryNode(*recursive_cte.left, recursive_scope);
+		}
+		if (recursive_cte.right) {
+			SourceVisitQueryNode(*recursive_cte.right, recursive_scope);
+		}
+		break;
+	}
+	case QueryNodeType::CTE_NODE: {
+		auto &cte = node.Cast<CTENode>();
+		if (cte.query) {
+			SourceVisitQueryNode(*cte.query, scoped);
+		}
+		if (cte.child) {
+			SourceRefVisitor child_scope {visitor.callback, scoped.cte_names};
+			child_scope.cte_names.insert(cte.ctename);
+			SourceVisitQueryNode(*cte.child, child_scope);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &expression) {
+		if (expression) {
+			SourceVisitExpression(*expression, scoped);
+		}
+	});
+}
+
+static void SourceVisitStatement(SQLStatement &statement, const SourceRefVisitor &visitor) {
+	switch (statement.type) {
+	case StatementType::SELECT_STATEMENT: {
+		auto &select = statement.Cast<SelectStatement>();
+		if (select.node) {
+			SourceVisitQueryNode(*select.node, visitor);
+		}
+		break;
+	}
+	case StatementType::CREATE_STATEMENT: {
+		auto &create = statement.Cast<CreateStatement>();
+		if (create.info && create.info->type == CatalogType::TABLE_ENTRY) {
+			auto &table_info = create.info->Cast<CreateTableInfo>();
+			if (table_info.query && table_info.query->node) {
+				SourceVisitQueryNode(*table_info.query->node, visitor);
+			}
+		}
+		break;
+	}
+	case StatementType::INSERT_STATEMENT: {
+		auto &insert = statement.Cast<InsertStatement>();
+		if (insert.select_statement && insert.select_statement->node) {
+			SourceVisitQueryNode(*insert.select_statement->node, visitor);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+void SqlUtils::RewriteSourceReferences(SQLStatement &statement,
+                                       const std::function<void(unique_ptr<TableRef> &)> &callback) {
+	SourceVisitStatement(statement, SourceRefVisitor {callback, {}});
+}
+
+void SqlUtils::VisitSourceReferences(SQLStatement &statement, const std::function<void(BaseTableRef &)> &callback) {
+	RewriteSourceReferences(statement, [&](unique_ptr<TableRef> &ref) { callback(ref->Cast<BaseTableRef>()); });
+}
 
 static constexpr const char *CAST_EXPRESSION_PREFIX = "openivm_expr:";
 static constexpr const char *CAST_COLUMN_PLACEHOLDER = "{openivm_column}";

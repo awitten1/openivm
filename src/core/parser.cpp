@@ -503,7 +503,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// Plan the full CREATE TABLE AS SELECT statement (for plan walking)
 	auto full_plan_start = create_profile_now();
 	Planner planner(context);
-	planner.CreatePlan(statement->Copy());
+	PlanWithSourceColumns(planner, statement->Copy());
 	auto plan = std::move(planner.plan);
 	add_create_profile_step("create_compile_full_plan", full_plan_start);
 
@@ -524,7 +524,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	{
 		auto select_parse_plan_start = create_profile_now();
 		Planner select_planner(context);
-		select_planner.CreatePlan(select_statement.Copy());
+		PlanWithSourceColumns(select_planner, select_statement.Copy());
 		auto select_plan = std::move(select_planner.plan);
 		visible_output_count = select_planner.names.size();
 		for (auto &name : select_planner.names) {

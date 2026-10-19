@@ -133,7 +133,11 @@ terms. If so, it keeps the smaller FK-pruned inclusion-exclusion plan. Otherwise
 uses the N-term plan.
 
 Trusted FK declarations resolve table names against the caller's catalog and schema
-search path and store fully qualified identities. A declaration for `a.fact` cannot
+search path and store fully qualified identities. Two-part names follow DuckDB's
+schema-or-catalog resolution: `data.fact` can refer to an attached database's default
+schema. If a schema and an attached database share that name, use the full
+`catalog.schema.table` name to resolve the ambiguity. Quoted names follow the same rules.
+A declaration for `a.fact` cannot
 authorize pruning for `b.fact`, even if their columns have identical names. Existing
 declarations stored with unqualified names are not used for pruning; redeclare them
 with the pragma to bind their identities.
