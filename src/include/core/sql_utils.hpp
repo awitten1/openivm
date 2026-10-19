@@ -37,6 +37,11 @@ public:
 	static string DeltaName(const string &name);
 	static string LastIdentifierPart(string name);
 	static vector<string> ParseQualifiedIdentifier(const string &name);
+	// Read one identifier at start without scanning the statement body.
+	static vector<string> ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end);
+	// Empty replacement keeps a reference unchanged; visit all references in one scan.
+	static string RewriteTableReferences(const string &sql,
+	                                     const std::function<string(const vector<string> &)> &rewrite);
 	static string FullName(const string &catalog, const string &schema, const string &table);
 	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
 	/// Compare SQL expressions holding catalog identifiers using DuckDB's ASCII-only case folding.

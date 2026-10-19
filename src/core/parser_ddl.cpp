@@ -70,48 +70,39 @@ static const vector<string> &MetadataStatementPrefixes() {
 	return prefixes;
 }
 
-// Read only the mutation target, never a metadata name in a query or literal.
-static string MetadataTargetReference(const string &statement, const string &prefix, const string &table) {
-	if (!StringUtil::CIStartsWith(statement, prefix)) {
-		return "";
-	}
-	auto target = statement.substr(prefix.size());
-	auto reference = SqlUtils::FindTableReference("FROM " + target, table);
-	if (reference.empty() || !StringUtil::StartsWith(target, reference) ||
-	    !StringUtil::CIEquals(SqlUtils::ParseQualifiedIdentifier(reference).back(), table)) {
-		return "";
-	}
-	return reference;
-}
+// Inspect only the generated mutation's target, never names in its query or literals.
+struct MetadataMutationTarget {
+	idx_t start = 0;
+	idx_t end = 0;
+	vector<string> parts;
 
-static bool HasMetadataTarget(const string &statement, const string &prefix, const string &table) {
-	return !MetadataTargetReference(statement, prefix, table).empty();
-}
+	bool Matches(const string &table) const {
+		return !parts.empty() && StringUtil::CIEquals(parts.back(), table);
+	}
+	bool Matches(const vector<string> &tables) const {
+		return std::any_of(tables.begin(), tables.end(), [&](const string &table) { return Matches(table); });
+	}
+};
 
-static bool TargetsMetadataTable(const string &statement, const string &table) {
-	auto trimmed = statement;
-	StringUtil::Trim(trimmed);
-	auto lower = StringUtil::Lower(trimmed);
+static MetadataMutationTarget ReadMetadataMutationTarget(const string &statement) {
+	MetadataMutationTarget target;
+	idx_t offset = 0;
+	while (offset < statement.size() && std::isspace(static_cast<unsigned char>(statement[offset]))) {
+		offset++;
+	}
 	for (auto &prefix : MetadataStatementPrefixes()) {
-		if (HasMetadataTarget(lower, prefix, table)) {
-			return true;
+		if (offset + prefix.size() <= statement.size() &&
+		    StringUtil::CIEquals(statement.data() + offset, prefix.size(), prefix.data(), prefix.size())) {
+			target.start = offset + prefix.size();
+			target.parts = SqlUtils::ReadQualifiedIdentifier(statement, target.start, target.end);
+			break;
 		}
 	}
-	return false;
+	return target;
 }
 
 static bool IsReplayableMetadataStatement(const string &statement) {
-	auto trimmed = statement;
-	StringUtil::Trim(trimmed);
-	auto lower = StringUtil::Lower(trimmed);
-	for (auto &prefix : MetadataStatementPrefixes()) {
-		for (auto &table : TransactionalMetadataTables()) {
-			if (HasMetadataTarget(lower, prefix, table)) {
-				return true;
-			}
-		}
-	}
-	return false;
+	return ReadMetadataMutationTarget(statement).Matches(TransactionalMetadataTables());
 }
 
 static string MakeTemporaryMetadataDDL(const string &statement) {
@@ -137,77 +128,49 @@ static bool IsSearchPathStatement(const string &statement) {
 // never be interpreted as references to our control tables. Generated metadata
 // reads (the duplicate-name guards) are qualified at construction instead.
 static string QualifyMetadataMutation(const string &statement, const string &catalog, const string &schema) {
-	bool metadata_target = false;
-	for (auto &table : MetadataTableNames()) {
-		if (TargetsMetadataTable(statement, table)) {
-			metadata_target = true;
-			break;
-		}
-	}
-	if (!metadata_target) {
+	auto target = ReadMetadataMutationTarget(statement);
+	if (!target.Matches(MetadataTableNames())) {
 		return statement;
 	}
 	auto qualified = statement;
-	for (auto &table : MetadataTableNames()) {
-		auto target = SqlUtils::FullName(catalog, schema, table);
-		auto trimmed = qualified;
-		StringUtil::Trim(trimmed);
-		for (const string prefix : {"create table if not exists ", "alter table "}) {
-			auto reference = MetadataTargetReference(trimmed, prefix, table);
-			if (!reference.empty() && SqlUtils::ParseQualifiedIdentifier(reference).size() == 1) {
-				trimmed = trimmed.substr(0, prefix.size()) + target + trimmed.substr(prefix.size() + reference.size());
-				qualified = trimmed;
-				break;
-			}
-		}
-		// Only unqualified references mean "this metadata location". Qualified ones, such as
-		// consumer checks against other catalogs' openivm_delta_tables, keep their identity.
-		for (idx_t occurrence = 0;; occurrence++) {
-			auto reference = SqlUtils::FindTableReferenceOccurrence(qualified, table, occurrence);
-			if (reference.empty()) {
-				break;
-			}
-			if (reference.find('.') != string::npos) {
-				continue;
-			}
-			bool replaced = false;
-			qualified = SqlUtils::ReplaceTableReferenceOccurrence(qualified, table, occurrence, target, replaced);
-		}
+	if (target.parts.size() == 1) {
+		qualified.replace(target.start, target.end - target.start,
+		                  SqlUtils::FullName(catalog, schema, target.parts[0]));
 	}
-	return qualified;
+	// Only unqualified reads belong to this location; other registries retain their identity.
+	return SqlUtils::RewriteTableReferences(qualified, [&](const vector<string> &parts) {
+		if (parts.size() == 1) {
+			for (auto &table : MetadataTableNames()) {
+				if (StringUtil::CIEquals(parts[0], table)) {
+					return SqlUtils::FullName(catalog, schema, table);
+				}
+			}
+		}
+		return string();
+	});
 }
 
-// Retained SQL keeps its physical metadata identity. Only the selected location
-// may be redirected to helper-local shadows; other catalogs remain qualified.
+// Only this location's metadata may be redirected to helper-local shadows.
 static string LocalizeMetadataStatement(const string &statement, const string &catalog, const string &schema) {
+	auto target = ReadMetadataMutationTarget(statement);
 	auto local = statement;
-	for (auto &table : TransactionalMetadataTables()) {
-		for (auto &prefix : MetadataStatementPrefixes()) {
-			auto reference = MetadataTargetReference(statement, prefix, table);
-			if (reference.empty()) {
-				continue;
-			}
-			auto parts = SqlUtils::ParseQualifiedIdentifier(reference);
-			if (parts.size() != 3 || !StringUtil::CIEquals(parts[0], catalog) ||
-			    !StringUtil::CIEquals(parts[1], schema)) {
-				return "";
-			}
-			local.replace(prefix.size(), reference.size(), table);
+	if (target.Matches(TransactionalMetadataTables())) {
+		if (target.parts.size() != 3 || !StringUtil::CIEquals(target.parts[0], catalog) ||
+		    !StringUtil::CIEquals(target.parts[1], schema)) {
+			return "";
 		}
-		for (idx_t occurrence = 0;; occurrence++) {
-			auto reference = SqlUtils::FindTableReferenceOccurrence(local, table, occurrence);
-			if (reference.empty()) {
-				break;
-			}
-			auto parts = SqlUtils::ParseQualifiedIdentifier(reference);
-			if (parts.size() == 3 && StringUtil::CIEquals(parts[0], catalog) &&
-			    StringUtil::CIEquals(parts[1], schema)) {
-				bool replaced = false;
-				local = SqlUtils::ReplaceTableReferenceOccurrence(local, table, occurrence, table, replaced);
-			}
-		}
+		local.replace(target.start, target.end - target.start, SqlUtils::QuoteIdentifier(target.parts.back()));
 	}
-	return local;
+	return SqlUtils::RewriteTableReferences(local, [&](const vector<string> &parts) {
+		if (parts.size() == 3 && StringUtil::CIEquals(parts[0], catalog) && StringUtil::CIEquals(parts[1], schema)) {
+			for (auto &table : TransactionalMetadataTables()) {
+				if (StringUtil::CIEquals(parts[2], table)) {
+					return SqlUtils::QuoteIdentifier(table);
+				}
+			}
+		}
+		return string();
+	});
 }
 
 static bool IsMetadataSchemaStatement(const string &statement) {
@@ -924,10 +887,11 @@ void TransactionalMVMetadataState::Register(ClientContext &context, const vector
 		if (IsReplayableMetadataStatement(statement)) {
 			// The caller records the evaluated watermark at execution time. A
 			// helper cannot read source deltas created in the caller transaction.
-			auto target = MetadataTargetReference(statement, "update ", openivm::DELTA_TABLES_TABLE);
-			if (!target.empty() && StringUtil::StartsWith(statement.substr(strlen("update ") + target.size()),
-			                                              " SET last_update = " +
-			                                                  string(OPENIVM_RECORD_SOURCE_WATERMARK_FUNCTION) + "(")) {
+			auto target = ReadMetadataMutationTarget(statement);
+			if (StringUtil::CIStartsWith(statement, "update ") && target.Matches(openivm::DELTA_TABLES_TABLE) &&
+			    StringUtil::StartsWith(statement.substr(target.end),
+			                           " SET last_update = " + string(OPENIVM_RECORD_SOURCE_WATERMARK_FUNCTION) +
+			                               "(")) {
 				continue;
 			}
 			statements.push_back(QualifyMetadataMutation(StabilizeTransactionalMetadata(statement, timestamp_sql),
@@ -962,21 +926,16 @@ bool TransactionalMVMetadataState::HasPendingViewDrop(const string &view_name) c
 vector<pair<string, string>> TransactionalMVMetadataState::MetadataLocations() const {
 	vector<pair<string, string>> locations;
 	for (auto &statement : statements) {
-		for (auto &table : TransactionalMetadataTables()) {
-			for (auto &prefix : MetadataStatementPrefixes()) {
-				auto reference = MetadataTargetReference(statement, prefix, table);
-				if (reference.empty()) {
-					continue;
-				}
-				auto parts = SqlUtils::ParseQualifiedIdentifier(reference);
-				if (parts.size() != 3) {
-					throw InternalException("Transaction-local OpenIVM metadata target must be qualified");
-				}
-				pair<string, string> location {parts[0], parts[1]};
-				if (std::find(locations.begin(), locations.end(), location) == locations.end()) {
-					locations.push_back(std::move(location));
-				}
-			}
+		auto target = ReadMetadataMutationTarget(statement);
+		if (!target.Matches(TransactionalMetadataTables())) {
+			continue;
+		}
+		if (target.parts.size() != 3) {
+			throw InternalException("Transaction-local OpenIVM metadata target must be qualified");
+		}
+		pair<string, string> location {target.parts[0], target.parts[1]};
+		if (std::find(locations.begin(), locations.end(), location) == locations.end()) {
+			locations.push_back(std::move(location));
 		}
 	}
 	return locations;
@@ -1075,11 +1034,8 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		if (IsMetadataSchemaStatement(statement)) {
 			continue;
 		}
-		for (auto &table : dependency_tables) {
-			if (TargetsMetadataTable(statement, table)) {
-				replay_statement(statement);
-				break;
-			}
+		if (ReadMetadataMutationTarget(statement).Matches(dependency_tables)) {
+			replay_statement(statement);
 		}
 	}
 	unordered_set<string> included_views = view_names;
@@ -1161,14 +1117,7 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 		if (IsMetadataSchemaStatement(statement)) {
 			continue;
 		}
-		bool already_replayed = false;
-		for (auto &table : dependency_tables) {
-			if (TargetsMetadataTable(statement, table)) {
-				already_replayed = true;
-				break;
-			}
-		}
-		if (already_replayed) {
+		if (ReadMetadataMutationTarget(statement).Matches(dependency_tables)) {
 			continue;
 		}
 		replay_statement(statement);

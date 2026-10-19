@@ -462,7 +462,7 @@ void TransactionalMVLockState::TransactionRollback(MetaTransaction &transaction,
 RebindQueryInfo TransactionalMVLockState::OnExecutePrepared(ClientContext &context, PreparedStatementCallbackInfo &info,
                                                             RebindQueryInfo current_rebind) {
 	auto &plan = info.prepared_statement.physical_plan;
-	if (plan) {
+	if (plan && !info.prepared_statement.properties.IsReadOnly()) {
 		AdmitPlanMutations(context, plan->Root());
 	}
 	return RebindQueryInfo::DO_NOT_REBIND;

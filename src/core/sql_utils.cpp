@@ -486,6 +486,17 @@ static bool ReadQualifiedIdentifierSpans(const string &sql, idx_t start, idx_t &
 	return true;
 }
 
+vector<string> SqlUtils::ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end) {
+	vector<IdentifierSegmentSpan> spans;
+	vector<string> parts;
+	if (ReadQualifiedIdentifierSpans(sql, start, end, spans)) {
+		for (auto &span : spans) {
+			parts.push_back(std::move(span.value));
+		}
+	}
+	return parts;
+}
+
 static bool QualifierMatches(const vector<IdentifierSegmentSpan> &segments, const unordered_set<string> &qualifiers) {
 	if (segments.size() <= 1) {
 		return false;
@@ -1157,13 +1168,14 @@ static idx_t ExtendPastTimeTravelClause(const string &sql, idx_t end) {
 }
 
 static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sql, const string &table_name,
-                                                                bool include_time_travel_clause) {
+                                                                bool include_time_travel_clause,
+                                                                bool match_all = false) {
 	vector<TableReferenceMatch> matches;
-	if (table_name.empty()) {
+	if (table_name.empty() && !match_all) {
 		return matches;
 	}
 	// Keep component boundaries: a quoted dot is part of a name, not qualification.
-	auto target_parts = SqlUtils::ParseQualifiedIdentifier(table_name);
+	auto target_parts = match_all ? vector<string>() : SqlUtils::ParseQualifiedIdentifier(table_name);
 	auto matches_table = [&](const vector<IdentifierSegmentSpan> &parts) {
 		if (parts.size() < target_parts.size()) {
 			return false;
@@ -1210,6 +1222,25 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 		i++;
 	}
 	return matches;
+}
+
+string SqlUtils::RewriteTableReferences(const string &sql,
+                                        const std::function<string(const vector<string> &)> &rewrite) {
+	string result;
+	idx_t previous = 0;
+	for (auto &match : CollectTableReferenceMatches(sql, "", false, true)) {
+		auto replacement = rewrite(ParseQualifiedIdentifier(sql.substr(match.start, match.end - match.start)));
+		if (!replacement.empty()) {
+			result.append(sql, previous, match.start - previous);
+			result += replacement;
+			previous = match.end;
+		}
+	}
+	if (previous == 0) {
+		return sql;
+	}
+	result.append(sql, previous, sql.size() - previous);
+	return result;
 }
 
 string SqlUtils::FindTableReference(const string &sql, const string &table_name) {

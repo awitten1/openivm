@@ -136,6 +136,55 @@ static void TestQualifiedTableReferences() {
 	    !SqlUtils::FindTableReference(dotted_query, "Table.Name").empty()) {
 		throw InvalidInputException("Table-reference matching confused a quoted table name with qualification");
 	}
+	const string repeated = query + " JOIN " + reference + " again USING(i) WHERE note='FROM " + reference + "'";
+	const string rewritten = SqlUtils::RewriteTableReferences(repeated, [&](const vector<string> &parts) {
+		return parts.size() == 3 && StringUtil::CIEquals(parts[0], "lake") && parts[1] == "Internal.Space" &&
+		               parts[2] == "maintenance"
+		           ? data_table
+		           : string();
+	});
+	if (rewritten != "SELECT * FROM " + data_table + " JOIN " + other_table + " USING(i) JOIN " + data_table +
+	                     " again USING(i) WHERE note='FROM " + reference + "'") {
+		throw InvalidInputException("Single-pass reference rewriting changed another location or a SQL literal");
+	}
+	idx_t end = 0;
+	auto parts = SqlUtils::ReadQualifiedIdentifier("UPDATE " + escaped_table + " SET i=1", 7, end);
+	if (parts != vector<string> {"Lake\"Catalog", "Internal Space", "maintenance"} || end != 7 + escaped_table.size()) {
+		throw InvalidInputException("Mutation-target parsing did not stop after the qualified identifier");
+	}
+}
+
+static void TestMetadataSchemaInventory() {
+	std::cerr << "CASE metadata inventory catalog versions" << std::endl;
+	DuckDB db(nullptr);
+	Connection owner(db), observer(db);
+	Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; CREATE SCHEMA \"Cache.Space\";");
+	auto check = [&](Connection &con, const vector<string> &expected, const string &catalog = "memory") {
+		auto actual = RefreshMetadata::FindMetadataSchemas(con, catalog, "inventory_probe");
+		if (actual != expected) {
+			throw InvalidInputException("Schema inventory did not preserve catalog/snapshot visibility");
+		}
+	};
+	check(owner, {});
+	check(observer, {});
+	Execute(owner, "BEGIN; CREATE TABLE \"Cache.Space\".inventory_probe(i INTEGER);");
+	check(owner, {"Cache.Space"});
+	check(observer, {});
+	Execute(owner, "ROLLBACK;");
+	check(owner, {});
+	Execute(owner, "CREATE TABLE \"Cache.Space\".inventory_probe(i INTEGER);");
+	check(owner, {"Cache.Space"});
+	Execute(observer, "BEGIN;");
+	check(observer, {"Cache.Space"});
+	Execute(owner, "DROP TABLE \"Cache.Space\".inventory_probe;");
+	check(owner, {});
+	check(observer, {"Cache.Space"});
+	Execute(observer, "ROLLBACK;");
+	check(observer, {});
+	Execute(owner, "ATTACH ':memory:' AS peer; CREATE TABLE peer.inventory_probe(i INTEGER);");
+	check(owner, {"main"}, "peer");
+	Execute(owner, "DETACH peer; ATTACH ':memory:' AS peer;");
+	check(owner, {}, "peer");
 }
 
 static void TestIdentifierComparisons() {
@@ -3117,6 +3166,7 @@ int main(int argc, char **argv) {
 		TestSourceGenerationSnapshots();
 		TestQuotedNamespaceNormalization();
 		TestQualifiedTableReferences();
+		TestMetadataSchemaInventory();
 		TestIdentifierComparisons();
 		TestTableColumnIdentity();
 		TestInternalSchemaReopen(argv[1]);

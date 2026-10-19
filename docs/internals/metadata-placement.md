@@ -99,6 +99,11 @@ the settings registers in the recorded location instead of splitting the metadat
 deployment with an in-memory frontend loses its marker on exit and sets the location at
 startup.
 
+Native registry schema discovery reuses an evictable inventory keyed by catalog identity
+and the transaction-visible catalog version. CREATE, DROP, rollback, and detach/reattach
+therefore select the matching inventory. Only schema names are cached; source ownership
+rows are still read from the caller’s snapshot, and remote inventories are not cached.
+
 Delta cleanup and DROP consult every location that may consume a delta table: the
 configured location, marker targets, and legacy native catalogs. An unreachable marker
 target aborts rather than risk deleting changes another view still needs.

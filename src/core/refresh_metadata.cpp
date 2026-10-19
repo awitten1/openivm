@@ -62,20 +62,58 @@ vector<string> CatalogSchemas(ClientContext &context, Catalog &catalog) {
 	return schemas;
 }
 
-vector<string> CatalogSchemas(Connection &con, const string &catalog) {
+// Catalog versions describe structural visibility, including transaction-local DDL.
+// Cache names only: ownership rows must still be read in the caller's snapshot.
+class MetadataSchemaInventory : public ObjectCacheEntry {
+public:
+	MetadataSchemaInventory(idx_t version, vector<string> schemas) : version(version), schemas(std::move(schemas)) {
+	}
+	static string ObjectType() {
+		return "openivm_metadata_schemas";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override {
+		idx_t size = sizeof(*this) + schemas.capacity() * sizeof(string);
+		for (auto &schema : schemas) {
+			size += schema.capacity();
+		}
+		return size;
+	}
+	const idx_t version;
+	const vector<string> schemas;
+};
+
+vector<string> FindMetadataSchemas(ClientContext &context, Catalog &catalog, const string &table) {
+	auto version = catalog.IsDuckCatalog() ? catalog.GetCatalogVersion(context) : optional_idx();
+	auto &cache = context.db->GetObjectCache();
+	auto key = MetadataSchemaInventory::ObjectType() + ":" + to_string(catalog.GetOid()) + ":" + table;
+	if (version.IsValid()) {
+		auto cached = cache.Get<MetadataSchemaInventory>(key);
+		if (cached && cached->version == version.GetIndex()) {
+			return cached->schemas;
+		}
+	}
 	vector<string> schemas;
-	con.context->RunFunctionInTransaction(
-	    [&]() { schemas = CatalogSchemas(*con.context, Catalog::GetCatalog(*con.context, catalog)); });
+	for (auto &schema : CatalogSchemas(context, catalog)) {
+		if (catalog.GetEntry<TableCatalogEntry>(context, schema, table, OnEntryNotFound::RETURN_NULL)) {
+			schemas.push_back(schema);
+		}
+	}
+	if (version.IsValid()) {
+		cache.Put(key, make_shared_ptr<MetadataSchemaInventory>(version.GetIndex(), schemas));
+	}
+	OPENIVM_DEBUG_PRINT("[METADATA] Discovered %zu schemas for %s in %s\n", schemas.size(), table.c_str(),
+	                    catalog.GetName().c_str());
 	return schemas;
 }
 
 bool SchemaExists(Connection &con, const string &catalog, const string &schema) {
-	for (auto &existing : CatalogSchemas(con, catalog)) {
-		if (StringUtil::CIEquals(existing, schema)) {
-			return true;
-		}
-	}
-	return false;
+	bool exists = false;
+	con.context->RunFunctionInTransaction(
+	    [&]() { exists = Catalog::GetSchema(*con.context, catalog, schema, OnEntryNotFound::RETURN_NULL) != nullptr; });
+	return exists;
 }
 
 void SelectMetadataLocation(Connection &con, const MetadataLocation &location) {
@@ -205,11 +243,9 @@ string RefreshMetadata::ConfiguredMetadataSchema(ClientContext &context) {
 
 vector<string> RefreshMetadata::FindMetadataSchemas(Connection &con, const string &catalog, const string &table) {
 	vector<string> schemas;
-	for (auto &schema : CatalogSchemas(con, catalog)) {
-		if (con.TableInfo(catalog, schema, table)) {
-			schemas.push_back(schema);
-		}
-	}
+	con.context->RunFunctionInTransaction([&]() {
+		schemas = duckdb::FindMetadataSchemas(*con.context, Catalog::GetCatalog(*con.context, catalog), table);
+	});
 	return schemas;
 }
 
@@ -805,7 +841,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
 		if (!source_catalog.IsDuckCatalog()) {
 			return nullptr;
 		}
-		for (auto &source_schema : CatalogSchemas(context, source_catalog)) {
+		for (auto &source_schema : duckdb::FindMetadataSchemas(context, source_catalog, openivm::DELTA_TABLES_TABLE)) {
 			locations.emplace_back(catalog, source_schema);
 		}
 	} else {

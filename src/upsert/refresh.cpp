@@ -1349,6 +1349,7 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 	parser.ParseQuery(program);
 	string stamped;
 	CompiledProgram archived;
+	const bool archive_enabled = CompiledSQLArchiveEnabled(context);
 	for (auto &statement : parser.statements) {
 		if (statement->type == StatementType::INSERT_STATEMENT) {
 			auto &insert = statement->Cast<InsertStatement>();
@@ -1372,9 +1373,11 @@ static string BuildTransactionalRefreshViewSQL(ClientContext &context, Connectio
 			sql = SqlUtils::ReplaceAllOccurrences(sql, openivm::UTC_NOW_SQL, timestamp);
 		}
 		stamped += sql + ";\n";
-		archived.statements.push_back(std::move(sql));
+		if (archive_enabled) {
+			archived.statements.push_back(std::move(sql));
+		}
 	}
-	if (!CompiledSQLArchiveEnabled(context)) {
+	if (!archive_enabled) {
 		return stamped;
 	}
 	// The archive write joins the caller's transaction: it commits with the refresh,
