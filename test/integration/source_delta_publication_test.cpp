@@ -168,8 +168,10 @@ static void TestMetadataSchemaInventory() {
 	check(owner, {});
 	check(observer, {});
 	Execute(owner, "BEGIN; CREATE TABLE \"Cache.Space\".inventory_probe(i INTEGER);");
-	check(owner, {"Cache.Space"});
-	check(observer, {});
+	for (idx_t round = 0; round < 4; round++) {
+		check(owner, {"Cache.Space"});
+		check(observer, {});
+	}
 	Execute(owner, "ROLLBACK;");
 	check(owner, {});
 	Execute(owner, "CREATE TABLE \"Cache.Space\".inventory_probe(i INTEGER);");
@@ -177,8 +179,10 @@ static void TestMetadataSchemaInventory() {
 	Execute(observer, "BEGIN;");
 	check(observer, {"Cache.Space"});
 	Execute(owner, "DROP TABLE \"Cache.Space\".inventory_probe;");
-	check(owner, {});
-	check(observer, {"Cache.Space"});
+	for (idx_t round = 0; round < 4; round++) {
+		check(owner, {});
+		check(observer, {"Cache.Space"});
+	}
 	Execute(observer, "ROLLBACK;");
 	check(observer, {});
 	Execute(owner, "ATTACH ':memory:' AS peer; CREATE TABLE peer.inventory_probe(i INTEGER);");

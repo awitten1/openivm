@@ -100,8 +100,9 @@ deployment with an in-memory frontend loses its marker on exit and sets the loca
 startup.
 
 Native registry schema discovery reuses an evictable inventory keyed by catalog identity
-and the transaction-visible catalog version. CREATE, DROP, rollback, and detach/reattach
-therefore select the matching inventory. Only schema names are cached; source ownership
+and the transaction-visible catalog version. Inventories for multiple live snapshots
+coexist within the bounded cache. CREATE, DROP, rollback, and detach/reattach select the
+matching inventory. Only schema names are cached; source ownership
 rows are still read from the caller’s snapshot, and remote inventories are not cached.
 
 Delta cleanup and DROP consult every location that may consume a delta table: the

@@ -81,6 +81,13 @@ static string DescribeCompiledVersionSQL(const CompiledProgram &program, Compile
 	       " AND p.operation = " + operation + " AND p.version = " + version + ")";
 }
 
+static string LatestCompiledVersionSQL(const string &statements, const string &filter) {
+	// Both forms return NULL for empty history. DuckDB v1.5.4's MAX statistics
+	// optimization asserts when transaction-local CREATE rows are all filtered out
+	// by the first refresh lookup, so use an ordered scalar subquery instead.
+	return "(SELECT version FROM " + statements + " WHERE " + filter + " ORDER BY version DESC LIMIT 1)";
+}
+
 vector<string> BuildCompiledSQLArchiveStatements(ClientContext &context, const CompiledProgram &program,
                                                  CompiledProgramOutcome outcome, const string &catalog,
                                                  const string &schema) {
@@ -95,7 +102,7 @@ vector<string> BuildCompiledSQLArchiveStatements(ClientContext &context, const C
 		return "'" + SqlUtils::EscapeSingleQuotes(value) + "'";
 	};
 	auto view_filter = "view_name = " + literal(program.view_name) + " AND operation = " + literal(program.operation);
-	auto latest_version = "(SELECT max(version) FROM " + statements + " WHERE " + view_filter + ")";
+	auto latest_version = LatestCompiledVersionSQL(statements, view_filter);
 	auto compilation_id = literal(program.compilation_id);
 	auto outcome_name = literal(CompiledProgramOutcomeName(outcome));
 	auto committed = outcome == CompiledProgramOutcome::COMMITTED ? string("1") : string("0");
@@ -170,9 +177,9 @@ string WriteCompiledProgram(ClientContext &context, Connection &con, const Compi
 	auto statements = ArchiveTableName(catalog, schema, openivm::COMPILED_STATEMENTS_TABLE);
 	Value view_name(program.view_name);
 	Value operation(program.operation);
-	auto stored = execute("SELECT version, sql FROM " + statements +
-	                          " WHERE view_name = $1 AND operation = $2 AND version = (SELECT max(version) FROM " +
-	                          statements + " WHERE view_name = $1 AND operation = $2) ORDER BY stmt_order",
+	const string view_filter = "view_name = $1 AND operation = $2";
+	auto stored = execute("SELECT version, sql FROM " + statements + " WHERE " + view_filter + " AND version = " +
+	                          LatestCompiledVersionSQL(statements, view_filter) + " ORDER BY stmt_order",
 	                      {view_name, operation}, error);
 	if (!stored) {
 		return error;

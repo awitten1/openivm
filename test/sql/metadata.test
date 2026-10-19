@@ -1514,3 +1514,91 @@ SELECT (SELECT count(*) FROM (SELECT * FROM controls_other.controls_mv EXCEPT AL
        (SELECT count(*) FROM (SELECT k,COUNT(*) FROM controls_src GROUP BY k EXCEPT ALL SELECT * FROM controls_other.controls_mv));
 ----
 0	0
+
+# A first CREATE archive and its first refresh share one explicit transaction.
+# The refresh operation has no history yet, while CREATE rows are still local.
+load __TEST_DIR__/openivm_archive_create_refresh_transaction.db
+
+statement ok
+SET openivm_disable_daemon=true;
+SET openivm_archive_compiled_sql=true;
+SET openivm_metadata_schema='Archive.Control';
+SET openivm_internal_schema='Hidden Archive';
+CREATE SCHEMA "Source.Space";
+CREATE TABLE "Source.Space".s(k INTEGER,v INTEGER);
+INSERT INTO "Source.Space".s VALUES(1,3),(1,3),(2,7);
+
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW "Source.Space"."Fresh;MV" AS SELECT k,SUM(v) total FROM "Source.Space".s GROUP BY k;
+
+statement ok
+PRAGMA refresh('"Source.Space"."Fresh;MV"');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM "Source.Space"."Fresh;MV" EXCEPT ALL SELECT k,SUM(v) FROM "Source.Space".s GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM "Source.Space".s GROUP BY k EXCEPT ALL SELECT * FROM "Source.Space"."Fresh;MV"));
+----
+0	0
+
+statement ok
+INSERT INTO "Source.Space".s VALUES(1,5),(3,7),(4,9);
+UPDATE "Source.Space".s SET v=v+2 WHERE k=1;
+DELETE FROM "Source.Space".s WHERE k IN (2,4);
+
+statement ok
+PRAGMA refresh('"Source.Space"."Fresh;MV"');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM "Source.Space"."Fresh;MV" EXCEPT ALL SELECT k,SUM(v) FROM "Source.Space".s GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM "Source.Space".s GROUP BY k EXCEPT ALL SELECT * FROM "Source.Space"."Fresh;MV"));
+----
+0	0
+
+statement ok
+COMMIT;
+
+query IT
+SELECT count(DISTINCT operation),bool_and(last_outcome='committed') FROM "Archive.Control".openivm_compiled_programs WHERE view_sql_name='Fresh;MV';
+----
+2	true
+
+# The same archive path must roll back with a new MV and its source writes.
+statement ok
+BEGIN;
+
+statement ok
+CREATE MATERIALIZED VIEW "Source.Space"."Rolled Back;MV" AS SELECT k,SUM(v) total FROM "Source.Space".s GROUP BY k;
+INSERT INTO "Source.Space".s VALUES(1,11),(5,13),(6,17);
+UPDATE "Source.Space".s SET v=v+1 WHERE k=1;
+DELETE FROM "Source.Space".s WHERE k IN (3,6);
+
+statement ok
+PRAGMA refresh('"Source.Space"."Rolled Back;MV"');
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM "Source.Space"."Rolled Back;MV" EXCEPT ALL SELECT k,SUM(v) FROM "Source.Space".s GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM "Source.Space".s GROUP BY k EXCEPT ALL SELECT * FROM "Source.Space"."Rolled Back;MV"));
+----
+0	0
+
+statement ok
+ROLLBACK;
+
+query I
+SELECT count(*) FROM "Archive.Control".openivm_compiled_programs WHERE view_sql_name='Rolled Back;MV';
+----
+0
+
+query I
+SELECT count(*) FROM duckdb_views() WHERE schema_name='Source.Space' AND view_name='Rolled Back;MV';
+----
+0
+
+query II
+SELECT (SELECT count(*) FROM (SELECT * FROM "Source.Space"."Fresh;MV" EXCEPT ALL SELECT k,SUM(v) FROM "Source.Space".s GROUP BY k)),
+       (SELECT count(*) FROM (SELECT k,SUM(v) FROM "Source.Space".s GROUP BY k EXCEPT ALL SELECT * FROM "Source.Space"."Fresh;MV"));
+----
+0	0

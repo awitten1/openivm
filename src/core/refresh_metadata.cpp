@@ -66,7 +66,7 @@ vector<string> CatalogSchemas(ClientContext &context, Catalog &catalog) {
 // Cache names only: ownership rows must still be read in the caller's snapshot.
 class MetadataSchemaInventory : public ObjectCacheEntry {
 public:
-	MetadataSchemaInventory(idx_t version, vector<string> schemas) : version(version), schemas(std::move(schemas)) {
+	explicit MetadataSchemaInventory(vector<string> schemas) : schemas(std::move(schemas)) {
 	}
 	static string ObjectType() {
 		return "openivm_metadata_schemas";
@@ -81,17 +81,19 @@ public:
 		}
 		return size;
 	}
-	const idx_t version;
 	const vector<string> schemas;
 };
 
 vector<string> FindMetadataSchemas(ClientContext &context, Catalog &catalog, const string &table) {
 	auto version = catalog.IsDuckCatalog() ? catalog.GetCatalogVersion(context) : optional_idx();
 	auto &cache = context.db->GetObjectCache();
-	auto key = MetadataSchemaInventory::ObjectType() + ":" + to_string(catalog.GetOid()) + ":" + table;
+	// Different live snapshots must not evict each other on every helper lookup.
+	// Each immutable version has its own entry in DuckDB's memory-bounded LRU.
+	auto key = MetadataSchemaInventory::ObjectType() + ":" + to_string(catalog.GetOid()) + ":" + table + ":" +
+	           (version.IsValid() ? to_string(version.GetIndex()) : "");
 	if (version.IsValid()) {
 		auto cached = cache.Get<MetadataSchemaInventory>(key);
-		if (cached && cached->version == version.GetIndex()) {
+		if (cached) {
 			return cached->schemas;
 		}
 	}
@@ -102,7 +104,7 @@ vector<string> FindMetadataSchemas(ClientContext &context, Catalog &catalog, con
 		}
 	}
 	if (version.IsValid()) {
-		cache.Put(key, make_shared_ptr<MetadataSchemaInventory>(version.GetIndex(), schemas));
+		cache.Put(key, make_shared_ptr<MetadataSchemaInventory>(schemas));
 	}
 	OPENIVM_DEBUG_PRINT("[METADATA] Discovered %zu schemas for %s in %s\n", schemas.size(), table.c_str(),
 	                    catalog.GetName().c_str());
