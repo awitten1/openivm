@@ -2232,3 +2232,178 @@ SELECT count(*) FROM ((SELECT * FROM generated_cte EXCEPT ALL SELECT k,g FROM "G
 UNION ALL (SELECT k,g FROM "Generated.Schema"."Values" EXCEPT ALL SELECT * FROM generated_cte));
 ----
 0
+
+# Ordinary views keep their own catalog/schema and CTE scope during source binding.
+statement ok
+CREATE SCHEMA generated_views;
+CREATE TABLE generated_views.s(k INTEGER,v INTEGER,g INTEGER GENERATED ALWAYS AS(v*2));
+INSERT INTO generated_views.s(k,v) VALUES(1,2),(1,2),(2,3);
+CREATE VIEW generated_views.inner_view AS SELECT k,g FROM generated_views.s;
+CREATE VIEW generated_views.named_view(id,value) AS SELECT k,g FROM generated_views.inner_view;
+CREATE TABLE s(k INTEGER,v INTEGER,g INTEGER);
+INSERT INTO s VALUES(99,99,99);
+CREATE MATERIALIZED VIEW generated_view_mv AS SELECT id,SUM(value) total FROM generated_views.named_view GROUP BY id;
+CREATE MATERIALIZED VIEW generated_view_join_mv AS SELECT a.id,a.value,b.value other FROM generated_views.named_view a JOIN generated_views.named_view b ON a.id=b.id;
+CREATE MATERIALIZED VIEW generated_view_cte_mv AS WITH s AS (SELECT 999 AS k,999 AS g) SELECT id,value FROM generated_views.named_view;
+CREATE MATERIALIZED VIEW generated_alias_mv AS SELECT a,SUM(c) total FROM generated_views.s AS x(a,b,c) GROUP BY a;
+CREATE MATERIALIZED VIEW generated_unused_alias_mv AS SELECT a,SUM(b) total FROM generated_views.s AS x(a,b,c) GROUP BY a;
+CREATE MATERIALIZED VIEW generated_view_alias_mv AS SELECT a,SUM(b) total FROM generated_views.named_view AS x(a,b) GROUP BY a;
+CREATE MATERIALIZED VIEW generated_values_mv AS SELECT * FROM (VALUES ((SELECT SUM(g) FROM generated_views.s))) q(total);
+
+statement ok
+CREATE OR REPLACE TABLE generated_views.s AS SELECT k,v,g+5 AS g FROM generated_views.s;
+INSERT INTO generated_views.s VALUES(1,4,13),(3,5,15),(4,6,17);
+UPDATE generated_views.s SET g=g+2 WHERE k=1;
+DELETE FROM generated_views.s WHERE k=4;
+
+statement ok
+PRAGMA refresh_pipeline('generated_view_mv','generated_view_join_mv','generated_view_cte_mv','generated_alias_mv','generated_unused_alias_mv','generated_view_alias_mv','generated_values_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_view_mv EXCEPT ALL SELECT id,SUM(value) total FROM generated_views.named_view GROUP BY id)
+UNION ALL (SELECT id,SUM(value) total FROM generated_views.named_view GROUP BY id EXCEPT ALL SELECT * FROM generated_view_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_view_join_mv EXCEPT ALL SELECT a.id,a.value,b.value other FROM generated_views.named_view a JOIN generated_views.named_view b ON a.id=b.id)
+UNION ALL (SELECT a.id,a.value,b.value other FROM generated_views.named_view a JOIN generated_views.named_view b ON a.id=b.id EXCEPT ALL SELECT * FROM generated_view_join_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_view_cte_mv EXCEPT ALL SELECT id,value FROM generated_views.named_view)
+UNION ALL (SELECT id,value FROM generated_views.named_view EXCEPT ALL SELECT * FROM generated_view_cte_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_alias_mv EXCEPT ALL SELECT a,SUM(c) total FROM generated_views.s AS x(a,b,c) GROUP BY a)
+UNION ALL (SELECT a,SUM(c) total FROM generated_views.s AS x(a,b,c) GROUP BY a EXCEPT ALL SELECT * FROM generated_alias_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_unused_alias_mv EXCEPT ALL SELECT a,SUM(b) total FROM generated_views.s AS x(a,b,c) GROUP BY a)
+UNION ALL (SELECT a,SUM(b) total FROM generated_views.s AS x(a,b,c) GROUP BY a EXCEPT ALL SELECT * FROM generated_unused_alias_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_view_alias_mv EXCEPT ALL SELECT a,SUM(b) total FROM generated_views.named_view AS x(a,b) GROUP BY a)
+UNION ALL (SELECT a,SUM(b) total FROM generated_views.named_view AS x(a,b) GROUP BY a EXCEPT ALL SELECT * FROM generated_view_alias_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_values_mv EXCEPT ALL SELECT * FROM (VALUES ((SELECT SUM(g) FROM generated_views.s))) q(total))
+UNION ALL (SELECT * FROM (VALUES ((SELECT SUM(g) FROM generated_views.s))) q(total) EXCEPT ALL SELECT * FROM generated_values_mv));
+----
+0
+
+# Existing native views can store unqualified sources; caller lookup must not win.
+statement ok
+USE generated_views;
+CREATE VIEW unqualified_view AS SELECT k,g FROM s;
+USE main;
+CREATE MATERIALIZED VIEW generated_unqualified_view_mv AS SELECT k,SUM(g) total FROM generated_views.unqualified_view GROUP BY k;
+CREATE MATERIALIZED VIEW generated_unqualified_cte_mv AS WITH s AS (SELECT 999 AS k,999 AS g) SELECT k,g FROM generated_views.unqualified_view;
+CREATE OR REPLACE TABLE generated_views.s(k INTEGER,v INTEGER,g INTEGER GENERATED ALWAYS AS(v*7));
+INSERT INTO generated_views.s(k,v) VALUES(1,4),(1,4),(2,5),(3,6);
+UPDATE generated_views.s SET v=v+1 WHERE k=1;
+DELETE FROM generated_views.s WHERE k=3;
+
+statement ok
+PRAGMA refresh_pipeline('generated_unqualified_cte_mv','generated_unqualified_view_mv','generated_view_mv','generated_view_join_mv','generated_view_cte_mv','generated_alias_mv','generated_unused_alias_mv','generated_view_alias_mv','generated_values_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_view_mv EXCEPT ALL SELECT id,SUM(value) total FROM generated_views.named_view GROUP BY id)
+UNION ALL (SELECT id,SUM(value) total FROM generated_views.named_view GROUP BY id EXCEPT ALL SELECT * FROM generated_view_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_view_join_mv EXCEPT ALL SELECT a.id,a.value,b.value other FROM generated_views.named_view a JOIN generated_views.named_view b ON a.id=b.id)
+UNION ALL (SELECT a.id,a.value,b.value other FROM generated_views.named_view a JOIN generated_views.named_view b ON a.id=b.id EXCEPT ALL SELECT * FROM generated_view_join_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_view_cte_mv EXCEPT ALL SELECT id,value FROM generated_views.named_view)
+UNION ALL (SELECT id,value FROM generated_views.named_view EXCEPT ALL SELECT * FROM generated_view_cte_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_alias_mv EXCEPT ALL SELECT a,SUM(c) total FROM generated_views.s AS x(a,b,c) GROUP BY a)
+UNION ALL (SELECT a,SUM(c) total FROM generated_views.s AS x(a,b,c) GROUP BY a EXCEPT ALL SELECT * FROM generated_alias_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_unused_alias_mv EXCEPT ALL SELECT a,SUM(b) total FROM generated_views.s AS x(a,b,c) GROUP BY a)
+UNION ALL (SELECT a,SUM(b) total FROM generated_views.s AS x(a,b,c) GROUP BY a EXCEPT ALL SELECT * FROM generated_unused_alias_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_view_alias_mv EXCEPT ALL SELECT a,SUM(b) total FROM generated_views.named_view AS x(a,b) GROUP BY a)
+UNION ALL (SELECT a,SUM(b) total FROM generated_views.named_view AS x(a,b) GROUP BY a EXCEPT ALL SELECT * FROM generated_view_alias_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_values_mv EXCEPT ALL SELECT * FROM (VALUES ((SELECT SUM(g) FROM generated_views.s))) q(total))
+UNION ALL (SELECT * FROM (VALUES ((SELECT SUM(g) FROM generated_views.s))) q(total) EXCEPT ALL SELECT * FROM generated_values_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_unqualified_view_mv EXCEPT ALL SELECT k,SUM(g) total FROM generated_views.unqualified_view GROUP BY k)
+UNION ALL (SELECT k,SUM(g) total FROM generated_views.unqualified_view GROUP BY k EXCEPT ALL SELECT * FROM generated_unqualified_view_mv));
+----
+0
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_unqualified_cte_mv EXCEPT ALL SELECT k,g FROM generated_views.unqualified_view)
+UNION ALL (SELECT k,g FROM generated_views.unqualified_view EXCEPT ALL SELECT * FROM generated_unqualified_cte_mv));
+----
+0
+
+# View-owned schema/catalog ambiguity follows DuckDB's lookup, not the caller's.
+statement ok
+ATTACH ':memory:' AS generated_peer;
+CREATE SCHEMA generated_peer.generated_lookup;
+CREATE TABLE generated_peer.generated_lookup.s(k INTEGER,v INTEGER,g INTEGER GENERATED ALWAYS AS(v*2));
+INSERT INTO generated_peer.generated_lookup.s(k,v) VALUES(1,2),(1,2);
+USE generated_peer.main;
+CREATE VIEW v AS SELECT k,g FROM generated_lookup.s;
+USE memory.main;
+CREATE MATERIALIZED VIEW generated_peer_view_mv AS SELECT k,SUM(g) total FROM generated_peer.main.v GROUP BY k;
+INSERT INTO generated_peer.generated_lookup.s(k,v) VALUES(2,3),(3,4);
+UPDATE generated_peer.generated_lookup.s SET v=v+1 WHERE k=1;
+DELETE FROM generated_peer.generated_lookup.s WHERE k=3;
+
+statement ok
+PRAGMA refresh('generated_peer_view_mv');
+
+query I
+SELECT count(*) FROM ((SELECT * FROM generated_peer_view_mv EXCEPT ALL SELECT k,SUM(g) total FROM generated_peer.main.v GROUP BY k)
+UNION ALL (SELECT k,SUM(g) total FROM generated_peer.main.v GROUP BY k EXCEPT ALL SELECT * FROM generated_peer_view_mv));
+----
+0
+
+statement ok
+ATTACH ':memory:' AS generated_lookup;
+CREATE TABLE generated_lookup.s(k INTEGER,v INTEGER,g INTEGER GENERATED ALWAYS AS(v*9));
+INSERT INTO generated_lookup.s(k,v) VALUES(99,99);
+
+statement error
+SELECT * FROM generated_peer.main.v;
+----
+Ambiguous reference to catalog or schema
+
+statement error
+CREATE MATERIALIZED VIEW generated_ambiguous_view_mv AS SELECT * FROM generated_peer.main.v;
+----
+Ambiguous reference to catalog or schema

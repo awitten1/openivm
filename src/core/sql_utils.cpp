@@ -83,12 +83,23 @@ static void SourceVisitTableRef(unique_ptr<TableRef> &ref, const SourceRefVisito
 		if (pivot.source) {
 			SourceVisitTableRef(pivot.source, visitor);
 		}
+		for (auto &aggregate : pivot.aggregates) {
+			SourceVisitExpression(*aggregate, visitor);
+		}
 		break;
 	}
+	case TableReferenceType::EXPRESSION_LIST:
 	case TableReferenceType::TABLE_FUNCTION: {
-		auto &table_function = ref->Cast<TableFunctionRef>();
-		if (table_function.function) {
-			SourceVisitExpression(*table_function.function, visitor);
+		ParsedExpressionIterator::EnumerateTableRefChildren(*ref, [&](unique_ptr<ParsedExpression> &expression) {
+			if (expression) {
+				SourceVisitExpression(*expression, visitor);
+			}
+		});
+		if (ref->type == TableReferenceType::TABLE_FUNCTION) {
+			auto &function = ref->Cast<TableFunctionRef>();
+			if (function.subquery && function.subquery->node) {
+				SourceVisitQueryNode(*function.subquery->node, visitor);
+			}
 		}
 		break;
 	}

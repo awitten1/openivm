@@ -9,6 +9,9 @@
 #include "rules/column_hider.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
+#include "duckdb/catalog/catalog_entry/view_catalog_entry.hpp"
+#include "duckdb/main/database_manager.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/main/settings.hpp"
 #include "duckdb/parser/query_error_context.hpp"
@@ -59,6 +62,8 @@ struct SourceColumnsBindData : public TableFunctionData {
 	}
 };
 
+static void RewriteSourceColumns(Binder &binder, SQLStatement &statement);
+
 } // namespace
 
 TableFunction SourceColumnsFunction() {
@@ -67,10 +72,38 @@ TableFunction SourceColumnsFunction() {
 		                       throw InvalidInputException("OpenIVM source-column IR cannot execute directly");
 	                       });
 	function.bind_replace = [](ClientContext &context, TableFunctionBindInput &input) -> unique_ptr<TableRef> {
-		auto entry =
-		    Catalog::GetEntry<TableCatalogEntry>(context, input.inputs[0].ToString(), input.inputs[1].ToString(),
-		                                         input.inputs[2].ToString(), OnEntryNotFound::THROW_EXCEPTION);
-		auto &table = *entry;
+		auto entry = Catalog::GetEntry(context, input.inputs[0].ToString(), input.inputs[1].ToString(),
+		                               EntryLookupInfo(CatalogType::TABLE_ENTRY, input.inputs[2].ToString()),
+		                               OnEntryNotFound::THROW_EXCEPTION);
+		if (entry->type == CatalogType::VIEW_ENTRY) {
+			auto &view = entry->Cast<ViewCatalogEntry>();
+			auto view_binder = Binder::CreateBinder(context, input.binder, BinderType::VIEW_BINDER);
+			view_binder->SetCanContainNulls(true);
+			view_binder->SetSearchPath(view.ParentCatalog(), view.ParentSchema().name);
+			view_binder->AddBoundView(view);
+			auto query = view.GetQuery().Copy();
+			RewriteSourceColumns(*view_binder, *query);
+			SubqueryRef subquery(unique_ptr_cast<SQLStatement, SelectStatement>(std::move(query)));
+			subquery.alias = input.ref.alias;
+			subquery.column_name_alias = view.aliases;
+			for (idx_t i = 0; i < input.ref.column_name_alias.size(); i++) {
+				if (i < subquery.column_name_alias.size()) {
+					subquery.column_name_alias[i] = input.ref.column_name_alias[i];
+				} else {
+					subquery.column_name_alias.push_back(input.ref.column_name_alias[i]);
+				}
+			}
+			auto bound = view_binder->Bind(static_cast<TableRef &>(subquery));
+			if (!view_binder->correlated_columns.empty()) {
+				throw BinderException("Contents of view were altered - view bound correlated columns");
+			}
+			view.UpdateBinding(bound.types, bound.names);
+			auto binder = Binder::CreateBinder(context, input.binder);
+			binder->bind_context.AddView(bound.plan->GetRootIndex(), input.ref.alias, subquery, bound, view);
+			OPENIVM_DEBUG_PRINT("[SOURCE COLUMNS] Bound view %s in its own search path\n", view.name.c_str());
+			return make_uniq<BoundRefWrapper>(std::move(bound), std::move(binder));
+		}
+		auto &table = entry->Cast<TableCatalogEntry>();
 		auto binder = Binder::CreateBinder(context, input.binder);
 		auto index = binder->GenerateTableIndex();
 		BoundStatement bound;
@@ -86,6 +119,7 @@ TableFunction SourceColumnsFunction() {
 		get->SetColumnIds(std::move(columns));
 		bound.plan = std::move(get);
 		auto binding_names = BindContext::AliasColumnNames(table.name, bound.names, input.ref.column_name_alias);
+
 		binder->bind_context.AddEntryBinding(index, input.ref.alias, binding_names, bound.types, table);
 		OPENIVM_DEBUG_PRINT("[SOURCE COLUMNS] Preserving generated identities in %s.%s.%s\n",
 		                    table.catalog.GetName().c_str(), table.schema.name.c_str(), table.name.c_str());
@@ -112,37 +146,67 @@ TableFunction SourceColumnsFunction() {
 	return function;
 }
 
-void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement) {
+namespace {
+
+static void RewriteSourceColumns(Binder &binder, SQLStatement &statement) {
 	// Bind generated columns as source values, not their current definitions. This
 	// plan is compiler IR only: LPTS emits ordinary source SQL, while delta scans
 	// read the materialized generated values captured with each signed change.
-	SqlUtils::RewriteSourceReferences(*statement, [&](unique_ptr<TableRef> &ref) {
+	SqlUtils::RewriteSourceReferences(statement, [&](unique_ptr<TableRef> &ref) {
 		auto &base = ref->Cast<BaseTableRef>();
 		if (base.at_clause) {
 			return;
 		}
 		auto catalog = base.catalog_name;
 		auto schema = base.schema_name;
-		Binder::BindSchemaOrCatalog(planner.context, catalog, schema);
-		auto entry =
-		    Catalog::GetEntry(planner.context, catalog, schema,
-		                      EntryLookupInfo(CatalogType::TABLE_ENTRY, base.table_name), OnEntryNotFound::RETURN_NULL);
-		if (!entry || entry->type != CatalogType::TABLE_ENTRY || !entry->ParentCatalog().IsDuckCatalog()) {
+		// The context-only resolver uses the caller's path. A view must check
+		// schema/catalog ambiguity against its own entry retriever instead.
+		if (catalog.empty() && !schema.empty() &&
+		    DatabaseManager::Get(binder.context).GetDatabase(binder.context, schema)) {
+			auto local = binder.EntryRetriever().GetSchema(
+			    INVALID_CATALOG, EntryLookupInfo(CatalogType::SCHEMA_ENTRY, schema), OnEntryNotFound::RETURN_NULL);
+			if (local) {
+				throw BinderException(
+				    "Ambiguous reference to catalog or schema \"%s\" - use a fully qualified path like \"%s.%s\"",
+				    schema, local->ParentCatalog().GetName(), schema);
+			}
+			catalog = schema;
+			schema.clear();
+		}
+		auto entry = binder.EntryRetriever().GetEntry(
+		    catalog, schema, EntryLookupInfo(CatalogType::TABLE_ENTRY, base.table_name), OnEntryNotFound::RETURN_NULL);
+		if (!entry) {
 			return;
 		}
-		auto &table = entry->Cast<TableCatalogEntry>();
-		if (table.GetColumns().LogicalColumnCount() == table.GetColumns().PhysicalColumnCount()) {
-			return;
+		if (entry->type != CatalogType::VIEW_ENTRY) {
+			if (entry->type != CatalogType::TABLE_ENTRY || !entry->ParentCatalog().IsDuckCatalog()) {
+				return;
+			}
+			auto &table = entry->Cast<TableCatalogEntry>();
+			if (table.GetColumns().LogicalColumnCount() == table.GetColumns().PhysicalColumnCount()) {
+				return;
+			}
 		}
 		auto function = make_uniq<TableFunctionRef>();
 		vector<unique_ptr<ParsedExpression>> arguments;
-		for (auto &name : {table.catalog.GetName(), table.schema.name, table.name}) {
+		for (auto &name : {entry->ParentCatalog().GetName(), entry->ParentSchema().name, entry->name}) {
 			arguments.push_back(make_uniq<ConstantExpression>(Value(name)));
 		}
 		function->function = make_uniq<FunctionExpression>("openivm_source_columns", std::move(arguments));
-		ref->CopyProperties(*function);
+		// CopyProperties requires equal ref types and omits column-name aliases.
+		function->alias = std::move(ref->alias);
+		function->column_name_alias = std::move(ref->column_name_alias);
+		function->query_location = ref->query_location;
+		function->sample = std::move(ref->sample);
+		function->external_dependency = std::move(ref->external_dependency);
 		ref = std::move(function);
 	});
+}
+
+} // namespace
+
+void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement) {
+	RewriteSourceColumns(*planner.binder, *statement);
 	planner.CreatePlan(std::move(statement));
 }
 

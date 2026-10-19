@@ -78,3 +78,8 @@ MVs compiled by older versions retain their stored, expanded expressions. Recrea
 those generated-column MVs from their original definitions to adopt this boundary;
 the expanded SQL cannot distinguish a former column reference from an explicitly
 written expression.
+
+The same boundary applies through ordinary SQL views and scalar subqueries inside
+`VALUES`. Views retain their own catalog/schema search path and CTE scope, and
+source column aliases such as `FROM source AS s(a, b, c)` preserve the underlying
+column identities.
