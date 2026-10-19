@@ -166,12 +166,7 @@ vector<string> TransactionMetadataSchemas(ClientContext &context, const string &
 		// The caller can also see metadata created without a replay record. A fresh
 		// helper cannot discover these uncommitted schemas or registry tables.
 		auto &catalog = Catalog::GetCatalog(context, catalog_name);
-		for (auto &schema : CatalogSchemas(context, catalog)) {
-			if (catalog.GetEntry<TableCatalogEntry>(context, schema, openivm::VIEWS_TABLE,
-			                                        OnEntryNotFound::RETURN_NULL)) {
-				schemas.push_back(schema);
-			}
-		}
+		schemas = FindMetadataSchemas(context, catalog, openivm::VIEWS_TABLE);
 	}
 	return schemas;
 }
@@ -452,10 +447,8 @@ vector<MetadataLocation> RefreshMetadata::MetadataLocations(ClientContext &conte
 		if (catalog.GetCatalogType() != "duckdb" || catalog.IsSystemCatalog() || catalog.IsTemporaryCatalog()) {
 			continue;
 		}
-		for (auto &schema : CatalogSchemas(context, catalog)) {
-			if (catalog.GetEntry<TableCatalogEntry>(context, schema, table, OnEntryNotFound::RETURN_NULL)) {
-				locations.push_back({catalog.GetName(), schema});
-			}
+		for (auto &schema : duckdb::FindMetadataSchemas(context, catalog, table)) {
+			locations.push_back({catalog.GetName(), schema});
 		}
 	}
 	Connection con(*context.db);
