@@ -933,6 +933,7 @@ struct FullOuterScopeRelation {
 	string reference;
 	string query;
 	vector<string> columns;
+	bool has_aggregate;
 };
 
 static unique_ptr<SelectStatement> ParseScopeQuery(const string &sql) {
@@ -946,9 +947,13 @@ static FullOuterScopeRelation ReadScopeRelation(const SelectNode &view,
                                                 const RefreshMetadata::FullOuterScopeSource &source) {
 	auto input = make_uniq<SelectNode>();
 	input->select_list.push_back(make_uniq<StarExpression>());
+	bool has_aggregate = false;
 	for (auto &entry : view.cte_map.map) {
 		input->cte_map.map[entry.first] = entry.second->Copy();
 		auto &info = *entry.second;
+		if (info.query->node->type == QueryNodeType::SELECT_NODE) {
+			has_aggregate |= !info.query->node->Cast<SelectNode>().groups.group_expressions.empty();
+		}
 		auto key = std::find(info.aliases.begin(), info.aliases.end(), source.key_column);
 		if (key == info.aliases.end() || key == info.aliases.begin() ||
 		    info.query->node->type != QueryNodeType::SELECT_NODE) {
@@ -973,7 +978,7 @@ static FullOuterScopeRelation ReadScopeRelation(const SelectNode &view,
 		auto ref = make_uniq<BaseTableRef>();
 		ref->table_name = entry.first;
 		input->from_table = std::move(ref);
-		return {entry.first, input->ToString(), info.aliases};
+		return {entry.first, input->ToString(), info.aliases, has_aggregate};
 	}
 	throw InternalException("Missing FULL JOIN input for presence column '%s'", source.presence_column);
 }
@@ -1042,7 +1047,15 @@ static FullOuterScopeRows ReadScopeRows(RefreshMetadata &metadata, const string 
 
 static string BuildScopeChanges(const FullOuterScopeRelation &relation,
                                 const RefreshMetadata::FullOuterScopeSource &source,
-                                const vector<FullOuterScopeRows> &rows) {
+                                const vector<FullOuterScopeRows> &rows, const string (&endpoints)[2]) {
+	if (relation.has_aggregate) {
+		// DISTINCT is non-linear: aggregating raw delta rows invents support
+		// counts and drops groups when intersected with an actual endpoint.
+		auto current = "SELECT * FROM (" + endpoints[0] + ") openivm_scope_current";
+		auto previous = "SELECT * FROM (" + endpoints[1] + ") openivm_scope_previous";
+		return "((" + current + " EXCEPT ALL " + previous + ") UNION ALL (" + previous + " EXCEPT ALL " + current +
+		       "))";
+	}
 	vector<string> terms;
 	// A term reads one changed occurrence. Other inputs use each real endpoint,
 	// preserving both old and new match/NULL-padding states without inventing a
@@ -1112,7 +1125,7 @@ static string BuildNestedFullOuterKeys(RefreshMetadata &metadata, const string &
 		}
 		for (idx_t side = 0; side < 2; side++) {
 			auto &source = side == 0 ? scope.left : scope.right;
-			auto changed = BuildScopeChanges(relations[side], source, rows[side]);
+			auto changed = BuildScopeChanges(relations[side], source, rows[side], endpoints[side]);
 			for (idx_t padded_side = 0; padded_side < 2; padded_side++) {
 				auto candidate = SqlUtils::QuoteIdentifier(relations[padded_side].reference);
 				auto opposite = SqlUtils::QuoteIdentifier(relations[1 - padded_side].reference);
@@ -1126,12 +1139,14 @@ static string BuildNestedFullOuterKeys(RefreshMetadata &metadata, const string &
 						candidate_rows = "SELECT * FROM " + changed + " INTERSECT ALL SELECT * FROM (" +
 						                 candidate_rows + ") openivm_scope_endpoint";
 					} else {
-						affected =
-						    "EXISTS (SELECT 1 FROM " + changed + " " + opposite + " WHERE " + predicate + ") AND ";
+						affected = "EXISTS (SELECT 1 FROM (" + endpoints[1 - padded_side][1 - endpoint] + ") " +
+						           opposite + " WHERE " + predicate + ") AND ";
 					}
 					// Padding is real only when the complete join predicate has no
-					// match at that endpoint. A matched-to-matched update must not
-					// manufacture a default key shared by unrelated unmatched rows.
+					// match at that endpoint. Opposite-side padding also needs a real
+					// match at the other endpoint; transient delta rows are insufficient.
+					// Matched-to-matched updates must not manufacture a default key
+					// shared by unrelated unmatched rows.
 					unmatched.push_back("SELECT " + candidate + ".* FROM (" + candidate_rows + ") " + candidate +
 					                    " WHERE " + affected + "NOT EXISTS (SELECT 1 FROM (" +
 					                    endpoints[1 - padded_side][endpoint] + ") " + opposite + " WHERE " + predicate +

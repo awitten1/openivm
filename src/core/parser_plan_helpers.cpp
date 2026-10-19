@@ -2429,6 +2429,16 @@ static bool ScopePresenceMatches(ColumnBinding binding, const string &name, cons
 			return ScopePresenceMatches(expression.Cast<BoundColumnRefExpression>().binding, name, facts);
 		}
 	}
+	for (auto *aggregate : facts.aggregates) {
+		if (binding.table_index != aggregate->aggregate_index) {
+			continue;
+		}
+		auto &expression = aggregate->expressions[binding.column_index]->Cast<BoundAggregateExpression>();
+		if (expression.function.name == "bool_or" && expression.children.size() == 1 &&
+		    expression.children[0]->type == ExpressionType::BOUND_COLUMN_REF) {
+			return ScopePresenceMatches(expression.children[0]->Cast<BoundColumnRefExpression>().binding, name, facts);
+		}
+	}
 	auto setop = facts.setops_by_index.find(binding.table_index);
 	if (setop != facts.setops_by_index.end()) {
 		for (auto &child : setop->second->children) {

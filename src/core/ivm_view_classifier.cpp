@@ -560,7 +560,11 @@ static void SelectRefreshType(DeltaViewModel &model, const PlanAnalysis &analysi
 	} else if (model.union_distinct_over_agg && !model.group_columns.empty()) {
 		model.type = RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_union_distinct && !analysis.found_aggregation && !model.group_columns.empty()) {
-		model.type = RefreshType::GROUP_RECOMPUTE;
+		// A descendant UNION DISTINCT does not aggregate the outer projection.
+		// FULL JOIN projections need both hidden key scopes to recover old and
+		// new NULL-padding keys; source-group recompute loses those transitions.
+		model.type = analysis.found_full_outer && !model.distinct_at_top ? RefreshType::SIMPLE_PROJECTION
+		                                                                 : RefreshType::GROUP_RECOMPUTE;
 	} else if (analysis.found_distinct && model.distinct_at_top && !model.group_columns.empty()) {
 		model.type = RefreshType::AGGREGATE_GROUP;
 	} else if (!model.strategy_reasons.empty() && !model.group_columns.empty()) {

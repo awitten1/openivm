@@ -3129,10 +3129,10 @@ statement ok
 INSERT INTO bucket_d SELECT i,'unchanged' FROM range(100,1100)t(i);
 
 statement ok
-CREATE VIEW bucket_expected AS WITH p AS (SELECT a.id,a.payload,COALESCE(a.v,b.v,0) AS lookup_key FROM bucket_a a FULL JOIN bucket_b b ON a.k=b.k) SELECT p.id,p.payload,d.label FROM p FULL JOIN bucket_d d ON p.lookup_key=d.k;
+CREATE VIEW bucket_expected AS WITH p AS (SELECT a.id,a.payload,COALESCE(b.v,a.v,0) AS lookup_key FROM bucket_a a FULL JOIN bucket_b b ON a.k=b.k) SELECT p.id,p.payload,d.label FROM p FULL JOIN bucket_d d ON p.lookup_key=d.k;
 
 statement ok
-CREATE MATERIALIZED VIEW bucket_mv AS WITH p AS (SELECT a.id,a.payload,COALESCE(a.v,b.v,0) AS lookup_key FROM bucket_a a FULL JOIN bucket_b b ON a.k=b.k) SELECT p.id,p.payload,d.label FROM p FULL JOIN bucket_d d ON p.lookup_key=d.k;
+CREATE MATERIALIZED VIEW bucket_mv AS WITH p AS (SELECT a.id,a.payload,COALESCE(b.v,a.v,0) AS lookup_key FROM bucket_a a FULL JOIN bucket_b b ON a.k=b.k) SELECT p.id,p.payload,d.label FROM p FULL JOIN bucket_d d ON p.lookup_key=d.k;
 
 query I
 SELECT type FROM openivm_views WHERE view_sql_name='bucket_mv';
@@ -3222,3 +3222,410 @@ SELECT COUNT(*) FROM (SELECT * FROM bucket_untouched EXCEPT ALL SELECT rowid,id 
 
 statement ok rowid_snapshot
 COMMIT;
+
+# A transient optional match does not replace unchanged preserved rows.
+statement ok rowid_snapshot
+BEGIN;
+
+statement ok rowid_snapshot
+SELECT COUNT(*) FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_;
+
+statement ok
+CREATE OR REPLACE TABLE bucket_untouched AS SELECT rowid AS old_rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100;
+
+statement ok
+INSERT INTO bucket_b VALUES(1,99);
+
+statement ok
+UPDATE bucket_b SET v=42;
+
+statement ok
+DELETE FROM bucket_b;
+
+statement ok
+PRAGMA refresh('bucket_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_mv) EXCEPT ALL (SELECT * FROM bucket_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_expected) EXCEPT ALL (SELECT * FROM bucket_mv));
+----
+0
+
+query I
+SELECT COUNT(*) FROM (SELECT * FROM bucket_untouched EXCEPT ALL SELECT rowid,id FROM openivm_data___openivm_mv_6d656d6f7279_6d61696e_6275636b65745f6d76_ WHERE id>=100);
+----
+0
+
+statement ok rowid_snapshot
+COMMIT;
+
+statement ok
+INSERT INTO bucket_b VALUES(1,99);
+
+statement ok
+UPDATE bucket_b SET v=42;
+
+statement ok
+INSERT INTO bucket_b VALUES(1,100);
+
+statement ok
+DELETE FROM bucket_b WHERE v=100;
+
+statement ok
+PRAGMA refresh('bucket_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_mv) EXCEPT ALL (SELECT * FROM bucket_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_expected) EXCEPT ALL (SELECT * FROM bucket_mv));
+----
+0
+
+statement ok
+UPDATE bucket_b SET v=99;
+
+statement ok
+DELETE FROM bucket_b;
+
+statement ok
+INSERT INTO bucket_b VALUES(1,100);
+
+statement ok
+DELETE FROM bucket_b;
+
+statement ok
+PRAGMA refresh('bucket_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_mv) EXCEPT ALL (SELECT * FROM bucket_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM bucket_expected) EXCEPT ALL (SELECT * FROM bucket_mv));
+----
+0
+
+# DISTINCT markers preserve groups shared by different UNION arms.
+
+statement ok
+CREATE TABLE distinct_a(id INT,k INT);
+
+statement ok
+CREATE TABLE distinct_c(id INT,k INT);
+
+statement ok
+CREATE TABLE distinct_b(k INT,v INT);
+
+statement ok
+CREATE TABLE distinct_d(k INT,label VARCHAR);
+
+statement ok
+INSERT INTO distinct_a VALUES(1,1),(1,1),(2,2),(3,3);
+
+statement ok
+INSERT INTO distinct_c VALUES(1,1),(2,2);
+
+statement ok
+INSERT INTO distinct_b VALUES(1,2),(2,3);
+
+statement ok
+INSERT INTO distinct_d VALUES(0,'default'),(1,'one'),(2,'two'),(3,'three'),(4,'four');
+
+statement ok
+CREATE VIEW distinct_input_expected AS WITH n AS (SELECT DISTINCT id,k FROM distinct_a), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_input_mv AS WITH n AS (SELECT DISTINCT id,k FROM distinct_a), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+query I
+SELECT CAST(type IN (2,6) AS INTEGER) FROM openivm_views WHERE view_sql_name='distinct_input_mv';
+----
+1
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_mv) EXCEPT ALL (SELECT * FROM distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_expected) EXCEPT ALL (SELECT * FROM distinct_input_mv));
+----
+0
+
+statement ok
+CREATE VIEW union_distinct_input_expected AS WITH n AS (SELECT id,k FROM distinct_a UNION SELECT id,k FROM distinct_c), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW union_distinct_input_mv AS WITH n AS (SELECT id,k FROM distinct_a UNION SELECT id,k FROM distinct_c), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+query I
+SELECT CAST(type IN (2,6) AS INTEGER) FROM openivm_views WHERE view_sql_name='union_distinct_input_mv';
+----
+1
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_mv) EXCEPT ALL (SELECT * FROM union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_expected) EXCEPT ALL (SELECT * FROM union_distinct_input_mv));
+----
+0
+
+statement ok
+CREATE VIEW self_union_distinct_input_expected AS WITH n AS (SELECT id,k FROM distinct_a UNION SELECT id,k FROM distinct_a), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW self_union_distinct_input_mv AS WITH n AS (SELECT id,k FROM distinct_a UNION SELECT id,k FROM distinct_a), p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k) SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+query I
+SELECT CAST(type IN (2,6) AS INTEGER) FROM openivm_views WHERE view_sql_name='self_union_distinct_input_mv';
+----
+1
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_mv) EXCEPT ALL (SELECT * FROM self_union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_expected) EXCEPT ALL (SELECT * FROM self_union_distinct_input_mv));
+----
+0
+
+statement ok
+CREATE VIEW distinct_join_expected AS WITH p AS (SELECT DISTINCT a.id,COALESCE(b.v,a.k,0) AS lookup_key FROM distinct_a a FULL JOIN distinct_b b ON a.k=b.k) SELECT p.id,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_join_mv AS WITH p AS (SELECT DISTINCT a.id,COALESCE(b.v,a.k,0) AS lookup_key FROM distinct_a a FULL JOIN distinct_b b ON a.k=b.k) SELECT p.id,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k;
+
+query I
+SELECT CAST(type IN (2,6) AS INTEGER) FROM openivm_views WHERE view_sql_name='distinct_join_mv';
+----
+1
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_mv) EXCEPT ALL (SELECT * FROM distinct_join_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_expected) EXCEPT ALL (SELECT * FROM distinct_join_mv));
+----
+0
+
+statement ok
+UPDATE distinct_d SET label='temporary' WHERE k=2;
+
+statement ok
+INSERT INTO distinct_d VALUES(2,'transient');
+
+statement ok
+DELETE FROM distinct_d WHERE label='transient';
+
+statement ok
+UPDATE distinct_d SET label='new' WHERE k=2;
+
+statement ok
+PRAGMA refresh('distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_mv) EXCEPT ALL (SELECT * FROM distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_expected) EXCEPT ALL (SELECT * FROM distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_mv) EXCEPT ALL (SELECT * FROM union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_expected) EXCEPT ALL (SELECT * FROM union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('self_union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_mv) EXCEPT ALL (SELECT * FROM self_union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_expected) EXCEPT ALL (SELECT * FROM self_union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('distinct_join_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_mv) EXCEPT ALL (SELECT * FROM distinct_join_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_expected) EXCEPT ALL (SELECT * FROM distinct_join_mv));
+----
+0
+
+statement ok
+DELETE FROM distinct_a WHERE id=1;
+
+statement ok
+INSERT INTO distinct_a VALUES(1,1),(4,4),(5,5);
+
+statement ok
+UPDATE distinct_a SET k=6 WHERE id=5;
+
+statement ok
+DELETE FROM distinct_a WHERE id=5;
+
+statement ok
+UPDATE distinct_a SET k=2 WHERE id=4;
+
+statement ok
+PRAGMA refresh('distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_mv) EXCEPT ALL (SELECT * FROM distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_expected) EXCEPT ALL (SELECT * FROM distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_mv) EXCEPT ALL (SELECT * FROM union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_expected) EXCEPT ALL (SELECT * FROM union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('self_union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_mv) EXCEPT ALL (SELECT * FROM self_union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_expected) EXCEPT ALL (SELECT * FROM self_union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('distinct_join_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_mv) EXCEPT ALL (SELECT * FROM distinct_join_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_expected) EXCEPT ALL (SELECT * FROM distinct_join_mv));
+----
+0
+
+statement ok
+DELETE FROM distinct_c WHERE id=1;
+
+statement ok
+DELETE FROM distinct_a WHERE id=1;
+
+statement ok
+INSERT INTO distinct_c VALUES(3,3),(7,7);
+
+statement ok
+UPDATE distinct_c SET k=8 WHERE id=7;
+
+statement ok
+DELETE FROM distinct_c WHERE id=7;
+
+statement ok
+UPDATE distinct_b SET v=9 WHERE k=1;
+
+statement ok
+DELETE FROM distinct_b WHERE k=1;
+
+statement ok
+INSERT INTO distinct_b VALUES(4,4);
+
+statement ok
+PRAGMA refresh('distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_mv) EXCEPT ALL (SELECT * FROM distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_input_expected) EXCEPT ALL (SELECT * FROM distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_mv) EXCEPT ALL (SELECT * FROM union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM union_distinct_input_expected) EXCEPT ALL (SELECT * FROM union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('self_union_distinct_input_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_mv) EXCEPT ALL (SELECT * FROM self_union_distinct_input_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM self_union_distinct_input_expected) EXCEPT ALL (SELECT * FROM self_union_distinct_input_mv));
+----
+0
+
+statement ok
+PRAGMA refresh('distinct_join_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_mv) EXCEPT ALL (SELECT * FROM distinct_join_expected));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_join_expected) EXCEPT ALL (SELECT * FROM distinct_join_mv));
+----
+0

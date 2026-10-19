@@ -582,6 +582,47 @@ DELETE FROM arm_a WHERE id=3;
                 base_query,
             )
 
+        for name, source in (
+            ("distinct_nested_outer_input", "SELECT DISTINCT id,k FROM distinct_a"),
+            ("union_distinct_nested_outer_input", "SELECT id,k FROM distinct_a UNION SELECT id,k FROM distinct_c"),
+        ):
+            base_query = f"""WITH n AS ({source}),
+    p AS (SELECT n.id,COALESCE(b.v,n.k,0) AS lookup_key,b.v FROM n FULL JOIN distinct_b b ON n.k=b.k)
+    SELECT p.id,p.v,d.label FROM p FULL JOIN distinct_d d ON p.lookup_key=d.k"""
+            run_scenario(
+                binary,
+                root,
+                name,
+                f"""
+    CREATE TABLE distinct_a(id INT,k INT);
+    CREATE TABLE distinct_c(id INT,k INT);
+    CREATE TABLE distinct_b(k INT,v INT);
+    CREATE TABLE distinct_d(k INT,label VARCHAR);
+    INSERT INTO distinct_a VALUES(1,1),(1,1),(2,2),(3,3);
+    INSERT INTO distinct_c VALUES(1,1),(2,2);
+    INSERT INTO distinct_b VALUES(1,2),(2,3);
+    INSERT INTO distinct_d VALUES(0,'default'),(1,'one'),(2,'two'),(3,'three');
+    CREATE MATERIALIZED VIEW distinct_mv AS {base_query};
+    DELETE FROM distinct_c WHERE id=1;
+    DELETE FROM distinct_a WHERE id=1;
+    INSERT INTO distinct_a VALUES(1,1),(4,4),(5,5);
+    UPDATE distinct_a SET k=6 WHERE id=5;
+    DELETE FROM distinct_a WHERE id=5;
+    UPDATE distinct_a SET k=2 WHERE id=4;
+    UPDATE distinct_b SET v=99 WHERE k=1;
+    DELETE FROM distinct_b WHERE k=1;
+    INSERT INTO distinct_b VALUES(4,4);
+    UPDATE distinct_d SET label='new' WHERE k=2;
+    """,
+                "distinct_mv",
+                {
+                    "target_dialect": "duckdb",
+                    "compile_only": True,
+                    "force_view_delta_cascade": True,
+                },
+                base_query,
+            )
+
     print("regular N-term compiled SQL integration tests passed")
 
 

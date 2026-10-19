@@ -79,6 +79,13 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 		return false;
 	}
 	auto &child = node->children[0];
+	if (child->type == LogicalOperatorType::LOGICAL_UNION) {
+		// DuckDB represents UNION DISTINCT with both a DISTINCT wrapper and
+		// a set-operation flag. The counting aggregate now owns deduplication;
+		// retaining the flag also deduplicates hidden per-source markers and
+		// prevents the UNION ALL delta rule from compiling this input.
+		child->Cast<LogicalSetOperation>().setop_all = true;
+	}
 	child->ResolveOperatorTypes();
 	auto child_bindings = child->GetColumnBindings();
 	auto child_types = child->types;
@@ -1296,8 +1303,9 @@ static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan, bool 
 	return bindings;
 }
 
-static void PropagateBindingThroughOperatorPath(Binder &binder, unique_ptr<LogicalOperator> &plan,
-                                                ColumnBinding &binding, LogicalType &type, const string &alias = "") {
+static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &binder,
+                                                unique_ptr<LogicalOperator> &plan, ColumnBinding &binding,
+                                                LogicalType &type, const string &alias = "") {
 	plan->ResolveOperatorTypes();
 	auto top_bindings = plan->GetColumnBindings();
 	auto top_types = plan->types;
@@ -1354,6 +1362,20 @@ static void PropagateBindingThroughOperatorPath(Binder &binder, unique_ptr<Logic
 				current = ColumnBinding(projection.table_index, projection.expressions.size() - 1);
 			}
 			projection.ResolveOperatorTypes();
+		} else if (entry.op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+			auto &aggregate = entry.op->Cast<LogicalAggregate>();
+			// Presence is an existential property of the group. Grouping by an
+			// arm's marker would split duplicates contributed by different arms.
+			D_ASSERT(type == LogicalType::BOOLEAN && StringUtil::StartsWith(alias, openivm::FULL_SCOPE_PREFIX));
+			auto function = BindAggregateByName(context, "bool_or", {type});
+			vector<unique_ptr<Expression>> arguments;
+			arguments.push_back(make_uniq<BoundColumnRefExpression>(type, current));
+			auto present = make_uniq<BoundAggregateExpression>(std::move(function), std::move(arguments), nullptr,
+			                                                   nullptr, AggregateType::NON_DISTINCT);
+			present->alias = alias;
+			current = ColumnBinding(aggregate.aggregate_index, aggregate.expressions.size());
+			aggregate.expressions.push_back(std::move(present));
+			aggregate.ResolveOperatorTypes();
 		} else if (entry.op->type == LogicalOperatorType::LOGICAL_UNION) {
 			auto &setop = entry.op->Cast<LogicalSetOperation>();
 			auto bindings = setop.children[entry.child_idx]->GetColumnBindings();
@@ -1410,7 +1432,8 @@ static void PropagateBindingThroughOperatorPath(Binder &binder, unique_ptr<Logic
 
 /// Add openivm_left_key (and openivm_right_key for FULL OUTER) projection at
 /// the top of the plan.
-static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan, const OuterJoinBindings &outer_join) {
+static void RewriteLeftJoinKey(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan,
+                               const OuterJoinBindings &outer_join) {
 	bool is_full_outer = outer_join.is_full_outer;
 	auto key_binding = outer_join.preserved_key_binding;
 	auto key_type = outer_join.preserved_key_type;
@@ -1421,9 +1444,9 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
 	// filters with projection maps, and CTE/projection stacks can hide either key
 	// before the top of the plan. Push both keys through the operator path first,
 	// then build one final projection that exposes user columns plus hidden keys.
-	PropagateBindingThroughOperatorPath(binder, plan, key_binding, key_type);
+	PropagateBindingThroughOperatorPath(context, binder, plan, key_binding, key_type);
 	if (is_full_outer) {
-		PropagateBindingThroughOperatorPath(binder, plan, right_key_binding, right_key_type);
+		PropagateBindingThroughOperatorPath(context, binder, plan, right_key_binding, right_key_type);
 	}
 
 	auto top_bindings = plan->GetColumnBindings();
@@ -1577,7 +1600,7 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 		return;
 	}
 
-	RewriteLeftJoinKey(binder, plan, outer_join);
+	RewriteLeftJoinKey(context, binder, plan, outer_join);
 
 	// Nested outer joins can change an ancestor's computed key when they start
 	// NULL-padding. Presence columns let key discovery retain only rows from
@@ -1623,7 +1646,7 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 				LogicalType type = LogicalType::BOOLEAN;
 				// Source participation is needed inside the scoped input only;
 				// it is not an extra persisted output of the materialized view.
-				PropagateBindingThroughOperatorPath(binder, input, source.first, type, source.second);
+				PropagateBindingThroughOperatorPath(context, binder, input, source.first, type, source.second);
 			}
 		}
 	}
@@ -1635,7 +1658,7 @@ static void RewriteOuterJoinSupport(ClientContext &context, Binder &binder, uniq
 			auto presence =
 			    AddScopePresence(binder, plan, child, name, (side == 0 ? condition.left : condition.right).get());
 			LogicalType type = LogicalType::BOOLEAN;
-			PropagateBindingThroughOperatorPath(binder, plan, presence, type, name);
+			PropagateBindingThroughOperatorPath(context, binder, plan, presence, type, name);
 			auto &root = plan->Cast<LogicalProjection>();
 			D_ASSERT(presence.table_index == root.table_index);
 			root.expressions[presence.column_index]->alias = name;
