@@ -121,6 +121,8 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
 | `openivm_metadata_schema` | VARCHAR | empty | Schema for OpenIVM control metadata in each native catalog. Empty keeps existing metadata where it is (`main` for new metadata); a schema name moves existing metadata there on the next `CREATE MATERIALIZED VIEW` or refresh | [Metadata placement](docs/internals/metadata-placement.md) |
 | `openivm_internal_schema` | VARCHAR | empty | Schema for internal maintenance tables (backing, publication, auxiliary-state and delta tables) within each data catalog. Empty keeps them beside the MV and its sources; applies to objects created while set | [Metadata placement](docs/internals/metadata-placement.md#internal-maintenance-objects) |
 | `openivm_files_path` | VARCHAR | — | Directory for compiled SQL reference files (off when unset) | [Build: inspect SQL](docs/build/building.md#inspect-the-generated-sql) |
+| `openivm_archive_compiled_sql` | BOOLEAN | `false` | Store executed CREATE and refresh programs in metadata tables; independent of file export | [Compiled SQL archive](docs/build/building.md#archived-compiled-sql) |
+| `openivm_compiled_sql_retention` | BIGINT | `10` | Latest distinct archived programs per view and operation; at least 1 | [Compiled SQL archive](docs/build/building.md#archived-compiled-sql) |
 | `openivm_metadata_catalog` | VARCHAR | `""` | Database-wide attached catalog for OpenIVM metadata (native DuckDB, or PostgreSQL via `TYPE postgres`); empty keeps metadata next to each native view catalog | [Metadata placement](docs/internals/metadata-placement.md) |
 | `openivm_metadata_lease_seconds` | BIGINT | `600` | Refresh lease for clients sharing a PostgreSQL metadata catalog | [Metadata placement](docs/internals/metadata-placement.md) |
 | `openivm_explain_initial_load` | BOOLEAN | `false` | Print the `CREATE MATERIALIZED VIEW` initial-load SQL and its `EXPLAIN` plans | [Build: inspect SQL](docs/build/building.md#inspect-the-generated-sql) |
@@ -191,6 +193,10 @@ MVs can be created using any SQL construct. Unsupported operators automatically 
   that frontend and reattach the same lake under the same name in later sessions.
   Use `openivm_metadata_catalog` and `openivm_metadata_schema` for
   [custom metadata placement](docs/internals/metadata-placement.md), including PostgreSQL.
+- **Can the frontend run without a local database file?** Yes, with persistent
+  metadata in an attached catalog. Reattach the lake and metadata catalog and
+  select the metadata location on every startup. See the
+  [startup sequence](docs/ducklake.md#running-without-a-persistent-frontend-file).
 - **Can control metadata use its own schema?** Yes: `SET openivm_metadata_schema = 'openivm'`.
   Existing metadata is found where it lives and moved automatically by the next
   `CREATE MATERIALIZED VIEW` or refresh; do not move OpenIVM tables by hand. See

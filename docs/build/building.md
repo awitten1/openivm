@@ -225,7 +225,8 @@ FROM openivm_compiled_programs ORDER BY view_name, operation, version;
 SELECT s.stmt_order, s.sql
 FROM openivm_compiled_statements s
 JOIN openivm_compiled_programs p USING (view_name, operation, version)
-WHERE p.view_sql_name = 'regional_totals' AND p.operation = 'refresh'
+WHERE p.view_catalog = current_database() AND p.view_schema = 'main'
+  AND p.view_sql_name = 'regional_totals' AND p.operation = 'refresh'
   AND p.version = (SELECT max(version) FROM openivm_compiled_programs
                    WHERE view_name = p.view_name AND operation = 'refresh')
 ORDER BY s.stmt_order;

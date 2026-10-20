@@ -97,12 +97,8 @@ To keep the control tables elsewhere, select a metadata catalog and schema befor
 creating views. The catalog can be another attached DuckDB file or a PostgreSQL
 database attached with the `postgres` extension:
 
-```sql
-ATTACH 'dbname=openivm host=localhost' AS control (TYPE postgres);
-SET openivm_metadata_catalog = 'control';
-SET openivm_metadata_schema = 'openivm';
-CREATE MATERIALIZED VIEW dl.main.product_summary AS ...;
-```
+The [startup sequence below](#running-without-a-persistent-frontend-file) shows
+the settings and attachment order for PostgreSQL control metadata.
 
 Backing and delta tables still live in the lake. DuckLake catalogs cannot hold the
 location marker, so OpenIVM records it in the frontend database: a persistent frontend
@@ -127,6 +123,56 @@ cancels that cleanup. Cleanup retains changes needed by other consumers, includi
 MVs whose metadata lives in another native catalog. If cleanup encounters a
 conflict, OpenIVM reports that the refresh committed and cleanup was deferred;
 the committed watermark prevents those retained changes from being applied twice.
+
+### Running without a persistent frontend file
+
+Launch the built CLI without a database filename:
+
+```bash
+./build/release/duckdb
+```
+
+The frontend is now in memory. Attach your existing lake as `dl`, then attach
+the persistent control database and select its metadata schema before creating
+or refreshing views. For example, with PostgreSQL control metadata:
+
+```sql
+INSTALL postgres;
+LOAD postgres;
+ATTACH 'dbname=openivm host=localhost' AS control (TYPE postgres);
+SET openivm_metadata_catalog = 'control';
+SET openivm_metadata_schema = 'openivm';
+SET openivm_internal_schema = 'openivm_internal';
+SET openivm_archive_compiled_sql = true;
+SET openivm_compiled_sql_retention = 1;
+```
+
+Replace the connection string with your control database's connection details.
+On first setup, create the lake's MVs after these settings. Internal tables are
+created in `openivm_internal` of the lake; user-facing MVs keep their requested
+schemas. This setting does not move internal tables of existing MVs.
+
+On subsequent startups, reattach the same lake and control database under the
+same aliases and repeat the settings. Then refresh the existing MV directly:
+
+```sql
+PRAGMA refresh('dl.observation.product_summary');
+
+SELECT view_catalog, view_schema, view_sql_name, operation, version,
+       statement_count, last_outcome
+FROM control.openivm.openivm_compiled_programs
+WHERE view_catalog = 'dl' AND view_schema = 'observation'
+  AND view_sql_name = 'product_summary'
+ORDER BY operation, version;
+```
+
+The metadata and SQL archive survive closing the CLI because they are in the
+control database. The in-memory frontend's discovery marker does not survive,
+which is why the attachment aliases and metadata settings must be restored.
+Leave `openivm_files_path` unset to avoid compiled SQL files. Run lifecycle and
+refresh statements in autocommit mode when control metadata is separate from
+the lake. Remote metadata still requires a client running OpenIVM; publishing
+the extension does not install it in a managed service's server processes.
 
 ### Empty delta tables
 
