@@ -1257,7 +1257,8 @@ CREATE MATERIALIZED VIEW controls_file AS SELECT * FROM controls_src;
 
 query I
 SELECT count(*) FROM glob('__TEST_DIR__/openivm_compiled_queries_*.sql')
-WHERE file = '__TEST_DIR__/openivm_compiled_queries_' ||
+WHERE replace(file, chr(92), '/') = replace('__TEST_DIR__', chr(92), '/') ||
+      '/openivm_compiled_queries_' ||
       (SELECT view_name FROM openivm_views WHERE view_sql_name='controls_file') || '.sql';
 ----
 1
