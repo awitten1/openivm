@@ -63,11 +63,24 @@ static void Execute(Connection &con, const string &sql) {
 	std::cerr << "DONE " << SqlUtils::SQLStatementPreview(sql) << std::endl;
 }
 
+static void CheckBag(Connection &con, const string &actual, const string &expected, const string &message) {
+	Execute(con, "SELECT CASE WHEN EXISTS (" + actual + " EXCEPT ALL " + expected + ") OR EXISTS (" + expected +
+	                 " EXCEPT ALL " + actual + ") THEN error(" + Value(message).ToSQLString() + ") ELSE true END;");
+}
+
+static void ExecuteBatch(Connection &con, const vector<string> &statements, bool batched) {
+	if (batched) {
+		Execute(con, StringUtil::Join(statements, "; ") + ";");
+	} else {
+		for (auto &sql : statements) {
+			Execute(con, sql + ";");
+		}
+	}
+}
+
 static void RefreshAndCheckBag(Connection &owner, const string &view, const string &query) {
 	Execute(owner, "PRAGMA refresh(" + Value(view).ToSQLString() + ");");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + query + ") OR EXISTS (" + query +
-	                   " EXCEPT ALL SELECT * FROM " + view +
-	                   ") THEN error('Publication owner survivor bag mismatch') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM " + view, query, "Publication owner survivor bag mismatch");
 }
 
 static void TestQuotedNamespaceNormalization() {
@@ -298,10 +311,8 @@ static void TestInternalSchemaReopen(const string &path) {
 		for (const auto &view : vector<string> {"original", "after_reopen"}) {
 			auto qualified = SqlUtils::QuoteIdentifier("Source.Space") + "." + SqlUtils::QuoteIdentifier(view);
 			Execute(owner, "PRAGMA refresh(" + Value(qualified).ToSQLString() + ");");
-			Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + qualified +
-			                   " EXCEPT ALL SELECT * FROM \"Source.Space\".items) "
-			                   "OR EXISTS (SELECT * FROM \"Source.Space\".items EXCEPT ALL SELECT * FROM " +
-			                   qualified + ") THEN error('Reopened MV bag mismatch') ELSE true END;");
+			CheckBag(owner, "SELECT * FROM " + qualified, "SELECT * FROM \"Source.Space\".items",
+			         "Reopened MV bag mismatch");
 		}
 		Execute(owner, "DROP VIEW \"Source.Space\".original; DROP VIEW \"Source.Space\".after_reopen;");
 		Execute(owner, "SELECT CASE WHEN "
@@ -380,10 +391,7 @@ static void TestPublication(bool explicit_transaction) {
 	}
 	for (const auto &view : views) {
 		Execute(observer, "PRAGMA refresh('" + string(view) + "');");
-		Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM " + string(view) +
-		                      " EXCEPT ALL SELECT * FROM source) OR EXISTS (SELECT * FROM source EXCEPT ALL "
-		                      "SELECT * FROM " +
-		                      string(view) + ") THEN error('Concurrent MV bag mismatch') ELSE true END;");
+		CheckBag(observer, "SELECT * FROM " + string(view), "SELECT * FROM source", "Concurrent MV bag mismatch");
 	}
 }
 
@@ -545,9 +553,7 @@ static void TestDMLWithInvisibleDelta(bool dedicated_schema) {
 		throw InvalidInputException("DML with an invisible committed delta must request a transaction retry");
 	}
 	Execute(writer, "ROLLBACK;");
-	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM (VALUES (1),(1),(2))) "
-	                  "OR EXISTS (SELECT * FROM (VALUES (1),(1),(2)) EXCEPT ALL SELECT * FROM source) "
-	                  "THEN error('Rejected DML changed its source') ELSE true END;");
+	CheckBag(observer, "SELECT * FROM source", "SELECT * FROM (VALUES (1),(1),(2))", "Rejected DML changed its source");
 	Execute(writer, "BEGIN; INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
 	                "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (5),(5); "
 	                "DELETE FROM source WHERE i=5; COMMIT;");
@@ -620,9 +626,8 @@ static void TestPlanningOnlySourceAdmission(bool dedicated_schema, bool tracked,
 		Execute(writer, "DROP VIEW prior_mv;");
 	}
 	Execute(creator, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source; COMMIT;");
-	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM (VALUES (1),(1),(2))) "
-	                  "OR EXISTS (SELECT * FROM (VALUES (1),(1),(2)) EXCEPT ALL SELECT * FROM source) "
-	                  "THEN error('Planning-only DML changed its source') ELSE true END;");
+	CheckBag(observer, "SELECT * FROM source", "SELECT * FROM (VALUES (1),(1),(2))",
+	         "Planning-only DML changed its source");
 	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
 	Execute(observer, ConflictingSourceDML("source"));
 	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
@@ -838,14 +843,11 @@ static void TestIndependentUntrackedWriters(bool cross_catalog, bool commit, boo
 	if (!completed) {
 		throw InvalidInputException("Independent untracked writer could not commit while another remained open");
 	}
-	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM " + independent +
-	                      " EXCEPT ALL SELECT * FROM (VALUES (3),(3),(4),(4))) OR EXISTS "
-	                      "(SELECT * FROM (VALUES (3),(3),(4),(4)) EXCEPT ALL SELECT * FROM " +
-	                      independent + ") THEN error('Independent writer lost committed rows') ELSE true END;");
+	CheckBag(observer, "SELECT * FROM " + independent, "SELECT * FROM (VALUES (3),(3),(4),(4))",
+	         "Independent writer lost committed rows");
 	const string expected = commit ? "(VALUES (3),(3),(4),(4))" : "(VALUES (1),(1),(2))";
-	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM " + source + " EXCEPT ALL SELECT * FROM " + expected +
-	                      ") OR EXISTS (SELECT * FROM " + expected + " EXCEPT ALL SELECT * FROM " + source +
-	                      ") THEN error('Open untracked writer lost commit/rollback isolation') ELSE true END;");
+	CheckBag(observer, "SELECT * FROM " + source, "SELECT * FROM " + expected,
+	         "Open untracked writer lost commit/rollback isolation");
 	Execute(first, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM " + source + ";");
 	Execute(observer, ConflictingSourceDML(source) + ConflictingSourceDML(independent));
 	RefreshAndCheckBag(observer, "mv", "SELECT * FROM " + source);
@@ -876,11 +878,8 @@ static void TestIndependentWriterDuringPublication(bool dedicated_schema, bool c
 	competing.get();
 	ExecuteStagedDDL(*creator.context, planned.parameters);
 	creator.context->transaction.Commit();
-	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM " + independent +
-	                      " EXCEPT ALL SELECT * FROM (VALUES (3),(3),(4),(4))) OR EXISTS "
-	                      "(SELECT * FROM (VALUES (3),(3),(4),(4)) EXCEPT ALL SELECT * FROM " +
-	                      independent +
-	                      ") THEN error('Independent publication writer lost committed rows') ELSE true END;");
+	CheckBag(observer, "SELECT * FROM " + independent, "SELECT * FROM (VALUES (3),(3),(4),(4))",
+	         "Independent publication writer lost committed rows");
 	Execute(observer, ConflictingSourceDML(source));
 	RefreshAndCheckBag(observer, "mv", "SELECT * FROM " + source);
 	Execute(observer, "DROP VIEW mv;");
@@ -903,10 +902,8 @@ static void TestConcurrentUntrackedAppends() {
 	if (!completed) {
 		throw InvalidInputException("Source admission serialized nonconflicting writers of one untracked source");
 	}
-	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM source EXCEPT ALL "
-	                  "SELECT * FROM (VALUES (1),(1),(2),(10),(10),(20),(20))) OR EXISTS "
-	                  "(SELECT * FROM (VALUES (1),(1),(2),(10),(10),(20),(20)) EXCEPT ALL SELECT * FROM source) "
-	                  "THEN error('Concurrent untracked appends lost rows') ELSE true END;");
+	CheckBag(observer, "SELECT * FROM source", "SELECT * FROM (VALUES (1),(1),(2),(10),(10),(20),(20))",
+	         "Concurrent untracked appends lost rows");
 	Execute(observer, "CREATE MATERIALIZED VIEW mv AS SELECT * FROM source; " + ConflictingSourceDML("source"));
 	RefreshAndCheckBag(observer, "mv", "SELECT * FROM source");
 	Execute(observer, "DROP VIEW mv;");
@@ -1048,9 +1045,7 @@ static void TestDropDuringPublication(bool explicit_transaction, bool staged_dro
 	                  "ELSE error('Surviving source delta did not capture batched DML') END "
 	                  "FROM \"Internal Space\".openivm_delta_6d61696e_source;");
 	Execute(observer, "PRAGMA refresh('second_mv');");
-	Execute(observer, "SELECT CASE WHEN EXISTS (SELECT * FROM second_mv EXCEPT ALL SELECT * FROM source) "
-	                  "OR EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM second_mv) "
-	                  "THEN error('CREATE versus DROP MV bag mismatch') ELSE true END;");
+	CheckBag(observer, "SELECT * FROM second_mv", "SELECT * FROM source", "CREATE versus DROP MV bag mismatch");
 }
 
 // Lookup must finish after schema enumeration releases its lock, and preserve
@@ -1083,9 +1078,8 @@ static void TestSourceDeltaLookup() {
 		                   " WHERE i=1; UPDATE " + view.second + " SET i=4 WHERE i=2; INSERT INTO " + view.second +
 		                   " VALUES (1),(4),(5); DELETE FROM " + view.second + " WHERE i=5;");
 		Execute(owner, "PRAGMA refresh('" + view.first + "');");
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view.first + " EXCEPT ALL SELECT * FROM " +
-		                   view.second + ") OR EXISTS (SELECT * FROM " + view.second + " EXCEPT ALL SELECT * FROM " +
-		                   view.first + ") THEN error('Source delta lookup MV bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + view.first, "SELECT * FROM " + view.second,
+		         "Source delta lookup MV bag mismatch");
 	}
 }
 
@@ -1126,9 +1120,7 @@ static void TestSharedMetadataUpgrade(bool explicit_transaction, bool commit) {
 	               "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (1),(4),(5); "
 	               "DELETE FROM source WHERE i=5;");
 	Execute(owner, "PRAGMA refresh('mv');");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM mv EXCEPT ALL SELECT * FROM source) "
-	               "OR EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM mv) "
-	               "THEN error('Upgraded registry MV bag mismatch') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM mv", "SELECT * FROM source", "Upgraded registry MV bag mismatch");
 	Execute(owner, "DROP VIEW mv;");
 	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Upgraded registry cleanup leaked') END "
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
@@ -1182,9 +1174,8 @@ static void TestDeltaOwnershipSearchPath(bool replay) {
 	               "DELETE FROM \"Source.Space\".source WHERE i=1; "
 	               "UPDATE \"Source.Space\".source SET i=4 WHERE i=2;");
 	Execute(owner, "PRAGMA refresh('mv');");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM mv EXCEPT ALL SELECT * FROM \"Source.Space\".source) "
-	               "OR EXISTS (SELECT * FROM \"Source.Space\".source EXCEPT ALL SELECT * FROM mv) "
-	               "THEN error('Ownership search-path survivor bag mismatch') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM mv", "SELECT * FROM \"Source.Space\".source",
+	         "Ownership search-path survivor bag mismatch");
 	Execute(owner, "DROP VIEW mv;");
 	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Ownership search-path cleanup leaked') END "
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
@@ -1219,9 +1210,7 @@ static void TestDeferredScratchDrop(bool explicit_transaction, bool commit, bool
 	                   "SELECT CASE WHEN count(*)=0 THEN true "
 	                   "ELSE error('Deferred scratch DROP lost temporary identity') END "
 	                   "FROM duckdb_tables() WHERE temporary AND table_name='Scratch;Name';");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM main.\"Scratch;Name\" EXCEPT ALL SELECT 99) "
-	               "OR EXISTS (SELECT 99 EXCEPT ALL SELECT * FROM main.\"Scratch;Name\") "
-	               "THEN error('Scratch DROP removed the persistent namesake') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM main.\"Scratch;Name\"", "SELECT 99", "Scratch DROP removed the persistent namesake");
 	// Exercise the same resolved-target round trip for VIEW, with a persistent
 	// namesake outside the active search path just as for TABLE above.
 	auto view_drop = executor_drop ? "SELECT * FROM openivm_execute_drop_view('', '', 'Scratch;View', false, false); "
@@ -1230,9 +1219,8 @@ static void TestDeferredScratchDrop(bool explicit_transaction, bool commit, bool
 	                   "SELECT CASE WHEN count(*)=0 THEN true "
 	                   "ELSE error('Deferred scratch VIEW DROP lost temporary identity') END "
 	                   "FROM duckdb_views() WHERE temporary AND view_name='Scratch;View';");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM main.\"Scratch;View\" EXCEPT ALL SELECT 99) "
-	               "OR EXISTS (SELECT 99 EXCEPT ALL SELECT * FROM main.\"Scratch;View\") "
-	               "THEN error('Scratch VIEW DROP removed the persistent namesake') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM main.\"Scratch;View\"", "SELECT 99",
+	         "Scratch VIEW DROP removed the persistent namesake");
 	Execute(owner, "DROP TABLE IF EXISTS \"Missing;Scratch\"; SELECT 1;");
 	Execute(owner, "SELECT * FROM openivm_execute_drop_table('', '', 'Missing;Scratch', false, true);");
 	Execute(owner, "SELECT * FROM openivm_execute_drop_view('', '', 'Missing;Scratch', false, true);");
@@ -1243,9 +1231,8 @@ static void TestDeferredScratchDrop(bool explicit_transaction, bool commit, bool
 	               "UPDATE main.source SET i=4 WHERE i=2; INSERT INTO main.source VALUES (1),(4),(5); "
 	               "DELETE FROM main.source WHERE i=5;");
 	Execute(owner, "PRAGMA refresh('main.mv');");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM main.mv EXCEPT ALL SELECT * FROM main.source) "
-	               "OR EXISTS (SELECT * FROM main.source EXCEPT ALL SELECT * FROM main.mv) "
-	               "THEN error('Deferred scratch DROP publication bag mismatch') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM main.mv", "SELECT * FROM main.source",
+	         "Deferred scratch DROP publication bag mismatch");
 	Execute(owner, "DROP VIEW main.mv; SELECT 1;");
 }
 
@@ -1300,9 +1287,7 @@ static void TestMetadataReplayMutationOwner(bool commit) {
 	               "UPDATE source SET i=4 WHERE i=2; INSERT INTO source VALUES (4),(5),(5); "
 	               "DELETE FROM source WHERE i=5;");
 	Execute(owner, "PRAGMA refresh('mv');");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM mv EXCEPT ALL SELECT * FROM source) "
-	               "OR EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM mv) "
-	               "THEN error('Metadata replay damaged surviving MV') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM mv", "SELECT * FROM source", "Metadata replay damaged surviving MV");
 	Execute(owner, "DROP VIEW mv;");
 	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Metadata replay cleanup leaked') END "
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
@@ -1356,9 +1341,7 @@ static void TestMetadataReplayLocations() {
 	};
 	for (const auto &view : views) {
 		Execute(owner, "PRAGMA refresh('" + view.first + "');");
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view.first + " EXCEPT ALL " + view.second +
-		                   ") OR EXISTS (" + view.second + " EXCEPT ALL SELECT * FROM " + view.first +
-		                   ") THEN error('Catalog replay rollback MV bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + view.first, view.second, "Catalog replay rollback MV bag mismatch");
 	}
 }
 
@@ -1390,10 +1373,8 @@ static void TestCrossCatalogSharedDelta(bool dedicated_schema, bool commit) {
 	               "AS SELECT * FROM \"Source.Space\".a; "
 	               "CREATE MATERIALIZED VIEW \"Consumer.Catalog\".main.new_mv AS SELECT * FROM \"Source.Space\".a;");
 	for (const auto &view : vector<string> {"mv", "new_mv"}) {
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM \"Consumer.Catalog\".main." + view +
-		                   " EXCEPT ALL SELECT * FROM \"Source.Space\".a) OR EXISTS "
-		                   "(SELECT * FROM \"Source.Space\".a EXCEPT ALL SELECT * FROM \"Consumer.Catalog\".main." +
-		                   view + ") THEN error('Cross-catalog initial load bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM \"Consumer.Catalog\".main." + view, "SELECT * FROM \"Source.Space\".a",
+		         "Cross-catalog initial load bag mismatch");
 	}
 	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
 	Execute(owner, "SELECT CASE WHEN count(*)=" + string(commit ? "1" : "0") +
@@ -1416,11 +1397,8 @@ static void TestCrossCatalogSharedDelta(bool dedicated_schema, bool commit) {
 	}
 	for (const auto &view : survivors) {
 		Execute(owner, "PRAGMA refresh(" + Value(view.first).ToSQLString() + ");");
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view.first +
-		                   " EXCEPT ALL SELECT * FROM \"Source.Space\"." + view.second +
-		                   ") OR EXISTS (SELECT * FROM \"Source.Space\"." + view.second + " EXCEPT ALL SELECT * FROM " +
-		                   view.first +
-		                   ") THEN error('Cross-catalog shared delta refresh bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + view.first, "SELECT * FROM \"Source.Space\"." + view.second,
+		         "Cross-catalog shared delta refresh bag mismatch");
 	}
 	for (const auto &view : survivors) {
 		Execute(owner, "DROP VIEW " + view.first + ";");
@@ -1540,10 +1518,8 @@ static void TestMetadataQueryText(bool explicit_transaction, bool commit) {
 		return "SELECT * FROM (" + queries[index] + ") expected";
 	};
 	auto check_initial = [&](idx_t index) {
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view_name(index) + " EXCEPT ALL " +
-		                   expected_query(index) + ") OR EXISTS (" + expected_query(index) +
-		                   " EXCEPT ALL SELECT * FROM " + view_name(index) +
-		                   ") THEN error('Metadata qualification changed initial query results') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + view_name(index), expected_query(index),
+		         "Metadata qualification changed initial query results");
 	};
 	for (idx_t i = 0; i < queries.size(); i++) {
 		Execute(owner, "CREATE MATERIALIZED VIEW " + view_name(i) + " AS " + queries[i] + ";");
@@ -1922,9 +1898,7 @@ static void CheckSourceWatermarkReplay(Connection &owner, DatabaseInstance &db) 
 	                  durable->GetValue(1, 0).ToSQLString() + "::TIMESTAMP AS last_update, " +
 	                  durable->GetValue(2, 0).ToSQLString() + "::TIMESTAMP AS last_refresh_ts";
 	auto replayed = columns + "openivm_delta_tables d JOIN openivm_views" + predicate;
-	Execute(helper, "SELECT CASE WHEN EXISTS (" + replayed + " EXCEPT ALL " + expected + ") OR EXISTS (" + expected +
-	                    " EXCEPT ALL " + replayed +
-	                    ") THEN error('Source watermark replay changed the caller value') ELSE true END;");
+	CheckBag(helper, replayed, expected, "Source watermark replay changed the caller value");
 }
 
 // Keep an unrelated, later-sorted metadata catalog selected at the end of source
@@ -2033,9 +2007,8 @@ static void TestSourceCascadeConsumerLocations(const string &mutation, bool comm
 	}
 	for (auto &view : surviving) {
 		Execute(owner, "PRAGMA refresh('" + view.first + "');");
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view.first + " EXCEPT ALL " + view.second +
-		                   ") OR EXISTS (" + view.second + " EXCEPT ALL SELECT * FROM " + view.first +
-		                   ") THEN error('Cross-location source CASCADE survivor bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + view.first, view.second,
+		         "Cross-location source CASCADE survivor bag mismatch");
 	}
 	if (commit && !removed) {
 		Execute(owner, "DROP VIEW mv2;");
@@ -2175,9 +2148,8 @@ static void TestStagedCascadeConsumerIdentity() {
 	               "INSERT INTO b VALUES (1),(2),(3),(3); DELETE FROM b WHERE i=1; UPDATE b SET i=4 WHERE i=2; "
 	               "INSERT INTO b VALUES (1),(4),(5); DELETE FROM b WHERE i=5; UPDATE b SET i=2 WHERE i=4;");
 	Execute(owner, "PRAGMA refresh('peer.main.mv1');");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM peer.main.mv1 EXCEPT ALL SELECT * FROM b) "
-	               "OR EXISTS (SELECT * FROM b EXCEPT ALL SELECT * FROM peer.main.mv1) "
-	               "THEN error('Staged CASCADE excluded another catalog consumer') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM peer.main.mv1", "SELECT * FROM b",
+	         "Staged CASCADE excluded another catalog consumer");
 	Execute(owner, "DROP VIEW peer.main.mv1;");
 	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Staged final consumer delta cleanup leaked') END "
 	               "FROM duckdb_tables() WHERE schema_name='Internal Space';");
@@ -2265,9 +2237,7 @@ static void TestBatchedViewDrop(bool explicit_transaction, bool commit, bool dis
 	}
 	for (auto &view : survivors) {
 		Execute(owner, "PRAGMA refresh('" + view.first + "');");
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view.first + " EXCEPT ALL " + view.second +
-		                   ") OR EXISTS (" + view.second + " EXCEPT ALL SELECT * FROM " + view.first +
-		                   ") THEN error('Batched view DROP survivor bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + view.first, view.second, "Batched view DROP survivor bag mismatch");
 	}
 	if (retained) {
 		Execute(owner, "BEGIN; DROP VIEW \"Public.Space\".\"Same.MV\"; "
@@ -2314,9 +2284,8 @@ static void TestSchemaDropPendingAppends(bool commit, bool executor_drop) {
 	    {"main.items",
 	     commit ? "SELECT * FROM (VALUES (3),(3),(3),(3),(4),(4))" : "SELECT * FROM (VALUES (3),(3),(4))"}};
 	for (auto &table : expected) {
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + table.first + " EXCEPT ALL " + table.second +
-		                   ") OR EXISTS (" + table.second + " EXCEPT ALL SELECT * FROM " + table.first +
-		                   ") THEN error('Schema reuse lost committed or restored appends') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + table.first, table.second,
+		         "Schema reuse lost committed or restored appends");
 	}
 	Execute(owner, "INSERT INTO main.items VALUES (1),(2),(3),(3); DELETE FROM main.items WHERE i=1; "
 	               "UPDATE main.items SET i=4 WHERE i=2;");
@@ -2409,9 +2378,7 @@ static void TestSchemaCascade(bool explicit_transaction, bool commit, bool cross
 		}
 		auto expected =
 		    "SELECT i AS g, i, count(*)::BIGINT AS _count FROM " + shared_source + " WHERE i IS NOT NULL GROUP BY i";
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + auxiliary_table + " EXCEPT ALL " + expected +
-		                   ") OR EXISTS (" + expected + " EXCEPT ALL SELECT * FROM " + auxiliary_table +
-		                   ") THEN error('Schema CASCADE auxiliary bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + auxiliary_table, expected, "Schema CASCADE auxiliary bag mismatch");
 	};
 	check_auxiliary_state();
 	auto owned_query = "SELECT database_name, schema_name, table_name FROM duckdb_tables() WHERE " + owned_predicate;
@@ -2582,9 +2549,7 @@ static void TestMixedLifecycleBatch(bool explicit_transaction, bool commit) {
 	    "'Dollar;/*Literal*/' AS dollar_label, 'materialized view' AS keyword_label, "
 	    "'or replace' AS replace_label, 'refresh every ''1 hour''' AS refresh_label FROM source";
 	Execute(owner, "CREATE MATERIALIZED VIEW " + view + " REFRESH EVERY '1 hour' AS " + base_query + ";");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + expected_query +
-	                   ") OR EXISTS (" + expected_query + " EXCEPT ALL SELECT * FROM " + view +
-	                   ") THEN error('Scheduled lifecycle changed literal contents') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM " + view, expected_query, "Scheduled lifecycle changed literal contents");
 	Execute(owner, "CREATE MATERIALIZED VIEW sibling AS SELECT * FROM source;");
 	if (explicit_transaction) {
 		Execute(owner, "BEGIN;");
@@ -2598,9 +2563,7 @@ static void TestMixedLifecycleBatch(bool explicit_transaction, bool commit) {
 	                   "; CREATE /* keyword comment ; */ OR REPLACE MATERIALIZED VIEW " + view + " AS " + base_query +
 	                   "; SELECT CASE WHEN count(*)=5 THEN true ELSE error('Mixed batch reordered DML') END FROM " +
 	                   view + ";");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL " + expected_query +
-	                   ") OR EXISTS (" + expected_query + " EXCEPT ALL SELECT * FROM " + view +
-	                   ") THEN error('Mixed lifecycle initial load bag mismatch') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM " + view, expected_query, "Mixed lifecycle initial load bag mismatch");
 	if (explicit_transaction) {
 		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
 	}
@@ -2609,9 +2572,7 @@ static void TestMixedLifecycleBatch(bool explicit_transaction, bool commit) {
 	               "DELETE FROM source WHERE i=5; UPDATE source SET i=2 WHERE i=4;");
 	for (auto &survivor : vector<pair<string, string>> {{view, expected_query}, {"sibling", "SELECT * FROM source"}}) {
 		Execute(owner, "PRAGMA refresh('" + survivor.first + "');");
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + survivor.first + " EXCEPT ALL " + survivor.second +
-		                   ") OR EXISTS (" + survivor.second + " EXCEPT ALL SELECT * FROM " + survivor.first +
-		                   ") THEN error('Mixed lifecycle survivor bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + survivor.first, survivor.second, "Mixed lifecycle survivor bag mismatch");
 	}
 	Execute(owner, "DROP VIEW " + view + "; DROP VIEW sibling; SELECT 1;");
 	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('Mixed lifecycle final cleanup leaked') END "
@@ -2641,10 +2602,8 @@ static void TestSequentialCreateBatch(bool explicit_transaction, bool commit) {
 	if (ClientConfig::GetConfig(*owner.context).profiler_settings != metrics) {
 		throw InvalidInputException("Lifecycle execution did not restore profiling metrics");
 	}
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM \"Public;Space\".mv EXCEPT ALL "
-	               "SELECT * FROM \"Public;Space\".source) OR EXISTS (SELECT * FROM \"Public;Space\".source "
-	               "EXCEPT ALL SELECT * FROM \"Public;Space\".mv) "
-	               "THEN error('Sequential CREATE initial load mismatch') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM \"Public;Space\".mv", "SELECT * FROM \"Public;Space\".source",
+	         "Sequential CREATE initial load mismatch");
 	if (explicit_transaction) {
 		Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
 	}
@@ -2657,10 +2616,8 @@ static void TestSequentialCreateBatch(bool explicit_transaction, bool commit) {
 	               "DELETE FROM \"Public;Space\".source WHERE i=1; "
 	               "UPDATE \"Public;Space\".source SET i=4 WHERE i=2;");
 	Execute(owner, "PRAGMA refresh('\"Public;Space\".mv');");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM \"Public;Space\".mv EXCEPT ALL "
-	               "SELECT * FROM \"Public;Space\".source) OR EXISTS (SELECT * FROM \"Public;Space\".source "
-	               "EXCEPT ALL SELECT * FROM \"Public;Space\".mv) "
-	               "THEN error('Sequential CREATE refresh bag mismatch') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM \"Public;Space\".mv", "SELECT * FROM \"Public;Space\".source",
+	         "Sequential CREATE refresh bag mismatch");
 	Execute(owner, "DROP VIEW \"Public;Space\".mv; SELECT CASE WHEN count(*)=0 THEN true "
 	               "ELSE error('Sequential CREATE final cleanup leaked') END FROM duckdb_tables() "
 	               "WHERE schema_name='Internal Space';");
@@ -2692,13 +2649,7 @@ static void TestCreateAlterTransaction(bool existing_metadata, bool batched, boo
 	    "SELECT CASE WHEN count(*)=1 THEN true ELSE error('Transaction-local ALTER EVERY failed') END FROM " +
 	        registry + " WHERE " + target_filter + " AND refresh_interval=7200",
 	};
-	if (batched) {
-		Execute(owner, StringUtil::Join(statements, "; ") + ";");
-	} else {
-		for (auto &sql : statements) {
-			Execute(owner, sql + ";");
-		}
-	}
+	ExecuteBatch(owner, statements, batched);
 	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
 	Execute(owner, "SELECT CASE WHEN count(*)=" + string(commit ? "1" : "0") +
 	                   " THEN true ELSE error('CREATE/ALTER transaction outcome mismatch') END FROM duckdb_views() "
@@ -2734,10 +2685,7 @@ static void TestCreateAlterTransaction(bool existing_metadata, bool batched, boo
 	}
 	for (auto &survivor : survivors) {
 		Execute(owner, "PRAGMA refresh(" + Value(survivor).ToSQLString() + ");");
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + survivor +
-		                   " EXCEPT ALL SELECT * FROM main.source) OR EXISTS (SELECT * FROM main.source "
-		                   "EXCEPT ALL SELECT * FROM " +
-		                   survivor + ") THEN error('CREATE/ALTER survivor bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + survivor, "SELECT * FROM main.source", "CREATE/ALTER survivor bag mismatch");
 	}
 	for (auto &survivor : survivors) {
 		Execute(owner, "DROP VIEW " + survivor + ";");
@@ -2793,10 +2741,7 @@ static void TestMetadataSchemaMigration(bool create_trigger) {
 	Execute(owner, "DROP TABLE \"Control.Space\".openivm_refresh_hooks;");
 	Execute(owner, trigger);
 	auto check_bag = [&](const string &view) {
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view +
-		                   " EXCEPT ALL SELECT * FROM \"Source.Space\".source) "
-		                   "OR EXISTS (SELECT * FROM \"Source.Space\".source EXCEPT ALL SELECT * FROM " +
-		                   view + ") THEN error('Migrated MV bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + view, "SELECT * FROM \"Source.Space\".source", "Migrated MV bag mismatch");
 	};
 	check_bag(create_trigger ? "main.sibling" : "main.mv");
 	Execute(owner,
@@ -2893,13 +2838,7 @@ static void TestMetadataSchemaSettingTransaction(bool existing_metadata, bool ba
 	statements.push_back(no_other_registry);
 	statements.push_back("SELECT CASE WHEN count(*)=0 THEN true ELSE error('Setting change created another schema') "
 	                     "END FROM duckdb_schemas() WHERE schema_name='Different;Control'");
-	if (batched) {
-		Execute(owner, StringUtil::Join(statements, "; ") + ";");
-	} else {
-		for (auto &statement : statements) {
-			Execute(owner, statement + ";");
-		}
-	}
+	ExecuteBatch(owner, statements, batched);
 	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
 	// Avoid a requested autocommit migration obscuring the transaction outcome.
 	Execute(owner, "SET openivm_metadata_schema='';");
@@ -2937,9 +2876,8 @@ static void TestMetadataSchemaSettingTransaction(bool existing_metadata, bool ba
 	               "DELETE FROM main.source WHERE i=5;");
 	for (auto &survivor : survivors) {
 		Execute(owner, "PRAGMA refresh(" + Value(survivor.first).ToSQLString() + ");");
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + survivor.first + " EXCEPT ALL " + survivor.second +
-		                   ") OR EXISTS (" + survivor.second + " EXCEPT ALL SELECT * FROM " + survivor.first +
-		                   ") THEN error('Setting transaction survivor bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + survivor.first, survivor.second,
+		         "Setting transaction survivor bag mismatch");
 	}
 	for (auto &survivor : survivors) {
 		Execute(owner, "DROP VIEW " + survivor.first + ";");
@@ -2989,11 +2927,8 @@ static void TestFailedCreateSourceDelta(bool dedicated_schema, bool peer_view, b
 	               "DELETE FROM main.source WHERE i=5;");
 	for (auto &survivor : shared ? vector<string> {view, "main.sibling"} : vector<string> {view}) {
 		Execute(owner, "PRAGMA refresh(" + Value(survivor).ToSQLString() + ");");
-		Execute(owner,
-		        "SELECT CASE WHEN EXISTS (SELECT * FROM " + survivor +
-		            " EXCEPT ALL SELECT i::TINYINT FROM main.source) OR EXISTS (SELECT i::TINYINT FROM main.source "
-		            "EXCEPT ALL SELECT * FROM " +
-		            survivor + ") THEN error('Failed CREATE retry survivor bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + survivor, "SELECT i::TINYINT FROM main.source",
+		         "Failed CREATE retry survivor bag mismatch");
 	}
 	Execute(owner, "DROP VIEW " + view + ";");
 	if (shared) {
@@ -3037,13 +2972,7 @@ static void TestAlterTableNamespace(bool existing_metadata, bool batched, bool c
 	statements.push_back("ALTER TABLE memory.\"Source;Space\".items RENAME COLUMN \"New;Column\" TO \"Final.Column\"");
 	statements.push_back("ALTER TABLE memory.\"Source;Space\".items ADD COLUMN scratch INTEGER");
 	statements.push_back("ALTER TABLE memory.\"Source;Space\".items DROP COLUMN scratch");
-	if (batched) {
-		Execute(owner, StringUtil::Join(statements, "; ") + ";");
-	} else {
-		for (auto &statement : statements) {
-			Execute(owner, statement + ";");
-		}
-	}
+	ExecuteBatch(owner, statements, batched);
 	auto rejected_drop = owner.Query("ALTER TABLE memory.\"Source;Space\".items DROP COLUMN \"Final.Column\";");
 	if (!rejected_drop->HasError() ||
 	    rejected_drop->GetError().find("referenced by materialized view") == string::npos ||
@@ -3055,10 +2984,8 @@ static void TestAlterTableNamespace(bool existing_metadata, bool batched, bool c
 		               "DELETE FROM memory.\"Source;Space\".items WHERE \"Final.Column\"=1; "
 		               "UPDATE memory.\"Source;Space\".items SET \"Final.Column\"=4 WHERE \"Final.Column\"=2;");
 		Execute(owner, "PRAGMA refresh(" + Value(view).ToSQLString() + ");");
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view +
-		                   " EXCEPT ALL SELECT \"Final.Column\" FROM memory.\"Source;Space\".items) OR EXISTS "
-		                   "(SELECT \"Final.Column\" FROM memory.\"Source;Space\".items EXCEPT ALL SELECT * FROM " +
-		                   view + ") THEN error('Caller-visible ALTER TABLE bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + view, "SELECT \"Final.Column\" FROM memory.\"Source;Space\".items",
+		         "Caller-visible ALTER TABLE bag mismatch");
 	}
 	Execute(owner, commit ? "COMMIT;" : "ROLLBACK;");
 	if (commit || peer_view) {
@@ -3070,10 +2997,8 @@ static void TestAlterTableNamespace(bool existing_metadata, bool batched, bool c
 		                   "UPDATE memory.\"Source;Space\".items SET " +
 		                   column + "=4 WHERE " + column + "=2;");
 		Execute(owner, "PRAGMA refresh(" + Value(view).ToSQLString() + ");");
-		Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM " + view + " EXCEPT ALL SELECT " + column +
-		                   " FROM memory.\"Source;Space\".items) OR EXISTS (SELECT " + column +
-		                   " FROM memory.\"Source;Space\".items EXCEPT ALL SELECT * FROM " + view +
-		                   ") THEN error('ALTER TABLE transaction outcome bag mismatch') ELSE true END;");
+		CheckBag(owner, "SELECT * FROM " + view, "SELECT " + column + " FROM memory.\"Source;Space\".items",
+		         "ALTER TABLE transaction outcome bag mismatch");
 		Execute(owner, "DROP VIEW " + view + ";");
 	}
 	if (existing_metadata) {
@@ -3081,11 +3006,8 @@ static void TestAlterTableNamespace(bool existing_metadata, bool batched, bool c
 		        "INSERT INTO \"Other Source\".items VALUES (8),(9),(10),(10); "
 		        "DELETE FROM \"Other Source\".items WHERE i=8; UPDATE \"Other Source\".items SET i=11 WHERE i=9;");
 		Execute(owner, "PRAGMA refresh('\"Other Source\".\"Same;MV\"');");
-		Execute(owner,
-		        "SELECT CASE WHEN EXISTS (SELECT * FROM \"Other Source\".\"Same;MV\" EXCEPT ALL "
-		        "SELECT * FROM \"Other Source\".items) OR EXISTS (SELECT * FROM \"Other Source\".items EXCEPT ALL "
-		        "SELECT * FROM \"Other Source\".\"Same;MV\") THEN error('ALTER TABLE changed sibling identity') ELSE "
-		        "true END;");
+		CheckBag(owner, "SELECT * FROM \"Other Source\".\"Same;MV\"", "SELECT * FROM \"Other Source\".items",
+		         "ALTER TABLE changed sibling identity");
 		Execute(owner, "DROP VIEW \"Other Source\".\"Same;MV\";");
 	}
 	Execute(owner, "SELECT CASE WHEN count(*)=0 THEN true ELSE error('ALTER TABLE namespace cleanup leaked') END "
@@ -3136,9 +3058,7 @@ static void TestLateLifecycleBindFailure(bool explicit_transaction) {
 	Execute(owner, "INSERT INTO source VALUES (1),(2),(3),(3); DELETE FROM source WHERE i=1; "
 	               "UPDATE source SET i=4 WHERE i=2;");
 	Execute(owner, "PRAGMA refresh('mv');");
-	Execute(owner, "SELECT CASE WHEN EXISTS (SELECT * FROM mv EXCEPT ALL SELECT * FROM source) "
-	               "OR EXISTS (SELECT * FROM source EXCEPT ALL SELECT * FROM mv) "
-	               "THEN error('Failed lifecycle damaged delta capture') ELSE true END;");
+	CheckBag(owner, "SELECT * FROM mv", "SELECT * FROM source", "Failed lifecycle damaged delta capture");
 	Execute(owner, "DROP VIEW mv;");
 }
 

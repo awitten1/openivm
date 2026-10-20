@@ -716,33 +716,6 @@ void SqlUtils::RemoveRedundantWhitespaces(string &query) {
 	query = std::regex_replace(query, std::regex("\\s+"), " ");
 }
 
-void SqlUtils::StripLineComments(string &query) {
-	string out;
-	out.reserve(query.size());
-	bool in_string = false;
-	for (size_t i = 0; i < query.size(); ++i) {
-		char c = query[i];
-		if (c == '\'' && !in_string) {
-			in_string = true;
-			out += c;
-		} else if (c == '\'' && in_string) {
-			in_string = false;
-			out += c;
-		} else if (!in_string && c == '-' && i + 1 < query.size() && query[i + 1] == '-') {
-			// Skip to end of line, preserve the newline so downstream \s+ collapse still works
-			while (i < query.size() && query[i] != '\n') {
-				++i;
-			}
-			if (i < query.size()) {
-				out += '\n';
-			}
-		} else {
-			out += c;
-		}
-	}
-	query = std::move(out);
-}
-
 vector<string> SqlUtils::SplitSQLStatements(const string &sql) {
 	vector<string> statements;
 	idx_t start = 0;
@@ -824,43 +797,8 @@ string SqlUtils::FullName(const string &catalog, const string &schema, const str
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(table);
 }
 
-string SqlUtils::FullDeltaName(const string &catalog, const string &schema, const string &table) {
-	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
-	string base = table;
-	if (base.size() > data_prefix.size() && base.rfind(data_prefix, 0) == 0) {
-		base = base.substr(data_prefix.size());
-	}
-	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(DeltaName(base));
-}
-
 string SqlUtils::QualifiedPrefix(const string &catalog, const string &schema) {
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + ".";
-}
-
-string SqlUtils::QuoteQualifiedPrefix(const string &prefix) {
-	if (prefix.empty()) {
-		return "";
-	}
-	vector<string> parts;
-	string current;
-	for (auto c : prefix) {
-		if (c == '.') {
-			if (!current.empty()) {
-				parts.push_back(current);
-				current.clear();
-			}
-			continue;
-		}
-		current += c;
-	}
-	if (!current.empty()) {
-		parts.push_back(current);
-	}
-	string quoted;
-	for (auto &part : parts) {
-		quoted += QuoteIdentifier(part) + ".";
-	}
-	return quoted;
 }
 
 vector<string> SqlUtils::ParseColumnList(const string &raw) {
@@ -1068,17 +1006,6 @@ vector<string> SqlUtils::ReplaceEachPlainOccurrence(const string &haystack, cons
 		pos += needle.size();
 	}
 	return variants;
-}
-
-bool SqlUtils::IdentifierMatchesTable(const string &identifier, const string &table_name) {
-	if (StringUtil::CIEquals(identifier, table_name)) {
-		return true;
-	}
-	if (identifier.size() <= table_name.size()) {
-		return false;
-	}
-	auto suffix = identifier.substr(identifier.size() - table_name.size());
-	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
 }
 
 bool SqlUtils::RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,

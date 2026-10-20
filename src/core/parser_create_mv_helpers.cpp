@@ -281,7 +281,7 @@ static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalo
 
 template <class BUILD_DDL>
 static bool InitializeSharedDDL(ClientContext &context, Connection &con, const string &probe, BUILD_DDL build_ddl,
-                                vector<CreateMVProfileRecord> *profile_steps = nullptr) {
+                                vector<MVProfileStep> *profile_steps = nullptr) {
 	// Explicit transactions retain their atomic, rollbackable initialization.
 	if (!context.transaction.IsAutoCommit()) {
 		return false;
@@ -333,7 +333,7 @@ static bool InitializeSharedDDL(ClientContext &context, Connection &con, const s
 }
 
 void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema,
-                          bool remote, vector<CreateMVProfileRecord> *profile_steps) {
+                          bool remote, vector<MVProfileStep> *profile_steps) {
 	auto table = [&](const char *name) {
 		return SqlUtils::FullName(catalog, schema, name);
 	};

@@ -52,7 +52,7 @@ void MVProfiler::AddStep(const string &name, std::chrono::steady_clock::time_poi
 
 void MVProfiler::AddMeasuredStep(const string &name, int64_t duration_ms, const string &detail) {
 	if (enabled) {
-		steps.push_back({static_cast<int32_t>(steps.size()), name, duration_ms, detail});
+		steps.push_back({name, duration_ms, detail});
 	}
 }
 
@@ -82,12 +82,13 @@ void MVProfiler::Flush() {
 	                  to_string(retention_days) + " days'");
 	// Statement profiles should not add a metadata commit for every DDL operation.
 	string values;
-	for (auto &step : steps) {
+	for (idx_t i = 0; i < steps.size(); i++) {
+		auto &step = steps[i];
 		if (!values.empty()) {
 			values += ", ";
 		}
 		values += "('" + SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) +
-		          "', CAST(current_timestamp AS TIMESTAMP), " + to_string(step.step_order) + ", '" +
+		          "', CAST(current_timestamp AS TIMESTAMP), " + to_string(i) + ", '" +
 		          SqlUtils::EscapeValue(step.step_name) + "', " + to_string(step.duration_ms) + ", '" +
 		          SqlUtils::EscapeValue(step.detail) + "')";
 	}

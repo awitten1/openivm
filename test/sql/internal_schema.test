@@ -1589,39 +1589,26 @@ SELECT v.view_sql_name, v.type, v.internal_schema, t.schema_name FROM "Control S
 paren_counted	11	Quoted Internal	Quoted Internal
 quoted_counted	11	Quoted Internal	Quoted Internal
 
-statement ok
-INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+foreach mv,source,key quoted_counted,Mixed.Items,71756f7465645f636f756e746564 paren_counted,Items(""Archive""),706172656e5f636f756e746564
 
 statement ok
-DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+INSERT INTO main."${source}" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
 
 statement ok
-UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+DELETE FROM main."${source}" WHERE x = 20 OR g = 4;
 
 statement ok
-PRAGMA refresh('s1.quoted_counted');
+UPDATE main."${source}" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.${mv}');
 
 query I
-SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+SELECT count(*) FROM ((SELECT * FROM s1.${mv} EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."${source}" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."${source}" GROUP BY g EXCEPT ALL SELECT * FROM s1.${mv}));
 ----
 0
 
-statement ok
-INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
-
-statement ok
-DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
-
-statement ok
-UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
-
-statement ok
-PRAGMA refresh('s1.paren_counted');
-
-query I
-SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
-----
-0
+endloop
 
 # With no pending changes, missing auxiliary tables are repaired from quoted sources.
 
@@ -1634,94 +1621,68 @@ DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e746572
 statement ok
 SET openivm_internal_schema = '';
 
+foreach mv,source,key quoted_counted,Mixed.Items,71756f7465645f636f756e746564 paren_counted,Items(""Archive""),706172656e5f636f756e746564
+
 statement ok
-PRAGMA refresh('s1.quoted_counted');
+PRAGMA refresh('s1.${mv}');
 
 query I
-SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+SELECT count(*) FROM ((SELECT * FROM s1.${mv} EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."${source}" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."${source}" GROUP BY g EXCEPT ALL SELECT * FROM s1.${mv}));
 ----
 0
 
-statement ok
-PRAGMA refresh('s1.paren_counted');
-
-query I
-SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
-----
-0
+endloop
 
 # Reopen discovers both stored locations without restoring either schema setting.
 restart
 
-statement ok
-INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+foreach mv,source,key quoted_counted,Mixed.Items,71756f7465645f636f756e746564 paren_counted,Items(""Archive""),706172656e5f636f756e746564
 
 statement ok
-DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+INSERT INTO main."${source}" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
 
 statement ok
-UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+DELETE FROM main."${source}" WHERE x = 20 OR g = 4;
 
 statement ok
-PRAGMA refresh('s1.quoted_counted');
+UPDATE main."${source}" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+
+statement ok
+PRAGMA refresh('s1.${mv}');
 
 query I
-SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+SELECT count(*) FROM ((SELECT * FROM s1.${mv} EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."${source}" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."${source}" GROUP BY g EXCEPT ALL SELECT * FROM s1.${mv}));
 ----
 0
 
 statement ok
-DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_;
+DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_${key}_;
 
 statement ok
-PRAGMA refresh('s1.quoted_counted');
+PRAGMA refresh('s1.${mv}');
 
 query I
-SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+SELECT count(*) FROM ((SELECT * FROM s1.${mv} EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."${source}" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."${source}" GROUP BY g EXCEPT ALL SELECT * FROM s1.${mv}));
 ----
 0
 
-statement ok
-INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
-
-statement ok
-DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
-
-statement ok
-UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
-
-statement ok
-PRAGMA refresh('s1.paren_counted');
-
-query I
-SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
-----
-0
-
-statement ok
-DROP TABLE "Quoted Internal".openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_;
-
-statement ok
-PRAGMA refresh('s1.paren_counted');
-
-query I
-SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
-----
-0
+endloop
 
 statement ok
 SET openivm_stateful_auxstate = true;
 
 # Replacement rollback restores auxiliary state and its qualified source metadata.
 
+foreach mv,source,key quoted_counted,Mixed.Items,71756f7465645f636f756e746564 paren_counted,Items(""Archive""),706172656e5f636f756e746564
+
 statement ok
 BEGIN TRANSACTION;
 
 statement ok
-CREATE OR REPLACE MATERIALIZED VIEW s1.quoted_counted AS SELECT g, COUNT(*) AS n FROM main."Mixed.Items" GROUP BY g;
+CREATE OR REPLACE MATERIALIZED VIEW s1.${mv} AS SELECT g, COUNT(*) AS n FROM main."${source}" GROUP BY g;
 
 query I
-SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_';
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_${key}_';
 ----
 0
 
@@ -1729,131 +1690,39 @@ statement ok
 ROLLBACK;
 
 statement ok
-INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+INSERT INTO main."${source}" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
 
 statement ok
-DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+DELETE FROM main."${source}" WHERE x = 20 OR g = 4;
 
 statement ok
-UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+UPDATE main."${source}" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
 
 statement ok
-PRAGMA refresh('s1.quoted_counted');
+PRAGMA refresh('s1.${mv}');
 
 query I
-SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
+SELECT count(*) FROM ((SELECT * FROM s1.${mv} EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."${source}" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."${source}" GROUP BY g EXCEPT ALL SELECT * FROM s1.${mv}));
 ----
 0
 
 statement ok
-CREATE OR REPLACE MATERIALIZED VIEW s1.quoted_counted AS SELECT g, COUNT(DISTINCT x) AS n FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g;
+CREATE OR REPLACE MATERIALIZED VIEW s1.${mv} AS SELECT g, COUNT(DISTINCT x) AS n FROM main."${source}" WHERE x >= 30 GROUP BY g;
 
 statement ok
-INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+INSERT INTO main."${source}" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
 
 statement ok
-DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
+DELETE FROM main."${source}" WHERE x = 20 OR g = 4;
 
 statement ok
-UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+UPDATE main."${source}" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
 
 statement ok
-PRAGMA refresh('s1.quoted_counted');
+PRAGMA refresh('s1.${mv}');
 
 query I
-SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
-----
-0
-
-statement ok
-BEGIN TRANSACTION;
-
-statement ok
-DROP VIEW s1.quoted_counted;
-
-query I
-SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_71756f7465645f636f756e746564_';
-----
-0
-
-statement ok
-ROLLBACK;
-
-statement ok
-INSERT INTO main."Mixed.Items" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
-
-statement ok
-DELETE FROM main."Mixed.Items" WHERE x = 20 OR g = 4;
-
-statement ok
-UPDATE main."Mixed.Items" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
-
-statement ok
-PRAGMA refresh('s1.quoted_counted');
-
-query I
-SELECT count(*) FROM ((SELECT * FROM s1.quoted_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Mixed.Items" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.quoted_counted));
-----
-0
-
-statement ok
-DROP VIEW s1.quoted_counted;
-
-query I
-SELECT count(*) FROM "Control Space".openivm_views WHERE view_sql_name = 'quoted_counted';
-----
-0
-
-# Replacement rollback restores auxiliary state and its qualified source metadata.
-
-statement ok
-BEGIN TRANSACTION;
-
-statement ok
-CREATE OR REPLACE MATERIALIZED VIEW s1.paren_counted AS SELECT g, COUNT(*) AS n FROM main."Items(""Archive"")" GROUP BY g;
-
-query I
-SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_';
-----
-0
-
-statement ok
-ROLLBACK;
-
-statement ok
-INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
-
-statement ok
-DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
-
-statement ok
-UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
-
-statement ok
-PRAGMA refresh('s1.paren_counted');
-
-query I
-SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
-----
-0
-
-statement ok
-CREATE OR REPLACE MATERIALIZED VIEW s1.paren_counted AS SELECT g, COUNT(DISTINCT x) AS n FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g;
-
-statement ok
-INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
-
-statement ok
-DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
-
-statement ok
-UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
-
-statement ok
-PRAGMA refresh('s1.paren_counted');
-
-query I
-SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+SELECT count(*) FROM ((SELECT * FROM s1.${mv} EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."${source}" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."${source}" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.${mv}));
 ----
 0
 
@@ -1861,10 +1730,10 @@ statement ok
 BEGIN TRANSACTION;
 
 statement ok
-DROP VIEW s1.paren_counted;
+DROP VIEW s1.${mv};
 
 query I
-SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_706172656e5f636f756e746564_';
+SELECT count(*) FROM duckdb_tables() WHERE table_name = 'openivm_aux___openivm_mv_6f70656e69766d5f696e7465726e616c5f736368656d61_7331_${key}_';
 ----
 0
 
@@ -1872,29 +1741,31 @@ statement ok
 ROLLBACK;
 
 statement ok
-INSERT INTO main."Items(""Archive"")" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
+INSERT INTO main."${source}" VALUES (1,40),(1,40),(2,30),(4,99),(4,99);
 
 statement ok
-DELETE FROM main."Items(""Archive"")" WHERE x = 20 OR g = 4;
+DELETE FROM main."${source}" WHERE x = 20 OR g = 4;
 
 statement ok
-UPDATE main."Items(""Archive"")" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
+UPDATE main."${source}" SET x = CASE WHEN x = 40 THEN 41 ELSE 40 END WHERE g = 1;
 
 statement ok
-PRAGMA refresh('s1.paren_counted');
+PRAGMA refresh('s1.${mv}');
 
 query I
-SELECT count(*) FROM ((SELECT * FROM s1.paren_counted EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."Items(""Archive"")" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.paren_counted));
+SELECT count(*) FROM ((SELECT * FROM s1.${mv} EXCEPT ALL SELECT g, COUNT(DISTINCT x) FROM main."${source}" WHERE x >= 30 GROUP BY g) UNION ALL (SELECT g, COUNT(DISTINCT x) FROM main."${source}" WHERE x >= 30 GROUP BY g EXCEPT ALL SELECT * FROM s1.${mv}));
 ----
 0
 
 statement ok
-DROP VIEW s1.paren_counted;
+DROP VIEW s1.${mv};
 
 query I
-SELECT count(*) FROM "Control Space".openivm_views WHERE view_sql_name = 'paren_counted';
+SELECT count(*) FROM "Control Space".openivm_views WHERE view_sql_name = '${mv}';
 ----
 0
+
+endloop
 
 query I
 SELECT count(*) FROM duckdb_tables() WHERE schema_name = 'Quoted Internal';

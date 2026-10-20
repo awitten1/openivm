@@ -1538,11 +1538,6 @@ static void AddJoinEdgesFromFacts(CreateMVPlanFacts &facts) {
 			if (!left || !right) {
 				continue;
 			}
-			BaseColumnRef lbase, rbase;
-			if (ResolveBindingToBaseRef(left->binding, facts, lbase) &&
-			    ResolveBindingToBaseRef(right->binding, facts, rbase)) {
-				facts.inner_join_edges.emplace_back(std::move(lbase), std::move(rbase));
-			}
 			if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
 				continue;
 			}

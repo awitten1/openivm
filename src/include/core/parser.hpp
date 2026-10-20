@@ -51,9 +51,6 @@ public:
 //! Parse a materialized-view lifecycle statement written in `input_dialect`.
 ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, SqlDialect input_dialect);
 
-//! The dialect materialized-view bodies arrive in for this session (`openivm_input_dialect`).
-SqlDialect OpenIvmInputDialect(ClientContext &context);
-
 //! `openivm_input_dialect` set callback: validates the value and mirrors it onto the parser extension.
 void SetOpenIvmInputDialect(ClientContext &context, SetScope scope, Value &parameter);
 

@@ -212,7 +212,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	bool remote_metadata = metadata_location.explicit_placement && !metadata_location.IsNative();
 	TransactionalMVLockState::Get(*con.context)
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
-	vector<CreateMVProfileRecord> create_profile_steps;
+	vector<MVProfileStep> create_profile_steps;
 	Value create_profile_val;
 	bool create_profile_enabled = context.TryGetCurrentSetting("openivm_profile_refresh", create_profile_val) &&
 	                              !create_profile_val.IsNull() && create_profile_val.GetValue<bool>();

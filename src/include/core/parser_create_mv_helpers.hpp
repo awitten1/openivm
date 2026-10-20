@@ -2,6 +2,7 @@
 #define OPENIVM_PARSER_CREATE_MV_HELPERS_HPP
 
 #include "duckdb.hpp"
+#include "core/mv_profiler.hpp"
 
 namespace duckdb {
 
@@ -10,14 +11,8 @@ string CreateMVDependenciesSQL();
 const vector<string> &MetadataTableNames();
 // CREATE TABLE IF NOT EXISTS for a control-metadata table. An empty target uses the unqualified table name.
 string CreateMetadataTableSQL(const string &table, const string &target = "", bool remote = false);
-struct CreateMVProfileRecord {
-	string step_name;
-	int64_t duration_ms;
-	string detail;
-};
-
 void InitializeMVMetadata(ClientContext &context, Connection &con, const string &catalog, const string &schema,
-                          bool remote = false, vector<CreateMVProfileRecord> *profile_steps = nullptr);
+                          bool remote = false, vector<MVProfileStep> *profile_steps = nullptr);
 // True when the helper committed a new, empty source delta.
 bool InitializeSourceDelta(ClientContext &context, Connection &con, const string &delta_table, const string &ddl,
                            const string &mapping_probe);

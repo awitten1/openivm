@@ -13,14 +13,6 @@
 
 namespace duckdb {
 
-SqlDialect OpenIvmInputDialect(ClientContext &context) {
-	Value setting_value;
-	if (!context.TryGetCurrentSetting(OPENIVM_INPUT_DIALECT_SETTING, setting_value) || setting_value.IsNull()) {
-		return SqlDialect::DUCKDB;
-	}
-	return ParseSqlDialectSetting(setting_value.ToString(), OPENIVM_INPUT_DIALECT_SETTING);
-}
-
 void SetOpenIvmInputDialect(ClientContext &context, SetScope scope, Value &parameter) {
 	auto dialect = parameter.IsNull() ? SqlDialect::DUCKDB
 	                                  : ParseSqlDialectSetting(parameter.ToString(), OPENIVM_INPUT_DIALECT_SETTING);

@@ -5,6 +5,7 @@
 #include "core/refresh_metadata.hpp"
 #include "core/time_travel_pins.hpp"
 #include "duckdb.hpp"
+#include "core/mv_profiler.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/logical_operator.hpp"
@@ -125,14 +126,8 @@ private:
 
 struct RefreshCostEstimate;
 
-struct RefreshCompileProfileStep {
-	string step_name;
-	int64_t duration_ms;
-	string detail;
-};
-
 struct RefreshCompileProfile {
-	vector<RefreshCompileProfileStep> steps;
+	vector<MVProfileStep> steps;
 
 	void AddStep(const string &step_name, std::chrono::steady_clock::time_point start,
 	             const string &detail = string()) {

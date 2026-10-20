@@ -28,8 +28,6 @@ public:
 	static string ExtractViewQuery(string &query);
 	static string SQLToLowercase(const string &sql);
 	static void RemoveRedundantWhitespaces(string &query);
-	/// Strip SQL line comments (-- to end of line) while respecting single-quoted string literals.
-	static void StripLineComments(string &query);
 	/// Trim whitespace without stripping non-ASCII identifier bytes on signed-char builds.
 	static string TrimSQLFragment(const string &input);
 	static vector<string> SplitSQLStatements(const string &sql);
@@ -43,11 +41,9 @@ public:
 	static string RewriteTableReferences(const string &sql,
 	                                     const std::function<string(const vector<string> &)> &rewrite);
 	static string FullName(const string &catalog, const string &schema, const string &table);
-	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
 	/// Compare SQL expressions holding catalog identifiers using DuckDB's ASCII-only case folding.
 	static string IdentifierEqualsSQL(const string &left, const string &right);
 	static string QualifiedPrefix(const string &catalog, const string &schema);
-	static string QuoteQualifiedPrefix(const string &prefix);
 	static string JsonQuote(const string &value);
 	static vector<string> ParseColumnList(const string &raw);
 	static string JsonArray(const vector<string> &values);
@@ -86,7 +82,6 @@ public:
 	                                              const string &replacement, bool &replaced);
 	static vector<string> ReplaceEachTableReference(const string &sql, const string &table_name,
 	                                                const string &replacement);
-	static bool IdentifierMatchesTable(const string &identifier, const string &table_name);
 	static bool RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,
 	                                    const unordered_set<string> &qualifiers, bool allow_unqualified);
 	static string FindTableReference(const string &sql, const string &table_name);

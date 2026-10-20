@@ -5,6 +5,12 @@
 
 namespace duckdb {
 
+struct MVProfileStep {
+	string step_name;
+	int64_t duration_ms;
+	string detail;
+};
+
 class MVProfiler {
 public:
 	MVProfiler(ClientContext &context, string total_step, string view_name = "", string view_catalog = "");
@@ -24,12 +30,6 @@ public:
 	void Flush();
 
 private:
-	struct Step {
-		int32_t step_order;
-		string step_name;
-		int64_t duration_ms;
-		string detail;
-	};
 	ClientContext &context;
 	const bool enabled;
 	int64_t retention_days = 31;
@@ -40,7 +40,7 @@ private:
 	string profile_table;
 	bool flushed = false;
 	std::chrono::steady_clock::time_point total_start;
-	vector<Step> steps;
+	vector<MVProfileStep> steps;
 };
 
 } // namespace duckdb

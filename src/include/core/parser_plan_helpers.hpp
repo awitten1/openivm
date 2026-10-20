@@ -91,7 +91,6 @@ struct CreateMVPlanFacts {
 	unordered_map<idx_t, LogicalOperator *> cte_defs_by_index;
 	unordered_map<string, string> join_parents;
 	vector<BoundColumnRefExpression *> join_refs;
-	vector<pair<BaseColumnRef, BaseColumnRef>> inner_join_edges;
 	unordered_set<string> single_delim_key_bindings;
 	unordered_map<idx_t, ProjectionSourceOccurrence> occurrence_by_index;
 	vector<ProjectionSourceOccurrence> source_occurrences;
