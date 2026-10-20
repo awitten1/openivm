@@ -14,6 +14,7 @@ set(EXTENSION_SOURCES
     src/openivm_extension.cpp
     src/compile_facts.cpp
     src/core/compiled_sql_archive.cpp
+    src/core/mv_profiler.cpp
     src/core/ivm_delta_model.cpp
     src/core/ivm_view_classifier.cpp
     src/core/parser.cpp

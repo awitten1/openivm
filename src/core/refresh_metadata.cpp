@@ -786,8 +786,7 @@ static optional_ptr<TableCatalogEntry> FindSourceDeltaImpl(ClientContext &contex
                                                            SourceDeltaLookup lookup) {
 	// OpenIVM's own companion deltas are created before dependency rows exist.
 	// They always stay beside their reserved internal relation.
-	if (SqlUtils::IsDelta(table) || IncrementalTableNames::IsDataTable(table) ||
-	    StringUtil::StartsWith(table, openivm::VISIBLE_TABLE_PREFIX)) {
+	if (IncrementalTableNames::IsMaintenanceTable(table)) {
 		return Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, SqlUtils::DeltaName(table),
 		                                            OnEntryNotFound::RETURN_NULL);
 	}

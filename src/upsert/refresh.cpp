@@ -1,4 +1,5 @@
 #include "upsert/refresh.hpp"
+#include "core/mv_profiler.hpp"
 
 #include "core/compiled_sql_archive.hpp"
 #include "core/openivm_constants.hpp"
@@ -28,107 +29,6 @@
 #include <chrono>
 
 namespace duckdb {
-
-struct RefreshProfileStep {
-	int32_t step_order;
-	string step_name;
-	int64_t duration_ms;
-	string detail;
-};
-
-class RefreshProfiler {
-public:
-	RefreshProfiler(ClientContext &context, string view_name_p, string view_catalog_p)
-	    : enabled(false), retention_days(31), view_name(std::move(view_name_p)),
-	      view_catalog(std::move(view_catalog_p)), next_step(0), total_start(std::chrono::steady_clock::now()) {
-		Value profile_val;
-		enabled = context.TryGetCurrentSetting("openivm_profile_refresh", profile_val) && !profile_val.IsNull() &&
-		          profile_val.GetValue<bool>();
-		// Also identifies this refresh in the compiled-SQL archive, so profile rows join to it.
-		refresh_id = NewCompilationId(view_name);
-		if (enabled) {
-			Value retention_val;
-			if (context.TryGetCurrentSetting("openivm_profile_retention_days", retention_val) &&
-			    !retention_val.IsNull()) {
-				retention_days = std::max<int64_t>(0, retention_val.GetValue<int64_t>());
-			}
-		}
-	}
-
-	bool Enabled() const {
-		return enabled;
-	}
-
-	const string &RefreshId() const {
-		return refresh_id;
-	}
-
-	void AddStep(const string &step_name, std::chrono::steady_clock::time_point start,
-	             const string &detail = string()) {
-		if (!enabled) {
-			return;
-		}
-		auto end = std::chrono::steady_clock::now();
-		auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-		steps.push_back({next_step++, step_name, duration_ms, detail});
-	}
-
-	void AddMeasuredStep(const string &step_name, int64_t duration_ms, const string &detail = string()) {
-		if (!enabled) {
-			return;
-		}
-		steps.push_back({next_step++, step_name, duration_ms, detail});
-	}
-
-	void AddTotal() {
-		AddStep("total_refresh", total_start);
-	}
-
-	void Flush(ClientContext &context) {
-		if (!enabled || steps.empty()) {
-			return;
-		}
-		Connection profile_con(*context.db);
-		RefreshMetadata::UseCatalog(context, profile_con, view_catalog);
-		// Persist all steps together instead of synchronizing the WAL for every row.
-		profile_con.BeginTransaction();
-		profile_con.Query("DELETE FROM " + string(openivm::PROFILE_TABLE) +
-		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
-		                  to_string(retention_days) + " days'");
-		string values;
-		for (auto &step : steps) {
-			if (!values.empty()) {
-				values += ", ";
-			}
-			values += "('" + SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) +
-			          "', CAST(current_timestamp AS TIMESTAMP), " + to_string(step.step_order) + ", '" +
-			          SqlUtils::EscapeValue(step.step_name) + "', " + to_string(step.duration_ms) + ", '" +
-			          SqlUtils::EscapeValue(step.detail) + "')";
-		}
-		// One insert avoids a network round trip per step with PostgreSQL metadata.
-		auto result = profile_con.Query(
-		    "INSERT INTO " + string(openivm::PROFILE_TABLE) +
-		    " (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail) VALUES " + values);
-		if (result->HasError()) {
-			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record refresh profile: %s\n", result->GetError().c_str());
-			return;
-		}
-		auto committed = profile_con.Query("COMMIT");
-		if (committed->HasError()) {
-			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to commit refresh profile: %s\n", committed->GetError().c_str());
-		}
-	}
-
-private:
-	bool enabled;
-	int64_t retention_days;
-	string view_name;
-	string view_catalog;
-	string refresh_id;
-	int32_t next_step;
-	std::chrono::steady_clock::time_point total_start;
-	vector<RefreshProfileStep> steps;
-};
 
 static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadata, Connection &con,
                                 const string &view_catalog_name, const string &view_schema_name,
@@ -288,7 +188,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
                                const string &vn, bool cross_system, const string &attached_db_catalog_name,
                                const string &attached_db_schema_name, bool skip_empty_refresh, const string &after_hook,
                                idx_t attempt) {
-	RefreshProfiler profiler(context, vn, view_catalog_name);
+	MVProfiler profiler(context, "total_refresh", vn, view_catalog_name);
 	profiler.AddMeasuredStep("acquire_locks", 0, "database mutation gate pre-acquired");
 	Connection probe_con(*context.db.get());
 	auto metadata_location = RefreshMetadata::UseCatalog(context, probe_con, view_catalog_name);
@@ -332,7 +232,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		if (TrySkipEmptyRefresh(context, probe_meta, probe_con, view_catalog_name, view_schema_name, vn,
 		                        attached_db_catalog_name, attached_db_schema_name, &delta_activity)) {
 			profiler.AddTotal();
-			profiler.Flush(context);
+			profiler.Flush();
 			return;
 		}
 		if (!delta_activity.active_delta_table_names.empty() || delta_activity.requires_full_refresh) {
@@ -883,7 +783,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			                 "statements=" + to_string(archived.statements.size()));
 		}
 		profiler.AddTotal();
-		profiler.Flush(context);
+		profiler.Flush();
 		return;
 	} catch (SimulatedCrashException &) {
 		// A crashed process loses its open transaction and runs no compensation; the
@@ -933,7 +833,7 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 			}
 		}
 		profiler.AddTotal();
-		profiler.Flush(context);
+		profiler.Flush();
 		// Record the failed execution in its own metadata transaction. If that write
 		// also fails, say so in the refresh error rather than dropping it silently.
 		string archive_error;

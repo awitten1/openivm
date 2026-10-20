@@ -200,7 +200,7 @@ static optional_ptr<TableCatalogEntry> GetNativeDMLTable(LogicalOperator &dml) {
 	default:
 		throw InternalException("OpenIVM expected a source DML operator");
 	}
-	if (table->name.empty() || SqlUtils::IsDelta(table->name) || IncrementalTableNames::IsDataTable(table->name) ||
+	if (table->name.empty() || IncrementalTableNames::IsMaintenanceTable(table->name) ||
 	    !table->catalog.IsDuckCatalog()) {
 		return nullptr;
 	}
@@ -316,8 +316,7 @@ void RefreshInsertRule::RefreshInsertRuleFunction(OptimizerExtensionInput &input
 		auto &info = create.info->Base();
 		// MV lifecycle programs publish their own signed output changes. Their
 		// backing/publication rebuilds are not replacements of user sources.
-		if (SqlUtils::IsDelta(info.table) || IncrementalTableNames::IsDataTable(info.table) ||
-		    StringUtil::StartsWith(info.table, openivm::VISIBLE_TABLE_PREFIX)) {
+		if (IncrementalTableNames::IsMaintenanceTable(info.table)) {
 			return;
 		}
 		auto old_table = Catalog::GetEntry<TableCatalogEntry>(input.context, catalog.GetName(), create.schema.name,

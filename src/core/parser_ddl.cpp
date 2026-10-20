@@ -1,4 +1,5 @@
 #include "core/parser_ddl.hpp"
+#include "core/mv_profiler.hpp"
 
 #include "core/compiled_sql_archive.hpp"
 #include "core/metadata_location.hpp"
@@ -233,132 +234,6 @@ static string StabilizeTransactionalMetadata(const string &statement, const stri
 	return result;
 }
 
-struct CreateMVProfileStep {
-	int32_t step_order;
-	string step_name;
-	int64_t duration_ms;
-	string detail;
-};
-
-class CreateMVProfiler {
-public:
-	explicit CreateMVProfiler(ClientContext &context_p)
-	    : context(context_p), enabled(false), retention_days(31), next_step(0),
-	      total_start(std::chrono::steady_clock::now()) {
-		Value profile_val;
-		enabled = context.TryGetCurrentSetting("openivm_profile_refresh", profile_val) && !profile_val.IsNull() &&
-		          profile_val.GetValue<bool>();
-		if (!enabled) {
-			return;
-		}
-		Value retention_val;
-		if (context.TryGetCurrentSetting("openivm_profile_retention_days", retention_val) && !retention_val.IsNull()) {
-			retention_days = std::max<int64_t>(0, retention_val.GetValue<int64_t>());
-		}
-		auto now = std::chrono::steady_clock::now().time_since_epoch();
-		refresh_id = "create_mv_" + to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
-	}
-
-	bool Enabled() const {
-		return enabled;
-	}
-
-	void SetProfileTable(const string &profile_table_p) {
-		profile_table = profile_table_p;
-	}
-
-	void SetViewName(const string &view_name_p, Connection &con) {
-		if (!enabled || !view_name.empty()) {
-			return;
-		}
-		view_name = view_name_p;
-		refresh_id = view_name + "_" + refresh_id;
-		// The executor has selected CREATE's metadata location before its first marker.
-		// Keep that owner: a fresh connection cannot discover a data catalog's marker.
-		auto &entry = ClientData::Get(*con.context).catalog_search_path->GetDefault();
-		auto catalog = entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(*con.context) : entry.catalog;
-		if (profile_table.empty()) {
-			profile_table = SqlUtils::FullName(catalog, entry.schema.empty() ? DEFAULT_SCHEMA : entry.schema,
-			                                   openivm::PROFILE_TABLE);
-		}
-	}
-
-	void AddStep(const string &step_name, std::chrono::steady_clock::time_point start,
-	             const string &detail = string()) {
-		if (!enabled) {
-			return;
-		}
-		auto duration_ms =
-		    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
-		steps.push_back({next_step++, step_name, duration_ms, detail});
-	}
-
-	void AddMeasuredStep(const string &step_name, int64_t duration_ms, const string &detail = string()) {
-		if (!enabled) {
-			return;
-		}
-		steps.push_back({next_step++, step_name, duration_ms, detail});
-	}
-
-	void AddTotal() {
-		AddStep("create_mv_total", total_start);
-	}
-
-	void Flush() {
-		if (!enabled || flushed || view_name.empty() || profile_table.empty() || steps.empty()) {
-			return;
-		}
-		flushed = true;
-		Connection profile_con(*context.db);
-		TransactionalMVLockState::Get(*profile_con.context)
-		    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
-		// The CREATE planner resolved the metadata owner before staged execution.
-		// The caller's active catalog may instead be an unrelated attached database.
-		OPENIVM_DEBUG_PRINT("[PROFILE] Recording CREATE MV profile in %s\n", profile_table.c_str());
-		// Retention and the new profile share one durable metadata commit.
-		profile_con.BeginTransaction();
-		profile_con.Query("DELETE FROM " + profile_table +
-		                  " WHERE profile_timestamp < current_timestamp::TIMESTAMP - INTERVAL '" +
-		                  to_string(retention_days) + " days'");
-		// Statement profiles should not add a metadata commit for every DDL operation.
-		string values;
-		for (auto &step : steps) {
-			if (!values.empty()) {
-				values += ", ";
-			}
-			values += "('" + SqlUtils::EscapeValue(refresh_id) + "', '" + SqlUtils::EscapeValue(view_name) +
-			          "', CAST(current_timestamp AS TIMESTAMP), " + to_string(step.step_order) + ", '" +
-			          SqlUtils::EscapeValue(step.step_name) + "', " + to_string(step.duration_ms) + ", '" +
-			          SqlUtils::EscapeValue(step.detail) + "')";
-		}
-		// refresh_id is unique per statement; remote catalogs support neither INSERT OR
-		// REPLACE nor DuckDB column defaults.
-		auto result = profile_con.Query(
-		    "INSERT INTO " + profile_table +
-		    " (refresh_id, view_name, profile_timestamp, step_order, step_name, duration_ms, detail) VALUES " + values);
-		if (result->HasError()) {
-			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to record CREATE MV profile: %s\n", result->GetError().c_str());
-			return;
-		}
-		auto committed = profile_con.Query("COMMIT");
-		if (committed->HasError()) {
-			OPENIVM_DEBUG_PRINT("[PROFILE] Failed to commit CREATE MV profile: %s\n", committed->GetError().c_str());
-		}
-	}
-
-private:
-	ClientContext &context;
-	bool enabled;
-	string profile_table;
-	bool flushed = false;
-	int64_t retention_days;
-	string view_name;
-	string refresh_id;
-	int32_t next_step;
-	std::chrono::steady_clock::time_point total_start;
-	vector<CreateMVProfileStep> steps;
-};
-
 struct DDLExecutorBindData : public TableFunctionData {
 	explicit DDLExecutorBindData(bool result) : result(result) {
 	}
@@ -563,7 +438,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		context.transaction.Rollback(nullptr);
 		suspended_autocommit_transaction = true;
 	}
-	CreateMVProfiler profiler(context);
+	MVProfiler profiler(context, "create_mv_total");
 	auto lifecycle_leases = LifecycleLeaseState::TryGet(context);
 	string current_profile_step = "create_mv_unclassified";
 	string current_profile_detail;
