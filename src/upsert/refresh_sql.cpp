@@ -1772,7 +1772,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 		                          "), last_refresh_ts = " + string(openivm::UTC_NOW_SQL) + " WHERE view_name = '" +
 		                          SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
 		                          SqlUtils::EscapeValue(dt) + "';\n";
-		if (!cross_system || split_native_metadata) {
+		// Native inputs to a transactional DuckLake refresh need cleanup too;
+		// the helper defers those writes until the data and watermarks commit.
+		if (!cross_system || split_native_metadata || deferred_cleanup) {
 			delete_from_delta_table_query += RefreshMetadata::BuildDeltaCleanupSQL(
 			    resolved, dt, delta_metadata_table, deferred_cleanup, delta_metadata_tables, catalog_name, schema_name,
 			    cleanup_data_catalog);

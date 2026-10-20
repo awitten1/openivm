@@ -340,31 +340,20 @@ CREATE writes metadata last; a CREATE interrupted earlier leaves objects that
 
 ## Tests
 
-| Scenario | Test |
+The feature suite shares scenarios across backends instead of keeping a separate
+reproducer for every integration fix. Operator tests elsewhere in `test/sql/`
+continue to cover incremental query semantics.
+
+| Contract | Tests |
 |---|---|
-| Placement of metadata vs backing/delta tables, marker | `test/sql/metadata_location.test` |
-| Batched DML refresh, delta cleanup, profiles, history | `test/sql/metadata_location.test` |
-| Host view over a source in the metadata catalog: incremental and full refresh, source delta cleaned after the watermarks | `test/sql/metadata_location.test` |
-| DuckLake view over a native frontend source: crash after the data commit, recovery, forced full refresh, native source delta cleaned after the watermarks | `test/sql/metadata_location_ducklake.test` |
-| Explicit-transaction rejection (including RENAME COLUMN); atomic same-database schema | `test/sql/metadata_location.test` |
-| RENAME COLUMN restore after a failed ALTER; autocommit rename | `test/sql/metadata_location.test` |
-| Crash after intent, inside data transaction, after data commit; full recompute | `test/sql/metadata_location.test` (`openivm_test_fail_point`) |
-| Clean data-step failure retracts the marker; next refresh is incremental and exact (native view, chained DuckLake view) | `test/sql/metadata_location.test`, `test/sql/metadata_location_ducklake.test` (`data_statement_error`) |
-| Concurrent connections, daemon scheduling | `test/sql/metadata_location.test` |
-| Read-only and missing catalogs, untracked DROP TABLE while detached, reopen discovery, conflicting setting, existing databases, replace, drop, orphan cleanup | `test/sql/metadata_location.test` |
-| DuckLake views: frontend marker, reopen without settings, crash after the DuckLake data commit | `test/sql/metadata_location_ducklake.test` |
-| Chained DuckLake views: crash after intent, after the view's own delta rows, before and after the data commit; downstream refreshed before and after recovery, no lost or doubled rows | `test/sql/metadata_location_ducklake.test`, `test/sql/ducklake_chained_recovery.test` (default metadata) |
-| Chained DuckLake views under a lost PostgreSQL lease: downstream view checked before and after recovery | `test/integration/test_remote_metadata.py` |
-| Legacy discovery unchanged; scheduler discovery of a configured location | `test/integration/scheduler_catalog_test.cpp` |
-| PostgreSQL metadata: placement, reopen, crash + abandoned lease, RENAME rejection and portable restore, CREATE inside the metadata catalog rejected, DROP, concurrent DuckLake clients without a local frontend file | `test/integration/test_remote_metadata.py` (CI: `.github/workflows/RemoteMetadata.yml`) |
-| Lease lost before the data phase, after the first DuckLake statement, and taken over before the watermark commit (fence) | `test/integration/test_remote_metadata.py` |
-| A clean data rollback keeps the marker another client set with a bumped `refresh_epoch`; the next refresh recomputes exactly | `test/integration/test_remote_metadata.py` (`concurrent_commit_then_data_error`) |
-| Lease times written from the PostgreSQL server clock; expiry judged on that clock (live 120 s ahead refuses, 1 s past takes over) | `test/integration/test_remote_metadata.py` |
-| Rejected CREATE in an explicit transaction creates no metadata schema; ADD COLUMN of a tracked source while the metadata catalog is detached | `test/sql/metadata_location.test` |
-| Settings contradicting the frontend marker of a DuckLake view | `test/sql/metadata_location_ducklake.test` |
-| DuckLake source committed by another connection after the data transaction, with metadata in `control`: not read by that refresh, applied once by the next | `test/sql/metadata_location_ducklake.test` (`concurrent_commit_after_data`) |
-| DuckLake source committed before or after the data statements (aggregate and join views); retry count; unrelated tables cause no retry | `test/sql/ducklake_concurrent_source_commit.test` |
-| PostgreSQL metadata: injected concurrent commit, and a writer process racing two refreshing processes | `test/integration/test_remote_metadata.py` |
+| Native/DuckLake metadata and maintenance placement, qualified names, profiles, same-named join sources and DAG refresh | `test/sql/metadata_location.test`, `test/sql/internal_schema.test`, `test/sql/internal_schema_ducklake.test` |
+| Explicit cross-database transaction rejection, same-database commit/rollback, missing/read-only controllers, offline writes and reopen markers | `test/sql/metadata_location.test` |
+| Schema migration, initialization, rollback, shared ownership, fresh-configuration reopen and CREATE/DML/DROP races | `test/integration/source_delta_publication_test.cpp` |
+| Crash before/after data commit, partial data writes, clean failure, chained recovery and native-source cleanup | `test/sql/metadata_location.test`, `test/sql/ducklake_chained_recovery.test` |
+| Source changes committed during refresh, snapshot watermarks and retry | `test/sql/ducklake_concurrent_source_commit.test` |
+| Ordered SQL archive, controls, retention, failure, commit/rollback and migration | `test/sql/metadata.test`, `test/sql/metadata_schema.test` |
+| Scheduler discovery and schema synchronization with an unrelated locked catalog | `test/integration/scheduler_catalog_test.cpp` |
+| PostgreSQL placement, portability, separate-process races, server-clock leases, takeover/fencing and crash recovery | `test/integration/test_remote_metadata.py` (`.github/workflows/RemoteMetadata.yml`) |
 
 `openivm_test_fail_point` is a testing hook. `after_intent`, `before_data_commit` and
 `after_data_commit` simulate a process crash at a protocol step and run no compensation.

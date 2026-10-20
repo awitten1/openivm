@@ -166,15 +166,14 @@ static void InjectConcurrentCommit(ClientContext &context, const string &point, 
 }
 
 // Test-only: whether a refresh statement inserts into the view's own delta table (delta_<mv>).
-// Generated statements name their INSERT target without spaces.
+// Parse qualified identifiers so whitespace inside quoted namespaces is preserved.
 static bool WritesViewDelta(const string &statement, const string &view_name) {
 	const string insert = "INSERT INTO ";
 	auto delta_name = SqlUtils::DeltaName(view_name);
 	for (auto pos = statement.find(insert); pos != string::npos; pos = statement.find(insert, pos + 1)) {
-		auto start = pos + insert.size();
-		auto end = statement.find_first_of(" (\n", start);
-		auto target = statement.substr(start, end == string::npos ? string::npos : end - start);
-		if (SqlUtils::LastIdentifierPart(target) == delta_name) {
+		idx_t end = 0;
+		auto target = SqlUtils::ReadQualifiedIdentifier(statement, pos + insert.size(), end);
+		if (!target.empty() && StringUtil::CIEquals(target.back(), delta_name)) {
 			return true;
 		}
 	}
