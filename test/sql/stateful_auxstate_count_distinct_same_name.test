@@ -111,6 +111,11 @@ SELECT COUNT(*) FROM (SELECT i, n FROM mv EXCEPT ALL SELECT i, COUNT(DISTINCT i)
 ----
 0
 
+query I
+SELECT COUNT(*) FROM (SELECT i, COUNT(DISTINCT i) FROM s GROUP BY i EXCEPT ALL SELECT i, n FROM mv);
+----
+0
+
 # Delete every row of a group, then reinsert another.
 statement ok
 DELETE FROM s WHERE i = 1;
