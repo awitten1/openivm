@@ -1007,8 +1007,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 						if (last_snap == cur_snap) {
 							// Nothing consumed since the last refresh: snapshot last_snap + 1 does not
 							// exist yet, so avoid the table functions and read a typed empty relation.
-							string base_full =
-							    SqlUtils::FullName(source->catalog_name, source->schema_name, source_location.table_name);
+							string base_full = SqlUtils::FullName(source->catalog_name, source->schema_name,
+							                                      source_location.table_name);
 							result = "(SELECT " + qkey + " AS __k, 1 AS __m FROM " + base_full +
 							         " WHERE false UNION ALL SELECT " + qkey + " AS __k, -1 AS __m FROM " + base_full +
 							         " WHERE false)";

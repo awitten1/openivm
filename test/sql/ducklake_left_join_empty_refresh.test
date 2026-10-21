@@ -158,3 +158,36 @@ SELECT count(*) FROM (
 );
 ----
 0
+
+# The empty snapshot relation must retain non-default source and MV schemas.
+statement ok
+CREATE SCHEMA dl.observation;
+
+statement ok
+CREATE TABLE dl.observation.a AS SELECT * FROM dl.main.a;
+
+statement ok
+CREATE TABLE dl.observation.b AS SELECT * FROM dl.main.b;
+
+statement ok
+CREATE MATERIALIZED VIEW dl.observation.mv AS
+SELECT a.id, SUM(b.x) AS total, COUNT(*) AS n
+FROM dl.observation.a a LEFT JOIN dl.observation.b b USING(id) GROUP BY a.id;
+
+loop iteration 0 2
+
+statement ok
+PRAGMA refresh('dl.observation.mv');
+
+query I
+SELECT count(*) FROM (
+    (SELECT * FROM dl.observation.mv EXCEPT ALL
+     SELECT a.id, SUM(b.x), COUNT(*) FROM dl.observation.a a LEFT JOIN dl.observation.b b USING(id) GROUP BY a.id)
+    UNION ALL
+    (SELECT a.id, SUM(b.x), COUNT(*) FROM dl.observation.a a LEFT JOIN dl.observation.b b USING(id) GROUP BY a.id
+     EXCEPT ALL SELECT * FROM dl.observation.mv)
+);
+----
+0
+
+endloop
