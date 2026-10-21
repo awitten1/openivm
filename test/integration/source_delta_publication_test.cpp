@@ -7,6 +7,8 @@
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "duckdb/main/config.hpp"
+#include "duckdb/main/extension_helper.hpp"
 #include "rules/column_hider.hpp"
 
 #include <chrono>
@@ -80,9 +82,14 @@ static void RefreshAndCheckBag(Connection &owner, const string &view, const stri
 static void TestInternalSchemaReopen(const string &path) {
 	std::cerr << "CASE internal schema reopen with fresh configuration" << std::endl;
 	{
-		DuckDB db(path);
+		// Startup must be WAL-safe even when core functions are available at LOAD.
+		DBConfig config;
+		config.options.load_extensions = false;
+		DuckDB db(path, &config);
+		ExtensionHelper::LoadExtension(db, "core_functions");
+		ExtensionHelper::LoadExtension(db, "openivm");
 		Connection owner(db);
-		Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; PRAGMA disable_checkpoint_on_shutdown; "
+		Execute(owner, "SET openivm_disable_daemon=true; PRAGMA disable_checkpoint_on_shutdown; "
 		               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
 		               "CREATE SCHEMA \"Source.Space\"; CREATE TABLE \"Source.Space\".items(i INTEGER); "
 		               "INSERT INTO \"Source.Space\".items VALUES (1),(1),(2); "

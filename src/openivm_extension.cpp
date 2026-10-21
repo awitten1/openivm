@@ -338,22 +338,11 @@ static void LoadInternal(ExtensionLoader &loader) {
 	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
 	          " ADD COLUMN IF NOT EXISTS delta_table_name VARCHAR DEFAULT NULL");
 
-	// Migration: create refresh history table for learned cost model.
-	// Silently fails on fresh DB (core_functions not yet loaded → DEFAULT
-	// current_timestamp can't resolve). The parser recreates it with the
-	// default at first MV creation, so INSERTs (which omit refresh_timestamp)
-	// work. This stanza only matters for legacy DBs where the table already
-	// exists without the default.
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::HISTORY_TABLE) +
-	          " (view_name VARCHAR, refresh_timestamp TIMESTAMP DEFAULT current_timestamp,"
-	          " method VARCHAR, incremental_compute_est DOUBLE, incremental_upsert_est DOUBLE,"
-	          " recompute_compute_est DOUBLE, recompute_replace_est DOUBLE,"
-	          " actual_duration_ms BIGINT,"
-	          " PRIMARY KEY(view_name, refresh_timestamp))");
-	con.Query("CREATE TABLE IF NOT EXISTS " + string(openivm::PROFILE_TABLE) +
-	          " (refresh_id VARCHAR, view_name VARCHAR, profile_timestamp TIMESTAMP DEFAULT current_timestamp,"
-	          " step_order INTEGER, step_name VARCHAR, duration_ms BIGINT, detail VARCHAR,"
-	          " PRIMARY KEY(refresh_id, step_order))");
+	// Use the complete definitions at LOAD as well as CREATE MV. Creating history
+	// without strategy and then ALTERing it leaves a timestamp-default rebind in
+	// the WAL, which cannot run before DuckDB initializes its default database.
+	con.Query(CreateMetadataTableSQL(openivm::HISTORY_TABLE));
+	con.Query(CreateMetadataTableSQL(openivm::PROFILE_TABLE));
 
 	// View-matching CREATEs first (always succeed), ALTERs after. ALTERs that
 	// hit not-yet-existing tables on a fresh DB fail silently — the parser's
