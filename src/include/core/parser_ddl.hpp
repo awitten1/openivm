@@ -106,6 +106,7 @@ unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder 
 unique_ptr<LogicalOperator> BindLifecycleProgram(ClientContext &context, Binder &binder, idx_t bind_index,
                                                  const string &program, bool staged);
 TableFunction DropEntryFunction(CatalogType type);
+TableFunction CreateDeltaFromDataFunction();
 
 } // namespace duckdb
 

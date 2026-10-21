@@ -418,6 +418,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	loader.RegisterFunction(SourceWatermarkFunction());
 	loader.RegisterFunction(SourceColumnsFunction());
+	loader.RegisterFunction(CreateDeltaFromDataFunction());
 	loader.RegisterFunction(DropEntryFunction(CatalogType::VIEW_ENTRY));
 	loader.RegisterFunction(DropEntryFunction(CatalogType::TABLE_ENTRY));
 	loader.RegisterFunction(DropEntryFunction(CatalogType::SCHEMA_ENTRY));

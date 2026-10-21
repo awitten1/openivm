@@ -82,7 +82,7 @@ static void TestInternalSchemaReopen(const string &path) {
 	{
 		DuckDB db(path);
 		Connection owner(db);
-		Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; "
+		Execute(owner, "LOAD openivm; SET openivm_disable_daemon=true; PRAGMA disable_checkpoint_on_shutdown; "
 		               "SET openivm_metadata_schema='Control.Space'; SET openivm_internal_schema='Internal Space'; "
 		               "CREATE SCHEMA \"Source.Space\"; CREATE TABLE \"Source.Space\".items(i INTEGER); "
 		               "INSERT INTO \"Source.Space\".items VALUES (1),(1),(2); "

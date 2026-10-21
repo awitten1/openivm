@@ -39,6 +39,7 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/parser/statement/drop_statement.hpp"
+#include "duckdb/parser/tableref/bound_ref_wrapper.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/planner.hpp"
 #include "duckdb/transaction/local_storage.hpp"
@@ -351,6 +352,44 @@ void ParseCreateDeltaFromDataPayload(const string &payload, bool &replace, strin
 	data_table = payload.substr(second + 1);
 }
 
+static DeltaSchemaDDL BuildDeltaSchemaDDL(const vector<pair<string, string>> &source_columns, const string &delta_table,
+                                          const string &data_table, OnCreateConflict on_conflict) {
+	if (source_columns.empty()) {
+		throw CatalogException("Could not derive IVM delta schema from empty column list for data table '%s'",
+		                       data_table);
+	}
+	vector<string> columns;
+	unordered_set<string> seen_column_names;
+	for (auto &column : source_columns) {
+		auto &column_name = column.first;
+		auto &column_type = column.second;
+		if (column_name.empty() || column_type.empty()) {
+			throw CatalogException("Could not derive IVM delta schema from data table '%s': empty column name or type",
+			                       data_table);
+		}
+		if (!seen_column_names.insert(StringUtil::Lower(column_name)).second) {
+			throw CatalogException("Could not derive IVM delta schema from data table '%s': duplicate column '%s'",
+			                       data_table, column_name);
+		}
+		if (StringUtil::CIEquals(column_name, openivm::MULTIPLICITY_COL) ||
+		    StringUtil::CIEquals(column_name, openivm::TIMESTAMP_COL)) {
+			throw CatalogException("Could not derive IVM delta schema from data table '%s': reserved OpenIVM column "
+			                       "'%s' is already present",
+			                       data_table, column_name);
+		}
+		columns.push_back(SqlUtils::QuoteIdentifier(column_name) + " " + column_type);
+	}
+	columns.push_back(string(openivm::MULTIPLICITY_COL) + " INTEGER DEFAULT 1");
+	columns.push_back(string(openivm::TIMESTAMP_COL) + " TIMESTAMP DEFAULT now()");
+	DeltaSchemaDDL result;
+	result.sql = string(on_conflict == OnCreateConflict::REPLACE_ON_CONFLICT  ? "create or replace table "
+	                    : on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT ? "create table if not exists "
+	                                                                          : "create table ") +
+	             delta_table + " (" + StringUtil::Join(columns, ", ") + ")";
+	result.column_count = source_columns.size();
+	return result;
+}
+
 DeltaSchemaDDL BuildCreateDeltaFromDataSQL(Connection &conn, const string &delta_table, const string &data_table,
                                            bool replace) {
 	auto described = conn.Query("DESCRIBE SELECT * FROM " + data_table);
@@ -358,44 +397,17 @@ DeltaSchemaDDL BuildCreateDeltaFromDataSQL(Connection &conn, const string &delta
 		throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
 		                       "': " + described->GetError());
 	}
-	if (described->RowCount() == 0) {
-		throw CatalogException("Could not derive IVM delta schema from empty column list for data table '" +
-		                       data_table + "'");
-	}
-
-	vector<string> columns;
-	unordered_set<string> seen_column_names;
+	vector<pair<string, string>> columns;
 	for (idx_t row = 0; row < described->RowCount(); row++) {
 		if (described->GetValue(0, row).IsNull() || described->GetValue(1, row).IsNull()) {
-			throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
-			                       "': DESCRIBE returned a NULL column name or type");
+			throw CatalogException(
+			    "Could not derive IVM delta schema from data table '%s': DESCRIBE returned a NULL column name or type",
+			    data_table);
 		}
-		auto column_name = described->GetValue(0, row).ToString();
-		auto column_type = described->GetValue(1, row).ToString();
-		if (column_name.empty() || column_type.empty()) {
-			throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
-			                       "': DESCRIBE returned an empty column name or type");
-		}
-		auto column_name_lc = StringUtil::Lower(column_name);
-		if (!seen_column_names.insert(column_name_lc).second) {
-			throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
-			                       "': duplicate column '" + column_name + "'");
-		}
-		if (StringUtil::CIEquals(column_name, openivm::MULTIPLICITY_COL) ||
-		    StringUtil::CIEquals(column_name, openivm::TIMESTAMP_COL)) {
-			throw CatalogException("Could not derive IVM delta schema from data table '" + data_table +
-			                       "': reserved OpenIVM column '" + column_name + "' is already present");
-		}
-		columns.push_back(SqlUtils::QuoteIdentifier(column_name) + " " + column_type);
+		columns.emplace_back(described->GetValue(0, row).ToString(), described->GetValue(1, row).ToString());
 	}
-
-	columns.push_back(string(openivm::MULTIPLICITY_COL) + " INTEGER DEFAULT 1");
-	columns.push_back(string(openivm::TIMESTAMP_COL) + " TIMESTAMP DEFAULT now()");
-	DeltaSchemaDDL result;
-	result.sql = string(replace ? "create or replace table " : "create table if not exists ") + delta_table + " (" +
-	             StringUtil::Join(columns, ", ") + ")";
-	result.column_count = described->RowCount();
-	return result;
+	return BuildDeltaSchemaDDL(columns, delta_table, data_table,
+	                           replace ? OnCreateConflict::REPLACE_ON_CONFLICT : OnCreateConflict::IGNORE_ON_CONFLICT);
 }
 
 // Staged execution suspends the caller transaction. Its rollback callback must
@@ -1492,11 +1504,8 @@ vector<string> RenderTransactionalStatement(const string &input, const string &m
 		if (delta_table.empty() || data_table.empty()) {
 			throw InternalException("Malformed OpenIVM delta-schema operation");
 		}
-		return {string(replace ? "CREATE OR REPLACE TABLE " : "CREATE TABLE ") + delta_table +
-		            " AS SELECT *, 1::INTEGER AS " + string(openivm::MULTIPLICITY_COL) + ", now()::TIMESTAMP AS " +
-		            string(openivm::TIMESTAMP_COL) + " FROM " + data_table + " LIMIT 0",
-		        "ALTER TABLE " + delta_table + " ALTER " + string(openivm::MULTIPLICITY_COL) + " SET DEFAULT 1",
-		        "ALTER TABLE " + delta_table + " ALTER " + string(openivm::TIMESTAMP_COL) + " SET DEFAULT now()"};
+		return {"SELECT true FROM openivm_create_delta_from_data(" + Value(delta_table).ToSQLString() + ", " +
+		        Value(data_table).ToSQLString() + ", " + (replace ? "true" : "false") + ")"};
 	}
 	try {
 		Parser parser;
@@ -1518,6 +1527,40 @@ vector<string> RenderTransactionalStatement(const string &input, const string &m
 		// transactional program is executed.
 	}
 	return {statement};
+}
+
+TableFunction CreateDeltaFromDataFunction() {
+	TableFunction function("openivm_create_delta_from_data",
+	                       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BOOLEAN}, nullptr);
+	function.bind_replace = [](ClientContext &context, TableFunctionBindInput &input) -> unique_ptr<TableRef> {
+		auto delta_table = input.inputs[0].ToString();
+		auto data_table = input.inputs[1].ToString();
+		auto parts = SqlUtils::ParseQualifiedIdentifier(data_table);
+		if (parts.empty() || parts.size() > 3) {
+			throw InternalException("Invalid OpenIVM delta source '%s'", data_table);
+		}
+		string catalog = parts.size() == 3 ? parts[0] : string();
+		string schema = parts.size() >= 2 ? parts[parts.size() - 2] : string();
+		Binder::BindSchemaOrCatalog(context, catalog, schema);
+		auto &table = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, parts.back());
+		vector<pair<string, string>> columns;
+		for (auto &column : table.GetColumns().Logical()) {
+			columns.emplace_back(column.Name(), column.Type().ToString());
+		}
+		// Bind after the preceding lifecycle step creates the data table, in the
+		// caller's transaction. Defaults belong in CREATE: ALTER SET DEFAULT now()
+		// cannot be replayed before DuckDB initializes its default database.
+		auto ddl = BuildDeltaSchemaDDL(columns, delta_table, data_table,
+		                               input.inputs[2].GetValue<bool>() ? OnCreateConflict::REPLACE_ON_CONFLICT
+		                                                                : OnCreateConflict::ERROR_ON_CONFLICT);
+		Parser parser;
+		parser.ParseQuery(ddl.sql);
+		auto binder = Binder::CreateBinder(context, input.binder);
+		auto bound = binder->Bind(*parser.statements[0]);
+		OPENIVM_DEBUG_PRINT("[LIFECYCLE] Bound delta schema with defaults for %s\n", delta_table.c_str());
+		return make_uniq<BoundRefWrapper>(std::move(bound), std::move(binder));
+	};
+	return function;
 }
 
 static void SerializeDropEntry(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
