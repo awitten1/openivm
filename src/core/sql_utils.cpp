@@ -2,6 +2,22 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/parser/expression/subquery_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
+#include "duckdb/parser/query_node/cte_node.hpp"
+#include "duckdb/parser/query_node/recursive_cte_node.hpp"
+#include "duckdb/parser/query_node/select_node.hpp"
+#include "duckdb/parser/query_node/set_operation_node.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
+#include "duckdb/parser/statement/insert_statement.hpp"
+#include "duckdb/parser/statement/select_statement.hpp"
+#include "duckdb/parser/tableref/basetableref.hpp"
+#include "duckdb/parser/tableref/joinref.hpp"
+#include "duckdb/parser/tableref/pivotref.hpp"
+#include "duckdb/parser/tableref/subqueryref.hpp"
+#include "duckdb/parser/tableref/table_function_ref.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
+#include "duckdb/parser/parser.hpp"
 
 #include <cctype>
 #include <cstring>
@@ -10,6 +26,201 @@
 #include <sstream>
 
 namespace duckdb {
+
+// A `BaseTableRef` whose unqualified name matches a CTE visible at that point is a reference to
+// the CTE, not a scan of a same-named relation, so it must never be treated as an unpinned scan.
+struct SourceRefVisitor {
+	const std::function<void(unique_ptr<TableRef> &)> &callback;
+	case_insensitive_set_t cte_names;
+};
+
+static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visitor);
+
+static void SourceVisitExpression(ParsedExpression &expression, const SourceRefVisitor &visitor) {
+	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
+		auto &subquery = expression.Cast<SubqueryExpression>();
+		if (subquery.subquery && subquery.subquery->node) {
+			SourceVisitQueryNode(*subquery.subquery->node, visitor);
+		}
+	}
+	ParsedExpressionIterator::EnumerateChildren(
+	    expression, [&](ParsedExpression &child) { SourceVisitExpression(child, visitor); });
+}
+
+static void SourceVisitTableRef(unique_ptr<TableRef> &ref, const SourceRefVisitor &visitor) {
+	switch (ref->type) {
+	case TableReferenceType::BASE_TABLE: {
+		auto &base_table = ref->Cast<BaseTableRef>();
+		bool unqualified = base_table.catalog_name.empty() && base_table.schema_name.empty();
+		if (unqualified && visitor.cte_names.find(base_table.table_name) != visitor.cte_names.end()) {
+			break;
+		}
+		visitor.callback(ref);
+		break;
+	}
+	case TableReferenceType::JOIN: {
+		auto &join = ref->Cast<JoinRef>();
+		if (join.left) {
+			SourceVisitTableRef(join.left, visitor);
+		}
+		if (join.right) {
+			SourceVisitTableRef(join.right, visitor);
+		}
+		if (join.condition) {
+			SourceVisitExpression(*join.condition, visitor);
+		}
+		break;
+	}
+	case TableReferenceType::SUBQUERY: {
+		auto &subquery = ref->Cast<SubqueryRef>();
+		if (subquery.subquery && subquery.subquery->node) {
+			SourceVisitQueryNode(*subquery.subquery->node, visitor);
+		}
+		break;
+	}
+	case TableReferenceType::PIVOT: {
+		auto &pivot = ref->Cast<PivotRef>();
+		if (pivot.source) {
+			SourceVisitTableRef(pivot.source, visitor);
+		}
+		for (auto &aggregate : pivot.aggregates) {
+			SourceVisitExpression(*aggregate, visitor);
+		}
+		break;
+	}
+	case TableReferenceType::EXPRESSION_LIST:
+	case TableReferenceType::TABLE_FUNCTION: {
+		ParsedExpressionIterator::EnumerateTableRefChildren(*ref, [&](unique_ptr<ParsedExpression> &expression) {
+			if (expression) {
+				SourceVisitExpression(*expression, visitor);
+			}
+		});
+		if (ref->type == TableReferenceType::TABLE_FUNCTION) {
+			auto &function = ref->Cast<TableFunctionRef>();
+			if (function.subquery && function.subquery->node) {
+				SourceVisitQueryNode(*function.subquery->node, visitor);
+			}
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+static void SourceVisitQueryNode(QueryNode &node, const SourceRefVisitor &visitor) {
+	// Each CTE body sees preceding siblings, but not its own name.
+	SourceRefVisitor scoped {visitor.callback, visitor.cte_names};
+	for (auto &cte : node.cte_map.map) {
+		if (cte.second->query && cte.second->query->node) {
+			SourceVisitQueryNode(*cte.second->query->node, scoped);
+		}
+		scoped.cte_names.insert(cte.first);
+	}
+	switch (node.type) {
+	case QueryNodeType::SELECT_NODE: {
+		auto &select = node.Cast<SelectNode>();
+		if (select.from_table) {
+			SourceVisitTableRef(select.from_table, scoped);
+		}
+		auto visit = [&](unique_ptr<ParsedExpression> &expression) {
+			if (expression) {
+				SourceVisitExpression(*expression, scoped);
+			}
+		};
+		for (auto &expression : select.select_list) {
+			visit(expression);
+		}
+		for (auto &expression : select.groups.group_expressions) {
+			visit(expression);
+		}
+		visit(select.where_clause);
+		visit(select.having);
+		visit(select.qualify);
+		break;
+	}
+	case QueryNodeType::SET_OPERATION_NODE: {
+		auto &set_operation = node.Cast<SetOperationNode>();
+		for (auto &child : set_operation.children) {
+			if (child) {
+				SourceVisitQueryNode(*child, scoped);
+			}
+		}
+		break;
+	}
+	case QueryNodeType::RECURSIVE_CTE_NODE: {
+		auto &recursive_cte = node.Cast<RecursiveCTENode>();
+		SourceRefVisitor recursive_scope {visitor.callback, scoped.cte_names};
+		recursive_scope.cte_names.insert(recursive_cte.ctename);
+		if (recursive_cte.left) {
+			SourceVisitQueryNode(*recursive_cte.left, recursive_scope);
+		}
+		if (recursive_cte.right) {
+			SourceVisitQueryNode(*recursive_cte.right, recursive_scope);
+		}
+		break;
+	}
+	case QueryNodeType::CTE_NODE: {
+		auto &cte = node.Cast<CTENode>();
+		if (cte.query) {
+			SourceVisitQueryNode(*cte.query, scoped);
+		}
+		if (cte.child) {
+			SourceRefVisitor child_scope {visitor.callback, scoped.cte_names};
+			child_scope.cte_names.insert(cte.ctename);
+			SourceVisitQueryNode(*cte.child, child_scope);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+	ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &expression) {
+		if (expression) {
+			SourceVisitExpression(*expression, scoped);
+		}
+	});
+}
+
+static void SourceVisitStatement(SQLStatement &statement, const SourceRefVisitor &visitor) {
+	switch (statement.type) {
+	case StatementType::SELECT_STATEMENT: {
+		auto &select = statement.Cast<SelectStatement>();
+		if (select.node) {
+			SourceVisitQueryNode(*select.node, visitor);
+		}
+		break;
+	}
+	case StatementType::CREATE_STATEMENT: {
+		auto &create = statement.Cast<CreateStatement>();
+		if (create.info && create.info->type == CatalogType::TABLE_ENTRY) {
+			auto &table_info = create.info->Cast<CreateTableInfo>();
+			if (table_info.query && table_info.query->node) {
+				SourceVisitQueryNode(*table_info.query->node, visitor);
+			}
+		}
+		break;
+	}
+	case StatementType::INSERT_STATEMENT: {
+		auto &insert = statement.Cast<InsertStatement>();
+		if (insert.select_statement && insert.select_statement->node) {
+			SourceVisitQueryNode(*insert.select_statement->node, visitor);
+		}
+		break;
+	}
+	default:
+		break;
+	}
+}
+
+void SqlUtils::RewriteSourceReferences(SQLStatement &statement,
+                                       const std::function<void(unique_ptr<TableRef> &)> &callback) {
+	SourceVisitStatement(statement, SourceRefVisitor {callback, {}});
+}
+
+void SqlUtils::VisitSourceReferences(SQLStatement &statement, const std::function<void(BaseTableRef &)> &callback) {
+	RewriteSourceReferences(statement, [&](unique_ptr<TableRef> &ref) { callback(ref->Cast<BaseTableRef>()); });
+}
 
 static constexpr const char *CAST_EXPRESSION_PREFIX = "openivm_expr:";
 static constexpr const char *CAST_COLUMN_PLACEHOLDER = "{openivm_column}";
@@ -45,6 +256,16 @@ string SqlUtils::TrimSQLFragment(const string &input) {
 		end--;
 	}
 	return input.substr(start, end - start);
+}
+
+string SqlUtils::IdentifierEqualsSQL(const string &left, const string &right) {
+	// SQL lower() folds Unicode, whereas StringUtil::CIEquals and catalog lookup
+	// fold only A-Z. Preserve every other code point, including quoted identifiers.
+	auto fold = [](const string &expression) {
+		return "translate(" + expression + ", 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')";
+	};
+	// An application collation must not widen physical identifier equality either.
+	return "(" + fold(left) + " COLLATE \"binary\" = " + fold(right) + " COLLATE \"binary\")";
 }
 
 string SqlUtils::BuildCastSpec(const string &target_type, bool try_cast) {
@@ -244,25 +465,6 @@ vector<string> SqlUtils::ParseQualifiedIdentifier(const string &name) {
 	}
 }
 
-static bool ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end, string &identifier) {
-	idx_t pos = start;
-	string segment;
-	if (!ReadIdentifierSegment(sql, pos, segment)) {
-		return false;
-	}
-	identifier = segment;
-	while (pos < sql.size() && sql[pos] == '.') {
-		idx_t dot_pos = pos++;
-		if (!ReadIdentifierSegment(sql, pos, segment)) {
-			pos = dot_pos;
-			break;
-		}
-		identifier += "." + segment;
-	}
-	end = pos;
-	return true;
-}
-
 static bool ReadQualifiedIdentifierSpans(const string &sql, idx_t start, idx_t &end,
                                          vector<IdentifierSegmentSpan> &segments) {
 	idx_t pos = start;
@@ -282,6 +484,17 @@ static bool ReadQualifiedIdentifierSpans(const string &sql, idx_t start, idx_t &
 	}
 	end = pos;
 	return true;
+}
+
+vector<string> SqlUtils::ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end) {
+	vector<IdentifierSegmentSpan> spans;
+	vector<string> parts;
+	if (ReadQualifiedIdentifierSpans(sql, start, end, spans)) {
+		for (auto &span : spans) {
+			parts.push_back(std::move(span.value));
+		}
+	}
+	return parts;
 }
 
 static bool QualifierMatches(const vector<IdentifierSegmentSpan> &segments, const unordered_set<string> &qualifiers) {
@@ -480,15 +693,20 @@ string SqlUtils::ExtractViewQuery(string &query) {
 
 string SqlUtils::SQLToLowercase(const string &sql) {
 	std::stringstream lowercase_stream;
-	bool in_string = false;
+	// Quoted identifiers carry physical catalog/schema identities. Folding them
+	// can select a different metadata catalog even though DuckDB binds the name.
+	char quote = '\0';
 	for (char c : sql) {
-		if (c == '\'') {
-			in_string = !in_string;
-		}
-		if (!in_string) {
-			lowercase_stream << (char)tolower(c);
-		} else {
+		if (quote) {
 			lowercase_stream << c;
+			if (c == quote) {
+				quote = '\0';
+			}
+		} else if (c == '\'' || c == '"') {
+			quote = c;
+			lowercase_stream << c;
+		} else {
+			lowercase_stream << StringUtil::CharacterToLower(c);
 		}
 	}
 	return lowercase_stream.str();
@@ -498,102 +716,21 @@ void SqlUtils::RemoveRedundantWhitespaces(string &query) {
 	query = std::regex_replace(query, std::regex("\\s+"), " ");
 }
 
-void SqlUtils::StripLineComments(string &query) {
-	string out;
-	out.reserve(query.size());
-	bool in_string = false;
-	for (size_t i = 0; i < query.size(); ++i) {
-		char c = query[i];
-		if (c == '\'' && !in_string) {
-			in_string = true;
-			out += c;
-		} else if (c == '\'' && in_string) {
-			in_string = false;
-			out += c;
-		} else if (!in_string && c == '-' && i + 1 < query.size() && query[i + 1] == '-') {
-			// Skip to end of line, preserve the newline so downstream \s+ collapse still works
-			while (i < query.size() && query[i] != '\n') {
-				++i;
-			}
-			if (i < query.size()) {
-				out += '\n';
-			}
-		} else {
-			out += c;
-		}
-	}
-	query = std::move(out);
-}
-
 vector<string> SqlUtils::SplitSQLStatements(const string &sql) {
 	vector<string> statements;
 	idx_t start = 0;
-	bool in_single_quote = false;
-	bool in_double_quote = false;
-	bool in_line_comment = false;
-	bool in_block_comment = false;
-
-	for (idx_t i = 0; i < sql.size(); i++) {
-		auto c = sql[i];
-		auto next = i + 1 < sql.size() ? sql[i + 1] : '\0';
-
-		if (in_line_comment) {
-			if (c == '\n') {
-				in_line_comment = false;
-			}
+	// Match DuckDB's own statement splitting, including dollar-quoted strings
+	// and nested comments, rather than maintaining a second SQL lexer.
+	for (auto &token : Parser::Tokenize(sql)) {
+		if (token.type != SimplifiedTokenType::SIMPLIFIED_TOKEN_OPERATOR || sql[token.start] != ';') {
 			continue;
 		}
-		if (in_block_comment) {
-			if (c == '*' && next == '/') {
-				in_block_comment = false;
-				i++;
-			}
-			continue;
+		auto statement = TrimSQLFragment(sql.substr(start, token.start - start));
+		if (!statement.empty()) {
+			statements.push_back(std::move(statement));
 		}
-		if (in_single_quote) {
-			if (c == '\'' && next == '\'') {
-				i++;
-			} else if (c == '\'') {
-				in_single_quote = false;
-			}
-			continue;
-		}
-		if (in_double_quote) {
-			if (c == '"' && next == '"') {
-				i++;
-			} else if (c == '"') {
-				in_double_quote = false;
-			}
-			continue;
-		}
-
-		if (c == '-' && next == '-') {
-			in_line_comment = true;
-			i++;
-			continue;
-		}
-		if (c == '/' && next == '*') {
-			in_block_comment = true;
-			i++;
-			continue;
-		}
-		if (c == '\'') {
-			in_single_quote = true;
-			continue;
-		}
-		if (c == '"') {
-			in_double_quote = true;
-			continue;
-		}
-		if (c == ';') {
-			auto statement = TrimSQLFragment(sql.substr(start, i - start));
-			if (!statement.empty()) {
-				statements.push_back(std::move(statement));
-			}
-			start = i + 1;
-		}
+		start = token.start + 1;
 	}
-
 	auto statement = TrimSQLFragment(sql.substr(start));
 	if (!statement.empty()) {
 		statements.push_back(std::move(statement));
@@ -660,43 +797,66 @@ string SqlUtils::FullName(const string &catalog, const string &schema, const str
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(table);
 }
 
-string SqlUtils::FullDeltaName(const string &catalog, const string &schema, const string &table) {
-	static const string data_prefix(openivm::DATA_TABLE_PREFIX);
-	string base = table;
-	if (base.size() > data_prefix.size() && base.rfind(data_prefix, 0) == 0) {
-		base = base.substr(data_prefix.size());
-	}
-	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + "." + QuoteIdentifier(DeltaName(base));
-}
-
 string SqlUtils::QualifiedPrefix(const string &catalog, const string &schema) {
 	return QuoteIdentifier(catalog) + "." + QuoteIdentifier(schema) + ".";
 }
 
-string SqlUtils::QuoteQualifiedPrefix(const string &prefix) {
-	if (prefix.empty()) {
-		return "";
+vector<string> SqlUtils::ParseColumnList(const string &raw) {
+	vector<string> columns;
+	string input = raw;
+	StringUtil::Trim(input);
+	if (input.empty()) {
+		return columns;
 	}
-	vector<string> parts;
-	string current;
-	for (auto c : prefix) {
-		if (c == '.') {
-			if (!current.empty()) {
-				parts.push_back(current);
-				current.clear();
+	if (input.front() == '[') {
+		size_t pos = 1;
+		while (pos < input.size()) {
+			while (pos < input.size() && (std::isspace(static_cast<unsigned char>(input[pos])) || input[pos] == ',')) {
+				pos++;
 			}
-			continue;
+			if (pos >= input.size() || input[pos] == ']') {
+				break;
+			}
+			if (input[pos] != '"') {
+				return {};
+			}
+			pos++;
+			string value;
+			while (pos < input.size()) {
+				char c = input[pos++];
+				if (c == '\\' && pos < input.size()) {
+					char esc = input[pos++];
+					value += (esc == 'n') ? '\n' : esc;
+					continue;
+				}
+				if (c == '"') {
+					columns.push_back(value);
+					break;
+				}
+				value += c;
+			}
 		}
-		current += c;
+		return columns;
 	}
-	if (!current.empty()) {
-		parts.push_back(current);
+
+	size_t start = 0;
+	while (start <= input.size()) {
+		size_t end = input.find(',', start);
+		string value = input.substr(start, end == string::npos ? string::npos : end - start);
+		StringUtil::Trim(value);
+		if ((value.size() >= 2 && value.front() == '"' && value.back() == '"') ||
+		    (value.size() >= 2 && value.front() == '\'' && value.back() == '\'')) {
+			value = value.substr(1, value.size() - 2);
+		}
+		if (!value.empty()) {
+			columns.push_back(value);
+		}
+		if (end == string::npos) {
+			break;
+		}
+		start = end + 1;
 	}
-	string quoted;
-	for (auto &part : parts) {
-		quoted += QuoteIdentifier(part) + ".";
-	}
-	return quoted;
+	return columns;
 }
 
 string SqlUtils::JsonQuote(const string &value) {
@@ -848,17 +1008,6 @@ vector<string> SqlUtils::ReplaceEachPlainOccurrence(const string &haystack, cons
 	return variants;
 }
 
-bool SqlUtils::IdentifierMatchesTable(const string &identifier, const string &table_name) {
-	if (StringUtil::CIEquals(identifier, table_name)) {
-		return true;
-	}
-	if (identifier.size() <= table_name.size()) {
-		return false;
-	}
-	auto suffix = identifier.substr(identifier.size() - table_name.size());
-	return identifier[identifier.size() - table_name.size() - 1] == '.' && StringUtil::CIEquals(suffix, table_name);
-}
-
 bool SqlUtils::RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,
                                        const unordered_set<string> &qualifiers, bool allow_unqualified) {
 	string rewritten;
@@ -946,11 +1095,25 @@ static idx_t ExtendPastTimeTravelClause(const string &sql, idx_t end) {
 }
 
 static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sql, const string &table_name,
-                                                                bool include_time_travel_clause) {
+                                                                bool include_time_travel_clause,
+                                                                bool match_all = false) {
 	vector<TableReferenceMatch> matches;
-	if (table_name.empty()) {
+	if (table_name.empty() && !match_all) {
 		return matches;
 	}
+	// Keep component boundaries: a quoted dot is part of a name, not qualification.
+	auto target_parts = match_all ? vector<string>() : SqlUtils::ParseQualifiedIdentifier(table_name);
+	auto matches_table = [&](const vector<IdentifierSegmentSpan> &parts) {
+		if (parts.size() < target_parts.size()) {
+			return false;
+		}
+		for (idx_t part = 0; part < target_parts.size(); part++) {
+			if (!StringUtil::CIEquals(parts[parts.size() - target_parts.size() + part].value, target_parts[part])) {
+				return false;
+			}
+		}
+		return true;
+	};
 	bool in_single_quote = false;
 	bool expect_table = false;
 	for (idx_t i = 0; i < sql.size();) {
@@ -967,16 +1130,16 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 		if (!in_single_quote && IsIdentifierTokenStart(c)) {
 			idx_t start = i;
 			idx_t end = i;
-			string qualified_identifier;
-			if (ReadQualifiedIdentifier(sql, start, end, qualified_identifier)) {
-				if (expect_table && SqlUtils::IdentifierMatchesTable(qualified_identifier, table_name)) {
+			vector<IdentifierSegmentSpan> parts;
+			if (ReadQualifiedIdentifierSpans(sql, start, end, parts)) {
+				if (expect_table && matches_table(parts)) {
 					matches.push_back({start, include_time_travel_clause ? ExtendPastTimeTravelClause(sql, end) : end});
 					i = matches.back().end;
 					expect_table = false;
 					continue;
 				}
 				i = end;
-				expect_table = IsTableReferenceKeyword(qualified_identifier);
+				expect_table = parts.size() == 1 && sql[start] != '"' && IsTableReferenceKeyword(parts[0].value);
 				continue;
 			}
 		}
@@ -986,6 +1149,25 @@ static vector<TableReferenceMatch> CollectTableReferenceMatches(const string &sq
 		i++;
 	}
 	return matches;
+}
+
+string SqlUtils::RewriteTableReferences(const string &sql,
+                                        const std::function<string(const vector<string> &)> &rewrite) {
+	string result;
+	idx_t previous = 0;
+	for (auto &match : CollectTableReferenceMatches(sql, "", false, true)) {
+		auto replacement = rewrite(ParseQualifiedIdentifier(sql.substr(match.start, match.end - match.start)));
+		if (!replacement.empty()) {
+			result.append(sql, previous, match.start - previous);
+			result += replacement;
+			previous = match.end;
+		}
+	}
+	if (previous == 0) {
+		return sql;
+	}
+	result.append(sql, previous, sql.size() - previous);
+	return result;
 }
 
 string SqlUtils::FindTableReference(const string &sql, const string &table_name) {
@@ -1089,7 +1271,6 @@ int64_t SqlUtils::ExtractRefreshInterval(string &query) {
 	string interval_str = match[1].str();
 	// Strip the REFRESH EVERY clause from the query
 	query = std::regex_replace(query, refresh_re, "");
-	SqlUtils::RemoveRedundantWhitespaces(query);
 	return ParseRefreshInterval(interval_str);
 }
 

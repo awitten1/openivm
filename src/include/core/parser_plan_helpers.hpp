@@ -18,6 +18,11 @@
 namespace duckdb {
 
 struct PlanRewriteNeeds;
+class Planner;
+
+// Compiler-only source boundary; generated columns retain their logical identity.
+void PlanWithSourceColumns(Planner &planner, unique_ptr<SQLStatement> statement);
+TableFunction SourceColumnsFunction();
 
 struct DuckLakeSourceTableInfo {
 	string table_name;
@@ -86,7 +91,6 @@ struct CreateMVPlanFacts {
 	unordered_map<idx_t, LogicalOperator *> cte_defs_by_index;
 	unordered_map<string, string> join_parents;
 	vector<BoundColumnRefExpression *> join_refs;
-	vector<pair<BaseColumnRef, BaseColumnRef>> inner_join_edges;
 	unordered_set<string> single_delim_key_bindings;
 	unordered_map<idx_t, ProjectionSourceOccurrence> occurrence_by_index;
 	vector<ProjectionSourceOccurrence> source_occurrences;
@@ -111,8 +115,10 @@ void StripPublicationModifiers(unique_ptr<LogicalOperator> &plan, vector<string>
                                string &ordering);
 /// Collect rewrite requirements while preparing CTEs, then inline eligible CTEs.
 PlanRewriteNeeds InlineCtesIfPresent(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> &plan);
-string QualifyCreateSourceTable(const string &table_name, const string &current_catalog, const string &current_schema,
-                                const string &default_db);
+// Qualify an auxiliary-state source by the catalog and schema the view bound it to.
+string QualifyCreateSourceTable(ClientContext &context, const string &table_name, const CreateMVPlanFacts &facts,
+                                const string &current_catalog, const string &current_schema, const string &default_db,
+                                const string &default_schema);
 string ExplainInitialLoadQuery(Connection &con, const string &label, const string &query);
 CreateMVPlanFacts BuildCreateMVPlanFacts(LogicalOperator *plan, const string &current_catalog);
 bool ResolvesToOutputBinding(idx_t table_index, idx_t column_index, idx_t group_index, size_t group_count,

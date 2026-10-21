@@ -13,8 +13,14 @@ namespace duckdb {
 // Utility functions for SQL string manipulation.
 // Originally from the compiler extension; inlined here to remove the external dependency.
 
+class BaseTableRef;
+
 class SqlUtils {
 public:
+	// Visit real relation references, excluding CTE names in their lexical scope.
+	static void VisitSourceReferences(SQLStatement &statement, const std::function<void(BaseTableRef &)> &callback);
+	static void RewriteSourceReferences(SQLStatement &statement,
+	                                    const std::function<void(unique_ptr<TableRef> &)> &callback);
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
 	static string ExtractTableName(const string &sql);
 	static string EscapeSingleQuotes(const string &input);
@@ -22,8 +28,6 @@ public:
 	static string ExtractViewQuery(string &query);
 	static string SQLToLowercase(const string &sql);
 	static void RemoveRedundantWhitespaces(string &query);
-	/// Strip SQL line comments (-- to end of line) while respecting single-quoted string literals.
-	static void StripLineComments(string &query);
 	/// Trim whitespace without stripping non-ASCII identifier bytes on signed-char builds.
 	static string TrimSQLFragment(const string &input);
 	static vector<string> SplitSQLStatements(const string &sql);
@@ -31,11 +35,17 @@ public:
 	static string DeltaName(const string &name);
 	static string LastIdentifierPart(string name);
 	static vector<string> ParseQualifiedIdentifier(const string &name);
+	// Read one identifier at start without scanning the statement body.
+	static vector<string> ReadQualifiedIdentifier(const string &sql, idx_t start, idx_t &end);
+	// Empty replacement keeps a reference unchanged; visit all references in one scan.
+	static string RewriteTableReferences(const string &sql,
+	                                     const std::function<string(const vector<string> &)> &rewrite);
 	static string FullName(const string &catalog, const string &schema, const string &table);
-	static string FullDeltaName(const string &catalog, const string &schema, const string &table);
+	/// Compare SQL expressions holding catalog identifiers using DuckDB's ASCII-only case folding.
+	static string IdentifierEqualsSQL(const string &left, const string &right);
 	static string QualifiedPrefix(const string &catalog, const string &schema);
-	static string QuoteQualifiedPrefix(const string &prefix);
 	static string JsonQuote(const string &value);
+	static vector<string> ParseColumnList(const string &raw);
 	static string JsonArray(const vector<string> &values);
 	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
 	                                    const string &table, int64_t last_snapshot_id, int64_t current_snapshot_id);
@@ -65,12 +75,13 @@ public:
 	static string ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement);
 	static vector<string> ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
 	                                                 const string &replacement);
+	// Table-reference helpers accept SQL identifier spellings. Use QuoteIdentifier for
+	// raw table names from the catalog so embedded dots and quotes retain their meaning.
 	static string ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement);
 	static string ReplaceTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence,
 	                                              const string &replacement, bool &replaced);
 	static vector<string> ReplaceEachTableReference(const string &sql, const string &table_name,
 	                                                const string &replacement);
-	static bool IdentifierMatchesTable(const string &identifier, const string &table_name);
 	static bool RewriteColumnReferences(string &sql, const string &old_name, const string &new_name,
 	                                    const unordered_set<string> &qualifiers, bool allow_unqualified);
 	static string FindTableReference(const string &sql, const string &table_name);

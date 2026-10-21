@@ -5,14 +5,28 @@
 
 namespace duckdb {
 namespace openivm {
+constexpr const char *SOURCE_GENERATIONS_TABLE = "openivm_source_generations";
+static constexpr const char *SOURCE_DELTA_MAP_TABLE = "openivm_source_deltas";
 constexpr const char *RUNNING_INPUT_PREFIX = "openivm_running_";
 constexpr const char *ROWS_POSITION_PREFIX = "openivm_rows_position_";
+
+// Schema for control metadata. Unset keeps each catalog's existing metadata schema (main for new metadata).
+constexpr const char *METADATA_SCHEMA_SETTING = "openivm_metadata_schema";
+// Schema for internal maintenance tables within each data catalog. Unset keeps them beside
+// the materialized view and its sources. Applies to objects created while it is set.
+constexpr const char *INTERNAL_SCHEMA_SETTING = "openivm_internal_schema";
 
 // System table names
 constexpr const char *VIEWS_TABLE = "openivm_views";
 constexpr const char *DELTA_TABLES_TABLE = "openivm_delta_tables";
 constexpr const char *HISTORY_TABLE = "openivm_refresh_history";
 constexpr const char *PROFILE_TABLE = "openivm_refresh_profile";
+// Compiled CREATE/REFRESH SQL archive: one row per distinct program version, and
+// that version's statements in execution order.
+constexpr const char *COMPILED_PROGRAMS_TABLE = "openivm_compiled_programs";
+constexpr const char *COMPILED_STATEMENTS_TABLE = "openivm_compiled_statements";
+
+constexpr const char *REFRESH_HOOKS_TABLE = "openivm_refresh_hooks";
 
 // View-matching system tables.
 constexpr const char *MV_DEPS_TABLE = "openivm_mv_dependencies";

@@ -5,6 +5,7 @@
 #include "core/refresh_metadata.hpp"
 #include "core/time_travel_pins.hpp"
 #include "duckdb.hpp"
+#include "core/mv_profiler.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/planner/logical_operator.hpp"
@@ -35,6 +36,9 @@ struct DuckLakeSourceLocation {
 	string schema_name;
 	string table_name;
 };
+
+string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
+                                        int64_t current_snapshot_id);
 
 struct DuckLakeSourceSpec {
 	string metadata_key;
@@ -122,14 +126,8 @@ private:
 
 struct RefreshCostEstimate;
 
-struct RefreshCompileProfileStep {
-	string step_name;
-	int64_t duration_ms;
-	string detail;
-};
-
 struct RefreshCompileProfile {
-	vector<RefreshCompileProfileStep> steps;
+	vector<MVProfileStep> steps;
 
 	void AddStep(const string &step_name, std::chrono::steady_clock::time_point start,
 	             const string &detail = string()) {
@@ -179,12 +177,14 @@ string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &quer
                                     const string &old_table, const string &new_table, const string &filter);
 bool IsSummableLogicalType(const LogicalType &type);
 string NormalizeColumnNameForMatch(const string &name);
+// Resolve a logical source to its metadata key using catalog and schema as well as its name.
+string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
+                               const vector<string> &delta_table_names);
 string BaseTableNameFromDeltaKey(const string &delta_key);
 string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec);
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
-                                     const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs,
-                                     const string &lpts_table_prefix);
+                                     const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs);
 string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
                                  const string &extra_predicate = "");
 
@@ -194,7 +194,7 @@ string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, c
                            bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
                            const string &catalog_prefix = "", const string &metadata_prefix = "",
                            string *out_post_meta = nullptr, vector<string> *deferred_cleanup = nullptr,
-                           const vector<string> &metadata_catalogs = {});
+                           const vector<string> &delta_metadata_tables = {}, const string &data_catalog = "");
 
 string BuildFullOuterAffectedGroupRefresh(RefreshMetadata &metadata, const string &view_name,
                                           const vector<string> &delta_table_names, const vector<string> &group_cols,
@@ -271,6 +271,10 @@ DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, C
                                                     const string &table_name, const string &catalog_name,
                                                     const string &schema_name, int64_t last_snapshot_id,
                                                     int64_t current_snapshot_id);
+// Whether the DuckLake table at `loc` (id `table_id`, -1 if unknown) changed in a snapshot
+// after `after_snapshot_id` up to `through_snapshot_id`. `ok` is false when unverifiable.
+DuckLakeTableActivity ProbeDuckLakeTableChanges(Connection &con, const DuckLakeSourceLocation &loc, int64_t table_id,
+                                                int64_t after_snapshot_id, int64_t through_snapshot_id);
 
 string BuildWindowPartitionRefresh(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                    const string &view_query_sql, const vector<string> &delta_table_names,

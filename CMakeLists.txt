@@ -13,6 +13,8 @@ include_directories(src/include ${LPTS_DIR}/src/include ${LPTS_DIR}/third_party/
 set(EXTENSION_SOURCES
     src/openivm_extension.cpp
     src/compile_facts.cpp
+    src/core/compiled_sql_archive.cpp
+    src/core/mv_profiler.cpp
     src/core/ivm_delta_model.cpp
     src/core/ivm_view_classifier.cpp
     src/core/parser.cpp
@@ -23,6 +25,7 @@ set(EXTENSION_SOURCES
     src/core/parser_sql_extractors.cpp
     src/core/sql_utils.cpp
     src/core/time_travel_pins.cpp
+    src/core/metadata_location.cpp
     src/core/refresh_metadata.cpp
     src/core/published_view.cpp
     src/core/incremental_checker.cpp
@@ -135,6 +138,13 @@ if(NOT EMSCRIPTEN)
 
     add_executable(scheduler_catalog_test test/integration/scheduler_catalog_test.cpp)
     target_link_libraries(scheduler_catalog_test ${OPENIVM_LINK_LIBS})
+
+    add_executable(benchmark_metadata_test test/integration/benchmark_metadata_test.cpp)
+    target_link_libraries(benchmark_metadata_test ${OPENIVM_LINK_LIBS})
+    target_include_directories(benchmark_metadata_test PUBLIC benchmark/src)
+
+    add_executable(source_delta_publication_test test/integration/source_delta_publication_test.cpp)
+    target_link_libraries(source_delta_publication_test ${OPENIVM_LINK_LIBS})
 endif()
 
 # Benchmark tools are currently supported on Unix native platforms.

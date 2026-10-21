@@ -1,210 +1,23 @@
 #include "core/time_travel_pins.hpp"
 
 #include "core/openivm_debug.hpp"
+#include "core/sql_utils.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
-#include "duckdb/parser/expression/subquery_expression.hpp"
-#include "duckdb/parser/parsed_expression_iterator.hpp"
-#include "duckdb/parser/query_node/cte_node.hpp"
-#include "duckdb/parser/query_node/recursive_cte_node.hpp"
-#include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/parser/query_node/set_operation_node.hpp"
-#include "duckdb/parser/statement/create_statement.hpp"
-#include "duckdb/parser/statement/insert_statement.hpp"
-#include "duckdb/parser/statement/select_statement.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
-#include "duckdb/parser/tableref/joinref.hpp"
-#include "duckdb/parser/tableref/pivotref.hpp"
-#include "duckdb/parser/tableref/subqueryref.hpp"
-#include "duckdb/parser/tableref/table_function_ref.hpp"
-#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "lpts_helpers.hpp"
 #include "lpts_sql_scanner.hpp"
 
 #include <cctype>
+#include <map>
 
 namespace duckdb {
 namespace openivm {
 
 using BaseTableRefCallback = std::function<void(BaseTableRef &)>;
-
-// A `BaseTableRef` whose unqualified name matches a CTE visible at that point is a reference to
-// the CTE, not a scan of a same-named relation, so it must never be treated as an unpinned scan.
-struct RefVisitor {
-	const BaseTableRefCallback &callback;
-	case_insensitive_set_t cte_names;
-};
-
-static void VisitQueryNode(QueryNode &node, const RefVisitor &visitor);
-
-static void VisitExpression(ParsedExpression &expression, const RefVisitor &visitor) {
-	if (expression.GetExpressionClass() == ExpressionClass::SUBQUERY) {
-		auto &subquery = expression.Cast<SubqueryExpression>();
-		if (subquery.subquery && subquery.subquery->node) {
-			VisitQueryNode(*subquery.subquery->node, visitor);
-		}
-	}
-	ParsedExpressionIterator::EnumerateChildren(expression,
-	                                            [&](ParsedExpression &child) { VisitExpression(child, visitor); });
-}
-
-static void VisitTableRef(TableRef &ref, const RefVisitor &visitor) {
-	switch (ref.type) {
-	case TableReferenceType::BASE_TABLE: {
-		auto &base_table = ref.Cast<BaseTableRef>();
-		bool unqualified = base_table.catalog_name.empty() && base_table.schema_name.empty();
-		if (unqualified && visitor.cte_names.find(base_table.table_name) != visitor.cte_names.end()) {
-			break;
-		}
-		visitor.callback(base_table);
-		break;
-	}
-	case TableReferenceType::JOIN: {
-		auto &join = ref.Cast<JoinRef>();
-		if (join.left) {
-			VisitTableRef(*join.left, visitor);
-		}
-		if (join.right) {
-			VisitTableRef(*join.right, visitor);
-		}
-		if (join.condition) {
-			VisitExpression(*join.condition, visitor);
-		}
-		break;
-	}
-	case TableReferenceType::SUBQUERY: {
-		auto &subquery = ref.Cast<SubqueryRef>();
-		if (subquery.subquery && subquery.subquery->node) {
-			VisitQueryNode(*subquery.subquery->node, visitor);
-		}
-		break;
-	}
-	case TableReferenceType::PIVOT: {
-		auto &pivot = ref.Cast<PivotRef>();
-		if (pivot.source) {
-			VisitTableRef(*pivot.source, visitor);
-		}
-		break;
-	}
-	case TableReferenceType::TABLE_FUNCTION: {
-		auto &table_function = ref.Cast<TableFunctionRef>();
-		if (table_function.function) {
-			VisitExpression(*table_function.function, visitor);
-		}
-		break;
-	}
-	default:
-		break;
-	}
-}
-
-static void VisitQueryNode(QueryNode &node, const RefVisitor &visitor) {
-	// Each CTE body sees preceding siblings, but not its own name.
-	RefVisitor scoped {visitor.callback, visitor.cte_names};
-	for (auto &cte : node.cte_map.map) {
-		if (cte.second->query && cte.second->query->node) {
-			VisitQueryNode(*cte.second->query->node, scoped);
-		}
-		scoped.cte_names.insert(cte.first);
-	}
-	switch (node.type) {
-	case QueryNodeType::SELECT_NODE: {
-		auto &select = node.Cast<SelectNode>();
-		if (select.from_table) {
-			VisitTableRef(*select.from_table, scoped);
-		}
-		auto visit = [&](unique_ptr<ParsedExpression> &expression) {
-			if (expression) {
-				VisitExpression(*expression, scoped);
-			}
-		};
-		for (auto &expression : select.select_list) {
-			visit(expression);
-		}
-		for (auto &expression : select.groups.group_expressions) {
-			visit(expression);
-		}
-		visit(select.where_clause);
-		visit(select.having);
-		visit(select.qualify);
-		break;
-	}
-	case QueryNodeType::SET_OPERATION_NODE: {
-		auto &set_operation = node.Cast<SetOperationNode>();
-		for (auto &child : set_operation.children) {
-			if (child) {
-				VisitQueryNode(*child, scoped);
-			}
-		}
-		break;
-	}
-	case QueryNodeType::RECURSIVE_CTE_NODE: {
-		auto &recursive_cte = node.Cast<RecursiveCTENode>();
-		RefVisitor recursive_scope {visitor.callback, scoped.cte_names};
-		recursive_scope.cte_names.insert(recursive_cte.ctename);
-		if (recursive_cte.left) {
-			VisitQueryNode(*recursive_cte.left, recursive_scope);
-		}
-		if (recursive_cte.right) {
-			VisitQueryNode(*recursive_cte.right, recursive_scope);
-		}
-		break;
-	}
-	case QueryNodeType::CTE_NODE: {
-		auto &cte = node.Cast<CTENode>();
-		if (cte.query) {
-			VisitQueryNode(*cte.query, scoped);
-		}
-		if (cte.child) {
-			RefVisitor child_scope {visitor.callback, scoped.cte_names};
-			child_scope.cte_names.insert(cte.ctename);
-			VisitQueryNode(*cte.child, child_scope);
-		}
-		break;
-	}
-	default:
-		break;
-	}
-	ParsedExpressionIterator::EnumerateQueryNodeModifiers(node, [&](unique_ptr<ParsedExpression> &expression) {
-		if (expression) {
-			VisitExpression(*expression, scoped);
-		}
-	});
-}
-
-static void VisitStatement(SQLStatement &statement, const RefVisitor &visitor) {
-	switch (statement.type) {
-	case StatementType::SELECT_STATEMENT: {
-		auto &select = statement.Cast<SelectStatement>();
-		if (select.node) {
-			VisitQueryNode(*select.node, visitor);
-		}
-		break;
-	}
-	case StatementType::CREATE_STATEMENT: {
-		auto &create = statement.Cast<CreateStatement>();
-		if (create.info && create.info->type == CatalogType::TABLE_ENTRY) {
-			auto &table_info = create.info->Cast<CreateTableInfo>();
-			if (table_info.query && table_info.query->node) {
-				VisitQueryNode(*table_info.query->node, visitor);
-			}
-		}
-		break;
-	}
-	case StatementType::INSERT_STATEMENT: {
-		auto &insert = statement.Cast<InsertStatement>();
-		if (insert.select_statement && insert.select_statement->node) {
-			VisitQueryNode(*insert.select_statement->node, visitor);
-		}
-		break;
-	}
-	default:
-		break;
-	}
-}
 
 // Resolve without the AT clause; DuckDB owns lookup errors for unresolved relations.
 static optional_ptr<CatalogEntry> LookupPinRelation(ClientContext &context, BaseTableRef &ref) {
@@ -270,8 +83,7 @@ TimeTravelPins TimeTravelPins::Peel(ClientContext &context, SQLStatement &statem
 		                    pin.snapshot->ToString().c_str(), ref.table_name.c_str(), pin.binds_natively);
 		result.pins[ref.table_name] = std::move(pin);
 	};
-	RefVisitor visitor {callback, case_insensitive_set_t()};
-	VisitStatement(statement, visitor);
+	SqlUtils::VisitSourceReferences(statement, callback);
 	for (auto &entry : result.pins) {
 		if (unpinned.find(entry.first) != unpinned.end()) {
 			ThrowAmbiguousPin(entry.first, "it is scanned both pinned and unpinned");
@@ -342,7 +154,7 @@ string TimeTravelPins::StripFrom(ClientContext &context, const string &sql) cons
 			ref.at_clause.reset();
 		}
 	};
-	VisitStatement(*parser.statements[0], RefVisitor {callback, {}});
+	SqlUtils::VisitSourceReferences(*parser.statements[0], callback);
 	return parser.statements[0]->ToString();
 }
 
@@ -421,6 +233,60 @@ static idx_t SkipIgnorableSpan(const string &sql, idx_t pos) {
 		pos = end;
 	}
 	return pos;
+}
+
+string TimeTravelPins::QualifySources(ClientContext &context, const string &sql) {
+	Parser parser(context.GetParserOptions());
+	parser.ParseQuery(sql);
+	if (parser.statements.size() != 1) {
+		throw InternalException("Expected one view query while qualifying sources");
+	}
+	// Parsed locations identify individual references, including repeated names and public MVs
+	// whose bound scans name an internal publication table. Keep raw SQL rather than serializing
+	// the query node: original-SQL fallback must also work for unsupported plan shapes.
+	std::map<idx_t, std::pair<idx_t, string>> replacements;
+	BaseTableRefCallback callback = [&](BaseTableRef &ref) {
+		auto relation = LookupPinRelation(context, ref);
+		if (!relation) {
+			return; // Let normal binding report unresolved relations and handle replacement scans.
+		}
+		if (!ref.query_location.IsValid()) {
+			throw InternalException("Missing source location while qualifying '%s'", ref.table_name);
+		}
+		auto start = ref.query_location.GetIndex();
+		auto end = start;
+		idx_t components = 1 + !ref.schema_name.empty() + !ref.catalog_name.empty();
+		for (idx_t i = 0; i < components; i++) {
+			end = SkipIgnorableSpan(sql, end);
+			if (end < sql.size() && sql[end] == '"') {
+				string ignored;
+				end = CopyQuotedRun(sql, end, ignored);
+			} else {
+				while (end < sql.size() && !std::isspace(static_cast<unsigned char>(sql[end])) && sql[end] != '.' &&
+				       sql[end] != ',' && sql[end] != ')' && sql[end] != ';' && sql[end] != '/' && sql[end] != '-') {
+					end++;
+				}
+			}
+			if (i + 1 < components) {
+				end = SkipIgnorableSpan(sql, end);
+				if (end >= sql.size() || sql[end] != '.') {
+					throw InternalException("Invalid source span while qualifying '%s'", ref.table_name);
+				}
+				end++;
+			}
+		}
+		auto qualified =
+		    SqlUtils::FullName(relation->ParentCatalog().GetName(), relation->ParentSchema().name, relation->name);
+		replacements[start] = {end, qualified};
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Original SQL source '%s' resolves to %s\n", ref.table_name.c_str(),
+		                    qualified.c_str());
+	};
+	SqlUtils::VisitSourceReferences(*parser.statements[0], callback);
+	string result = sql;
+	for (auto it = replacements.rbegin(); it != replacements.rend(); ++it) {
+		result.replace(it->first, it->second.first - it->first, it->second.second);
+	}
+	return result;
 }
 
 // Words that close a FROM list, so a comma past them separates something other than relations.
