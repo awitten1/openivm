@@ -1004,7 +1004,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 						// Matches CreateDeltaGetNode's convention: the stored snapshot was already
 						// consumed, so start one past it. Insertions are +1, deletions -1.
 						auto source_location = metadata.GetSourceLocation(view_name, delta_name);
-						if (last_snap >= cur_snap) {
+						if (last_snap == cur_snap) {
 							// Nothing consumed since the last refresh: snapshot last_snap + 1 does not
 							// exist yet, so avoid the table functions and read a typed empty relation.
 							string base_full =
