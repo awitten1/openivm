@@ -196,13 +196,10 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Intercepted query: %s\n", query_lower.c_str());
 
-	// Detect CREATE OR REPLACE MATERIALIZED VIEW
-	bool is_replace = false;
-	std::regex or_replace_re("\\bcreate\\s+or\\s+replace\\s+materialized\\s+view\\b", std::regex::icase);
-	if (std::regex_search(query_lower, or_replace_re)) {
-		is_replace = true;
-		// Strip "or replace" so the rest of the pipeline sees "create materialized view"
-		query_lower = std::regex_replace(query_lower, std::regex("\\bor\\s+replace\\s+"), "");
+	// Rewrite only the CREATE header; quoted names can contain the same keywords.
+	bool is_replace = StringUtil::StartsWith(header, "create or replace materialized view ");
+	if (is_replace) {
+		query_lower = std::regex_replace(query_lower, std::regex("^create\\s+or\\s+replace\\s+"), "create ");
 	}
 
 	// Extract REFRESH EVERY clause before structural rewrite (strips it from the query)
