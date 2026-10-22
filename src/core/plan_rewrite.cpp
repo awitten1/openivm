@@ -1362,11 +1362,12 @@ static void PropagateBindingThroughOperatorPath(ClientContext &context, Binder &
 				current = ColumnBinding(projection.table_index, projection.expressions.size() - 1);
 			}
 			projection.ResolveOperatorTypes();
-		} else if (entry.op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+		} else if (entry.op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY &&
+		           StringUtil::StartsWith(alias, openivm::FULL_SCOPE_PREFIX)) {
 			auto &aggregate = entry.op->Cast<LogicalAggregate>();
 			// Presence is an existential property of the group. Grouping by an
 			// arm's marker would split duplicates contributed by different arms.
-			D_ASSERT(type == LogicalType::BOOLEAN && StringUtil::StartsWith(alias, openivm::FULL_SCOPE_PREFIX));
+			D_ASSERT(type == LogicalType::BOOLEAN);
 			auto function = BindAggregateByName(context, "bool_or", {type});
 			vector<unique_ptr<Expression>> arguments;
 			arguments.push_back(make_uniq<BoundColumnRefExpression>(type, current));

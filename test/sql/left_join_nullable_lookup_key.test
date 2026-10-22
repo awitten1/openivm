@@ -10,6 +10,73 @@ SET openivm_files_path='__TEST_DIR__';
 statement ok
 SET openivm_cascade_refresh='off';
 
+# A DISTINCT window over an outer join can propagate an integer refresh key
+# through an aggregate. Only Boolean scope-presence markers use BOOL_OR.
+statement ok
+CREATE TABLE distinct_window_left(g INTEGER, id INTEGER);
+
+statement ok
+CREATE TABLE distinct_window_right(g INTEGER, id INTEGER);
+
+statement ok
+INSERT INTO distinct_window_left VALUES (1,1),(1,2),(2,3);
+
+statement ok
+INSERT INTO distinct_window_right VALUES (1,1);
+
+statement ok
+CREATE VIEW expected_distinct_window AS SELECT DISTINCT l.g, COUNT(r.id) OVER (PARTITION BY l.g) AS n FROM distinct_window_left l LEFT JOIN distinct_window_right r ON l.g=r.g AND l.id=r.id;
+
+statement ok
+CREATE MATERIALIZED VIEW distinct_window_mv AS SELECT DISTINCT l.g, COUNT(r.id) OVER (PARTITION BY l.g) AS n FROM distinct_window_left l LEFT JOIN distinct_window_right r ON l.g=r.g AND l.id=r.id;
+
+query I
+SELECT type FROM openivm_views WHERE view_sql_name='distinct_window_mv';
+----
+5
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_window_mv) EXCEPT ALL (SELECT * FROM expected_distinct_window));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_distinct_window) EXCEPT ALL (SELECT * FROM distinct_window_mv));
+----
+0
+
+statement ok
+INSERT INTO distinct_window_right VALUES (1,1),(2,3);
+
+statement ok
+PRAGMA refresh('distinct_window_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_window_mv) EXCEPT ALL (SELECT * FROM expected_distinct_window));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_distinct_window) EXCEPT ALL (SELECT * FROM distinct_window_mv));
+----
+0
+
+statement ok
+DELETE FROM distinct_window_right WHERE g=1;
+
+statement ok
+PRAGMA refresh('distinct_window_mv');
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM distinct_window_mv) EXCEPT ALL (SELECT * FROM expected_distinct_window));
+----
+0
+
+query I
+SELECT COUNT(*) FROM ((SELECT * FROM expected_distinct_window) EXCEPT ALL (SELECT * FROM distinct_window_mv));
+----
+0
+
 statement ok
 CREATE TABLE events(id INTEGER, customer VARCHAR, amount INTEGER);
 
