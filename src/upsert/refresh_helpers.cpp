@@ -1023,14 +1023,15 @@ static FullOuterScopeRows ReadScopeRows(RefreshMetadata &metadata, const string 
 		throw InternalException("Missing FULL JOIN delta source for '%s'", input.table);
 	}
 	auto current = SqlUtils::FindTableReferenceOccurrence(query, input.table, input.occurrence);
-	auto delta = metadata.ResolveDeltaQualifiedName(view_name, name);
 	if (metadata.IsDuckLakeTable(view_name, name)) {
 		auto snapshot = metadata.GetLastSnapshotId(view_name, name);
 		if (snapshot < 0) {
 			throw InternalException("Missing FULL JOIN snapshot for '%s'", input.table);
 		}
-		return {current, current + " AT (VERSION => " + to_string(snapshot) + ")", "(SELECT * FROM " + delta + ")"};
+		return {current, current + " AT (VERSION => " + to_string(snapshot) + ")",
+		        ResolveFullOuterDeltaSource(metadata, view_name, name)};
 	}
+	auto delta = metadata.ResolveDeltaQualifiedName(view_name, name);
 	auto weighted_delta = [&](const string &comparison) {
 		return "SELECT openivm_scope_delta.* EXCLUDE (" + string(openivm::MULTIPLICITY_COL) + ", " +
 		       string(openivm::TIMESTAMP_COL) + ") FROM " + delta +
