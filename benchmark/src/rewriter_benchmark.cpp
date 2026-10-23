@@ -635,6 +635,10 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					con.Query("DROP TABLE IF EXISTS " + cat + ".main." + tn);
 				}
 			}
+			// A crashed child may leave encoded backing tables after its user view is gone.
+			for (auto &view : leftover_keys) {
+				con.Query("DROP TABLE IF EXISTS " + SqlUtils::FullName(view.catalog, view.schema, "openivm_data_" + view.key));
+			}
 			// Clean orphaned metadata rows in the native catalog. Views are keyed internally;
 			// match their SQL names as well as legacy keys equal to the SQL name.
 			string orphan_views = "SELECT view_name FROM " + metadata_table("openivm_views") +
