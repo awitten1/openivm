@@ -10,6 +10,7 @@
 #include "duckdb/common/printer.hpp"
 #include "core/openivm_extension.hpp"
 #include "core/refresh_metadata.hpp"
+#include "core/sql_utils.hpp"
 #include "benchmark_metadata.hpp"
 #include "tpcc_helpers.hpp"
 #include "tpcdi_helpers.hpp"
@@ -634,6 +635,11 @@ static void ChildWorkerMain(int read_fd, int write_fd, const string &db_path, co
 					string tn = orphaned->GetValue(1, r).ToString();
 					con.Query("DROP TABLE IF EXISTS " + cat + ".main." + tn);
 				}
+			}
+			// A crashed child may leave encoded backing tables after its user view is gone.
+			for (auto &view : leftover_keys) {
+				con.Query("DROP TABLE IF EXISTS " +
+				          duckdb::SqlUtils::FullName(view.catalog, view.schema, "openivm_data_" + view.key));
 			}
 			// Clean orphaned metadata rows in the native catalog. Views are keyed internally;
 			// match their SQL names as well as legacy keys equal to the SQL name.
