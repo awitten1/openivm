@@ -330,22 +330,12 @@ static void RefreshViewAttempt(ClientContext &context, const string &view_catalo
 		                       precomputed_delta_activity, adaptive_refresh ? &cost_estimate : nullptr,
 		                       /*facts=*/nullptr, /*metadata_connection=*/nullptr, &delete_retry_plan,
 		                       /*write_query_file=*/true, collect_cleanup ? &deferred_cleanup : nullptr);
-		string fallback_sql;
-		// The fallback defers the same cleanup as the primary program, so it never writes
-		// outside the data catalog either.
-		vector<string> fallback_deferred_cleanup;
-		if (delete_retry_plan.IsActive()) {
-			// Compile the ranked rowid program before setting refresh_in_progress. It is only
-			// executed when DuckLake reports that the exhaustive tuple delete removed more
-			// rows than the negative delta requested.
-			fallback_sql = GenerateRefreshSQL(
-			    context, view_catalog_name, view_schema_name, vn, cross_system, attached_db_catalog_name,
-			    attached_db_schema_name, cross_system ? &meta_pre_sql : nullptr,
-			    cross_system ? &meta_post_sql : nullptr, /*compile_profile=*/nullptr, precomputed_delta_activity,
-			    /*out_adaptive_estimate=*/nullptr, /*facts=*/nullptr, /*metadata_connection=*/nullptr,
-			    /*delete_retry_plan=*/nullptr, /*write_query_file=*/false,
-			    collect_cleanup ? &fallback_deferred_cleanup : nullptr);
-		}
+		// The ranked rowid program is compiled with the primary one, before refresh_in_progress is set.
+		// It only runs when DuckLake reports that the exhaustive tuple delete removed more rows than the
+		// negative delta requested, and defers the same cleanup, so it never writes outside the data
+		// catalog either.
+		string &fallback_sql = delete_retry_plan.fallback_program;
+		vector<string> fallback_deferred_cleanup = deferred_cleanup;
 		// The archived program is exactly what this refresh executes, in order: after a
 		// delete retry, the fallback that replaced the rolled-back attempt, and for
 		// DuckLake the snapshot publication between the data and watermark statements.
@@ -929,9 +919,8 @@ static bool TrySkipEmptyRefresh(ClientContext &context, RefreshMetadata &metadat
 		return false;
 	}
 
-	auto view_query_sql = metadata.GetViewQuery(view_name);
 	auto delta_tables = metadata.GetDeltaTables(view_name);
-	auto activity = BuildDeltaActivityResult(metadata, con, view_name, view_query_sql, delta_tables, view_catalog_name,
+	auto activity = BuildDeltaActivityResult(metadata, con, view_name, delta_tables, view_catalog_name,
 	                                         view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 	if (!activity.active_delta_table_names.empty() || activity.requires_full_refresh) {
 		if (active_activity) {

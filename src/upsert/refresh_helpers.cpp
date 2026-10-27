@@ -5,6 +5,7 @@
 #include "core/published_view.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/sql_utils.hpp"
+#include "sql_dialect.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry.hpp"
@@ -133,7 +134,7 @@ struct FojJoinInfo {
 	}
 };
 
-string NormalizeColumnNameForMatch(const string &name) {
+static string NormalizeColumnNameForMatch(const string &name) {
 	string normalized;
 	for (auto c : name) {
 		if (std::isalnum(static_cast<unsigned char>(c))) {
@@ -195,6 +196,13 @@ string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64
 	return "(" + insertions + "\nUNION ALL\n" + deletions + ")";
 }
 
+RefreshMetadata::DeltaChangeStats GetDuckLakeDeltaChangeStats(RefreshMetadata &metadata,
+                                                              const DuckLakeSourceLocation &loc,
+                                                              int64_t last_snapshot_id, int64_t current_snapshot_id) {
+	return metadata.GetStandardDeltaChangeStats(
+	    BuildDuckLakeSignedDeltaRelation(loc, last_snapshot_id, current_snapshot_id), DUCKLAKE_SYNTHETIC_LAST_UPDATE);
+}
+
 static string ResolveFullOuterDeltaSource(RefreshMetadata &metadata, const string &view_name, const string &delta_key) {
 	if (!metadata.IsDuckLakeTable(view_name, delta_key)) {
 		return metadata.ResolveDeltaQualifiedName(view_name, delta_key);
@@ -213,8 +221,8 @@ static string ResolveFullOuterDeltaSource(RefreshMetadata &metadata, const strin
 	    current_snapshot);
 }
 
-string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
-                                 const string &extra_predicate) {
+static string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
+                                        const string &extra_predicate = "") {
 	string predicate;
 	if (!last_update.empty()) {
 		predicate = string(openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP";
@@ -231,21 +239,13 @@ string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &la
 }
 
 string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec) {
-	string delta_subselect;
-	if (spec.is_ducklake) {
-		delta_subselect =
-		    "(SELECT * FROM " +
-		    SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", spec.ducklake_catalog, spec.ducklake_schema,
-		                                    spec.base_table, spec.last_snapshot_id, spec.current_snapshot_id) +
-		    "\nUNION ALL\nSELECT * FROM " +
-		    SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", spec.ducklake_catalog, spec.ducklake_schema,
-		                                    spec.base_table, spec.last_snapshot_id, spec.current_snapshot_id) +
-		    ")";
-	} else {
-		delta_subselect = BuildStandardDeltaRowsSQL(spec.delta_table_sql, spec.last_update);
+	if (!spec.is_ducklake) {
+		return BuildStandardDeltaRowsSQL(spec.delta_table_sql, spec.last_update);
 	}
-
-	return delta_subselect;
+	return BuildStandardDeltaRowsSQL(
+	    BuildDuckLakeSignedDeltaRelation({spec.ducklake_catalog, spec.ducklake_schema, spec.base_table},
+	                                     spec.last_snapshot_id, spec.current_snapshot_id),
+	    "");
 }
 
 // Delta substitution finds matched groups, but not the null-extended groups that
@@ -300,6 +300,14 @@ string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &vi
 	OPENIVM_DEBUG_PRINT("[UPSERT] Full outer unmatched group discovery for %s: %zu changed sources\n",
 	                    view_name.c_str(), delta_specs.size());
 	return groups;
+}
+
+static string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_query_sql,
+                                          const string &recompute_alias, const string &delete_where,
+                                          const string &insert_where, const string &statement_prefix = "") {
+	return statement_prefix + "DELETE FROM " + data_table + " WHERE " + delete_where + ";\n" + statement_prefix +
+	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " +
+	       insert_where + ";\n";
 }
 
 static bool GroupColumnMatchesJoinColumn(const string &group_col, const string &join_col) {
@@ -417,19 +425,68 @@ string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool 
 	return string(openivm::TIMESTAMP_COL) + " > '" + ts.ToString() + "'::TIMESTAMP";
 }
 
-string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_query_sql,
-                                   const string &recompute_alias, const string &delete_where,
-                                   const string &insert_where, const string &statement_prefix) {
-	return statement_prefix + "DELETE FROM " + data_table + " WHERE " + delete_where + ";\n" + statement_prefix +
-	       "INSERT INTO " + data_table + "\nSELECT * FROM (" + view_query_sql + ") " + recompute_alias + "\nWHERE " +
-	       insert_where + ";\n";
-}
-
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix) {
 	return statement_prefix + "INSERT INTO " + delta_table +
 	       "\nSELECT *, CAST(-1 AS INTEGER), CURRENT_TIMESTAMP FROM " + old_source +
 	       "\nUNION ALL\nSELECT *, CAST(1 AS INTEGER), CURRENT_TIMESTAMP FROM " + new_source + ";\n";
+}
+
+SignedRowLists BuildSignedRowLists(const vector<string> &columns, const string &old_alias, const string &new_alias,
+                                   SqlDialect dialect) {
+	SignedRowLists lists;
+	for (auto &column : columns) {
+		if (!lists.columns.empty()) {
+			lists.columns += ", ";
+			lists.old_rows += ", ";
+			lists.new_rows += ", ";
+		}
+		auto quoted = DialectQuoteIdent(column, dialect);
+		lists.columns += quoted;
+		if (column == openivm::MULTIPLICITY_COL) {
+			lists.old_rows += "-1";
+			lists.new_rows += "1";
+		} else {
+			lists.old_rows += old_alias + quoted;
+			lists.new_rows += new_alias + quoted;
+		}
+	}
+	return lists;
+}
+
+string BuildDeltaResetSQL(const string &delta_table, const string &delta_ts_filter) {
+	return "DELETE FROM " + delta_table + " WHERE 1=1" + (delta_ts_filter.empty() ? "" : " AND " + delta_ts_filter) +
+	       ";\n";
+}
+
+AffectedGroupSignedDelta BuildAffectedGroupSignedDelta(const string &data_table, const string &delta_table,
+                                                       const vector<string> &keys, const vector<string> &columns,
+                                                       const string &delta_ts_filter, const string &scratch_name,
+                                                       bool persistent_scratch) {
+	string affected_temp = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "affected_" + scratch_name);
+	string old_temp = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "snapshot_" + scratch_name);
+	auto create_scratch = [&](const string &table, const string &query) {
+		string create =
+		    persistent_scratch ? "DROP TABLE IF EXISTS " + table + ";\nCREATE TABLE " : "CREATE TEMP TABLE ";
+		return create + table + " AS " + query + ";\n";
+	};
+	auto rows = BuildSignedRowLists(columns, "openivm_old.", "openivm_new.");
+	string delta_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
+	string insert_into = "INSERT INTO " + delta_table + " (" + rows.columns + ") SELECT ";
+	AffectedGroupSignedDelta result;
+	result.snapshot =
+	    create_scratch(affected_temp,
+	                   "SELECT DISTINCT " + SqlUtils::JoinQuotedColumns(keys) + " FROM " + delta_table + delta_where) +
+	    create_scratch(old_temp, "SELECT openivm_data.* FROM " + data_table +
+	                                 " openivm_data WHERE EXISTS (SELECT 1 FROM " + affected_temp +
+	                                 " openivm_aff WHERE " +
+	                                 SqlUtils::BuildNullSafeMatch(keys, "openivm_aff", "openivm_data") + ")");
+	result.publish = BuildDeltaResetSQL(delta_table, delta_ts_filter) + insert_into + rows.old_rows + " FROM " +
+	                 old_temp + " openivm_old;\n" + insert_into + rows.new_rows + " FROM " + data_table +
+	                 " openivm_new WHERE EXISTS (SELECT 1 FROM " + affected_temp + " openivm_aff WHERE " +
+	                 SqlUtils::BuildNullSafeMatch(keys, "openivm_aff", "openivm_new") + ");\nDROP TABLE " + old_temp +
+	                 ";\nDROP TABLE " + affected_temp + ";\n";
+	return result;
 }
 
 // The same affected-row predicate applies to the old snapshot, recomputed rows,
@@ -766,9 +823,9 @@ static string NullLiteralForDialect(const LogicalType &type, SqlDialect dialect)
 	return "NULL::" + type.ToString();
 }
 
-string BuildEmptyDeltaInsert(const string &view_name, const vector<string> &column_names,
+string BuildEmptyDeltaInsert(const string &insert_target, const vector<string> &column_names,
                              const vector<LogicalType> &column_types, SqlDialect dialect) {
-	string sql = "INSERT INTO " + SqlUtils::DeltaName(view_name) + " SELECT ";
+	string sql = "INSERT INTO " + insert_target + " SELECT ";
 	for (size_t i = 0; i < column_names.size(); i++) {
 		if (i > 0) {
 			sql += ", ";
@@ -811,8 +868,8 @@ string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_vie
 	return sql;
 }
 
-string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_name,
-                                  const string &attached_db_catalog_name) {
+static string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_name,
+                                         const string &attached_db_catalog_name) {
 	if (!attached_db_catalog_name.empty()) {
 		return attached_db_catalog_name;
 	}
@@ -1478,9 +1535,13 @@ DuckLakeSourceLocation ResolveDuckLakeSourceLocation(Connection &con, const stri
 
 vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(RefreshMetadata &metadata, const string &view_name,
                                                               Connection &con, const vector<string> &delta_table_names,
-                                                              const string &ducklake_catalog,
-                                                              const string &ducklake_schema) {
+                                                              const string &view_catalog_name,
+                                                              const string &view_schema_name,
+                                                              const string &attached_db_catalog_name,
+                                                              const string &attached_db_schema_name) {
 	vector<GroupRecomputeDeltaSpec> delta_specs;
+	string ducklake_catalog;
+	string ducklake_schema = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
 	for (auto &dt : delta_table_names) {
 		GroupRecomputeDeltaSpec spec;
 		auto source = metadata.GetSourceLocation(view_name, dt);
@@ -1489,6 +1550,9 @@ vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(RefreshMetadata &m
 		spec.last_update = metadata.GetLastUpdate(view_name, dt);
 		spec.is_ducklake = metadata.IsDuckLakeTable(view_name, dt);
 		if (spec.is_ducklake) {
+			if (ducklake_catalog.empty()) {
+				ducklake_catalog = ResolveDuckLakeCatalogName(con, view_catalog_name, attached_db_catalog_name);
+			}
 			auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, ducklake_catalog, ducklake_schema, "", "");
 			spec.ducklake_catalog = loc.catalog_name;
 			spec.ducklake_schema = loc.schema_name;
@@ -1500,40 +1564,6 @@ vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(RefreshMetadata &m
 		delta_specs.push_back(std::move(spec));
 	}
 	return delta_specs;
-}
-
-string BuildDuckLakeSnapshotQuery(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                  const string &view_query_sql, const vector<string> &delta_table_names,
-                                  const string &view_catalog_name, const string &view_schema_name,
-                                  const string &attached_db_catalog_name, const string &attached_db_schema_name) {
-	string snapshot_query = view_query_sql;
-	for (auto &dt : delta_table_names) {
-		if (!metadata.IsDuckLakeTable(view_name, dt)) {
-			continue;
-		}
-		int64_t old_snap = metadata.GetLastSnapshotId(view_name, dt);
-		auto loc = ResolveDuckLakeSourceLocation(con, view_name, dt, view_catalog_name, view_schema_name,
-		                                         attached_db_catalog_name, attached_db_schema_name);
-		string source_name = loc.table_name;
-		if (StringUtil::StartsWith(source_name, openivm::DATA_TABLE_PREFIX)) {
-			source_name = source_name.substr(strlen(openivm::DATA_TABLE_PREFIX));
-		}
-		auto visible_cols =
-		    SqlUtils::JoinQuotedColumns(metadata.GetTableColumns(loc.catalog_name, loc.schema_name, source_name));
-		if (visible_cols.empty()) {
-			visible_cols = "*";
-		}
-		string replacement = "(SELECT " + visible_cols + " FROM " +
-		                     SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name) +
-		                     " AT (VERSION => " + to_string(old_snap) + "))";
-		snapshot_query = SqlUtils::ReplaceTableReferences(
-		    snapshot_query, SqlUtils::FullName(loc.catalog_name, loc.schema_name, loc.table_name), replacement);
-		if (!StringUtil::CIEquals(source_name, loc.table_name)) {
-			snapshot_query = SqlUtils::ReplaceTableReferences(
-			    snapshot_query, SqlUtils::FullName(loc.catalog_name, loc.schema_name, source_name), replacement);
-		}
-	}
-	return snapshot_query;
 }
 
 openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &view_name, string &view_query_sql,

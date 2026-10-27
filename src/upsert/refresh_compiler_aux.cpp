@@ -15,7 +15,6 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 
 #include <map>
-#include <regex>
 
 namespace duckdb {
 
@@ -473,11 +472,6 @@ static string RunningAdjustedExpr(const RunningWindowExpr &expr, const RunningWi
 	return RunningAdjustedExprWithSeed(expr, local, state_col);
 }
 
-static string SparkPortableTimestampCasts(const string &sql) {
-	static const std::regex timestamp_cast_regex(R"(('[^']*(?:''[^']*)*')::TIMESTAMP)", std::regex_constants::icase);
-	return std::regex_replace(sql, timestamp_cast_regex, "CAST($1 AS TIMESTAMP)");
-}
-
 static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const string &view_query_sql,
                                                  const string &delta_ts_filter, const string &catalog_prefix,
                                                  const vector<string> &partition_columns,
@@ -528,7 +522,7 @@ static string BuildRunningWindowSuffixRefreshSQL(const string &view_name, const 
 	string delta_table = catalog_prefix + SqlUtils::QuoteIdentifier(SqlUtils::DeltaName(view_name));
 	string old_temp_table = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + view_name);
 	string new_temp_table = SqlUtils::QuoteIdentifier(string("openivm_new_") + view_name);
-	string portable_delta_ts_filter = SparkPortableTimestampCasts(delta_ts_filter);
+	string portable_delta_ts_filter = SparkPortableRefreshSQL(delta_ts_filter);
 	string delta_filter = portable_delta_ts_filter.empty() ? "" : " AND " + portable_delta_ts_filter;
 	string delta_positive = QualifiedColumn("d", openivm::MULTIPLICITY_COL) + " > 0" + delta_filter;
 	string part_q = SqlUtils::QuoteIdentifier(plan.partition_column);
