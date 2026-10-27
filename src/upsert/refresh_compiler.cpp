@@ -237,20 +237,15 @@ static string BuildAvgFormula(const string &sum_expr, const string &count_expr) 
 	return sum_expr + "::DOUBLE / NULLIF(" + count_expr + ", 0)";
 }
 
-static string BuildVarianceFormula(const string &sum_expr, const string &sum_sq_expr, const string &count_expr,
-                                   bool is_population, bool needs_sqrt, bool clamp_variance) {
-	string denom = is_population ? "NULLIF(" + count_expr + ", 0)" : "NULLIF(" + count_expr + " - 1, 0)";
-	string var_raw =
-	    "((" + sum_sq_expr + ") - (" + sum_expr + ") * (" + sum_expr + ") / (" + count_expr + ")) / " + denom;
-	string var_safe = clamp_variance ? "GREATEST(" + var_raw + ", 0::DOUBLE)" : var_raw;
-	return needs_sqrt ? "sqrt(" + var_safe + ")" : var_safe;
-}
-
+// NULL when there are too few rows (none for population, one or fewer for sample), matching the native
+// aggregates. GREATEST clamps tiny negative variances from floating-point cancellation before sqrt().
 static string BuildGuardedVarianceFormula(const string &sum_expr, const string &sum_sq_expr, const string &count_expr,
                                           bool is_population, bool needs_sqrt) {
-	int threshold = is_population ? 0 : 1;
-	return "CASE WHEN " + count_expr + " > " + std::to_string(threshold) + " THEN " +
-	       BuildVarianceFormula(sum_expr, sum_sq_expr, count_expr, is_population, needs_sqrt, true) + " ELSE NULL END";
+	string denom = is_population ? count_expr : "(" + count_expr + " - 1)";
+	string variance = "GREATEST(((" + sum_sq_expr + ") - (" + sum_expr + ") * (" + sum_expr + ") / (" + count_expr +
+	                  ")) / " + denom + ", 0::DOUBLE)";
+	return "CASE WHEN " + count_expr + " > " + (is_population ? "0" : "1") + " THEN " +
+	       (needs_sqrt ? "sqrt(" + variance + ")" : variance) + " ELSE NULL END";
 }
 
 /// Detect AVG and STDDEV/VARIANCE decomposition columns from the column list.
@@ -983,8 +978,7 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql, bool has_minmax, const string &delta_ts_filter,
-                               const string &catalog_prefix, const vector<LogicalType> &column_types,
-                               bool *out_full_recompute) {
+                               const string &catalog_prefix, const vector<LogicalType> &column_types) {
 	string data_table = catalog_prefix + SqlUtils::QuoteIdentifier(IncrementalTableNames::DataTableName(view_name));
 
 	// Any non-summable column (VARCHAR literal, CASE result, LIST) forces a full
@@ -1002,11 +996,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 		}
 	}
 
-	bool full_recompute = has_minmax || has_non_summable_col;
-	if (out_full_recompute) {
-		*out_full_recompute = full_recompute;
-	}
-	if (full_recompute) {
+	if (has_minmax || has_non_summable_col) {
 		string delete_query = "DELETE FROM " + data_table + ";\n";
 		string insert_query = "INSERT INTO " + data_table + " " + view_query_sql + ";\n";
 		return delete_query + insert_query;
@@ -1071,7 +1061,7 @@ string CompileSimpleAggregates(const string &view_name, const vector<string> &co
 			string sum_sq_col = d_sum_sq.at(alias);
 			bool is_pop = decomp.is_population.count(alias) && decomp.is_population.at(alias);
 			bool do_sqrt = decomp.needs_sqrt.count(alias) && decomp.needs_sqrt.at(alias);
-			string formula = BuildVarianceFormula(sum_col, sum_sq_col, count_col, is_pop, do_sqrt, false);
+			string formula = BuildGuardedVarianceFormula(sum_col, sum_sq_col, count_col, is_pop, do_sqrt);
 			result += "UPDATE " + data_table + " SET " + alias + " = " + formula + ";\n";
 		} else {
 			// AVG: recompute from sum/count

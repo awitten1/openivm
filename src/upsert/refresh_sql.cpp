@@ -999,7 +999,6 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 
 	case RefreshType::SIMPLE_AGGREGATE: {
 		RefreshMetadata::FilteredGroupCountAuxMeta aux_meta;
-		bool simple_aggregate_full_recompute = false;
 		if (metadata.GetFilteredGroupCountAuxMeta(view_name, aux_meta)) {
 			ensure_aux_state(aux_meta.aux_table, RefreshMetadata::ExpectedFilteredGroupCountAuxColumns(aux_meta),
 			                 {aux_meta.source}, [&]() {
@@ -1020,14 +1019,8 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 			                    aux_meta.group_col.c_str(), aux_meta.sum_col.c_str(), aux_meta.comparison_op.c_str(),
 			                    aux_meta.threshold_sql.c_str());
 		} else {
-			upsert_query =
-			    CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, delta_ts_filter,
-			                            internal_catalog_prefix, column_types, &simple_aggregate_full_recompute);
-		}
-		if (!has_minmax && aux_meta.aux_table.empty() && !simple_aggregate_full_recompute) {
-			AppendSimpleAggregateEmptySourceNulling(metadata, upsert_query, view_name, column_names, data_table,
-			                                        view_catalog_name, view_schema_name, attached_db_catalog_name,
-			                                        attached_db_schema_name);
+			upsert_query = CompileSimpleAggregates(view_name, column_names, view_query_sql, has_minmax, delta_ts_filter,
+			                                       internal_catalog_prefix, column_types);
 		}
 		break;
 	}

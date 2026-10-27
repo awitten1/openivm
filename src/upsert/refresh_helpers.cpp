@@ -1352,36 +1352,6 @@ string CompileProjectionRefresh(RefreshMetadata &metadata, const string &view_na
 	                                 appended_rows);
 }
 
-void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &upsert_query, const string &view_name,
-                                             const vector<string> &column_names, const string &data_table,
-                                             const string &view_catalog_name, const string &view_schema_name,
-                                             const string &attached_db_catalog_name,
-                                             const string &attached_db_schema_name) {
-	auto source_tables = metadata.GetDeltaTables(view_name);
-	for (auto &dt : source_tables) {
-		string catalog_name = attached_db_catalog_name.empty() ? view_catalog_name : attached_db_catalog_name;
-		string schema_name = attached_db_schema_name.empty() ? view_schema_name : attached_db_schema_name;
-		auto source_location = metadata.GetSourceLocation(view_name, dt, catalog_name, schema_name);
-		string base_name = BaseTableNameFromDeltaKey(source_location.table_name);
-		catalog_name = source_location.catalog_name;
-		schema_name = source_location.schema_name;
-		if (catalog_name.empty()) {
-			catalog_name = "memory";
-		}
-		if (schema_name.empty()) {
-			schema_name = "main";
-		}
-		string source = SqlUtils::QuoteIdentifier(catalog_name) + "." + SqlUtils::QuoteIdentifier(schema_name) + "." +
-		                SqlUtils::QuoteIdentifier(base_name);
-		auto data_columns = SqlUtils::WithoutMultiplicity(column_names);
-		string null_cols = StringUtil::Join(data_columns, data_columns.size(), ", ", [](const string &col) {
-			return SqlUtils::QuoteIdentifier(col) + " = NULL";
-		});
-		upsert_query += "UPDATE " + data_table + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " + source +
-		                " LIMIT 1);\n";
-	}
-}
-
 static string CurrentDatabase(Connection &con) {
 	auto res = con.Query("SELECT current_database()");
 	if (!res->HasError() && res->RowCount() > 0 && !res->GetValue(0, 0).IsNull()) {

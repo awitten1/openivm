@@ -223,11 +223,6 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
                                           const string &view_schema_name, const string &attached_db_catalog_name,
                                           const string &attached_db_schema_name, string &upsert_query,
                                           RefreshPublicationScope *publication_scope = nullptr);
-void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &upsert_query, const string &view_name,
-                                             const vector<string> &column_names, const string &data_table,
-                                             const string &view_catalog_name, const string &view_schema_name,
-                                             const string &attached_db_catalog_name,
-                                             const string &attached_db_schema_name);
 
 ViewLocation ResolveViewLocation(Connection &con, const string &view_name, const string &fallback_catalog,
                                  const string &fallback_schema);
