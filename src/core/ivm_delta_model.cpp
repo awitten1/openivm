@@ -520,7 +520,7 @@ AsofWindowPartitionReadsRightSideDirectly(const vector<RefreshMetadata::WindowPa
 		return false;
 	}
 	for (auto &op : lineage_ops) {
-		if (op.kind == "direct" && ContainsStringCI(rhs_sources, op.source)) {
+		if (op.kind == WindowLineageKind::DIRECT && ContainsStringCI(rhs_sources, op.source)) {
 			return true;
 		}
 	}
@@ -681,7 +681,7 @@ void PopulateDeltaViewModelLineage(DeltaViewModel &model, const CreateMVPlanFact
 			domain.delta_local = true;
 			for (auto &op : model.window_lineage_ops) {
 				AddStringCI(domain.source_tables, op.source);
-				if (op.kind == "lookup") {
+				if (op.kind == WindowLineageKind::LOOKUP) {
 					domain.delta_local = false;
 					domain.needs_base_lookup = true;
 				}

@@ -1086,11 +1086,10 @@ string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &
 	       " FROM left_counts lc LEFT JOIN match_counts mc ON " + lc_mc_match + right_stats_from;
 }
 
-static string SemiAntiVisibleExpr(const string &join_type, bool null_aware, const string &null_aware_left_col,
+static string SemiAntiVisibleExpr(SemiAntiJoinType join_type, bool null_aware, const string &null_aware_left_col,
                                   const string &alias) {
 	string prefix = alias.empty() ? "" : alias + ".";
-	bool is_anti = StringUtil::Lower(join_type) == "anti";
-	if (!is_anti) {
+	if (join_type != SemiAntiJoinType::ANTI) {
 		return prefix + "_match_count > 0";
 	}
 	if (null_aware && !null_aware_left_col.empty()) {
@@ -1101,7 +1100,7 @@ static string SemiAntiVisibleExpr(const string &join_type, bool null_aware, cons
 	return prefix + "_match_count = 0";
 }
 
-string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, const string &join_type,
+string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, SemiAntiJoinType join_type,
                                    const vector<string> &left_cols, const vector<string> &output_cols, bool null_aware,
                                    const string &null_aware_left_col) {
 	if (output_cols.empty()) {
@@ -1113,7 +1112,7 @@ string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_t
 	       " _cur, generate_series(1, _cur._left_count::BIGINT) WHERE " + visible + " AND _cur._left_count > 0";
 }
 
-string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
+string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, SemiAntiJoinType join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
                                 const string &right_alias, const string &predicate, const string &post_filter,
                                 const string &right_filter, const vector<string> &left_cols,
@@ -1138,7 +1137,7 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	string right_stats_table = "openivm_saj_right_stats_" + view_name;
 	string old_table = "openivm_saj_old_" + view_name;
 	string aff_table = "openivm_saj_aff_" + view_name;
-	bool null_aware_anti = null_aware && StringUtil::Lower(join_type) == "anti" && !null_aware_left_col.empty() &&
+	bool null_aware_anti = null_aware && join_type == SemiAntiJoinType::ANTI && !null_aware_left_col.empty() &&
 	                       !null_aware_right_expr.empty();
 	string visible = SemiAntiVisibleExpr(join_type, null_aware_anti, null_aware_left_col, "");
 	string cur_visible = SemiAntiVisibleExpr(join_type, null_aware_anti, null_aware_left_col, "_cur");
@@ -1291,8 +1290,8 @@ string CompileSemiAntiRecompute(const string &view_name, const string &aux_table
 	       SqlUtils::QuoteIdentifier(right_stats_table) + ";\nDROP TABLE IF EXISTS " +
 	       SqlUtils::QuoteIdentifier(aff_table) + ";\n";
 
-	OPENIVM_DEBUG_PRINT("[CompileSemiAntiRecompute] %s join, %zu left cols, aux=%s\n", join_type.c_str(),
-	                    left_cols.size(), aux_table.c_str());
+	OPENIVM_DEBUG_PRINT("[CompileSemiAntiRecompute] %s join, %zu left cols, aux=%s\n",
+	                    SEMI_ANTI_JOIN_TYPE_NAMES[static_cast<idx_t>(join_type)], left_cols.size(), aux_table.c_str());
 	return sql;
 }
 

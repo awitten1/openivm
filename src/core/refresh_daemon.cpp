@@ -87,10 +87,7 @@ void RefreshDaemon::Run() {
 			}
 
 			// Read adaptive backoff setting
-			Value backoff_val;
-			if (con.context->TryGetCurrentSetting("openivm_adaptive_backoff", backoff_val) && !backoff_val.IsNull()) {
-				adaptive_backoff_ = backoff_val.GetValue<bool>();
-			}
+			adaptive_backoff_ = SqlUtils::GetBoolSetting(*con.context, "openivm_adaptive_backoff", adaptive_backoff_);
 
 			RefreshMetadata metadata(con);
 			auto scheduled = metadata.GetScheduledViews();

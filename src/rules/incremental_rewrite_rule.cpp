@@ -61,7 +61,8 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	while (!child->children.empty()) {
 		child = child->children[0].get();
 	}
-	if (!StringUtil::StartsWith(child->GetName(), "COMPUTEDELTA")) {
+	auto marker = dynamic_cast<LogicalGet *>(child);
+	if (!marker || !StringUtil::CIEquals(marker->function.name, "ComputeDelta")) {
 		return;
 	}
 
@@ -69,13 +70,10 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	OPENIVM_DEBUG_PRINT("Activating the rewrite rule\n");
 #endif
 
-	auto child_get = dynamic_cast<LogicalGet *>(child);
-	if (!child_get) {
-		throw InternalException("ComputeDelta marker must be represented as a logical get");
-	}
-	auto view = child_get->named_parameters["view_name"].ToString();
-	auto view_catalog = child_get->named_parameters["view_catalog_name"].ToString();
-	auto view_schema = child_get->named_parameters["view_schema_name"].ToString();
+	// ComputeDelta(view_catalog_name, view_schema_name, view_name)
+	auto view_catalog = StringValue::Get(marker->parameters[0]);
+	auto view_schema = StringValue::Get(marker->parameters[1]);
+	auto view = StringValue::Get(marker->parameters[2]);
 
 	Connection con(*input.context.db);
 	RefreshMetadata::UseCatalog(input.context, con, view_catalog);
@@ -83,16 +81,10 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 		RefreshMetadata(con).SnapshotTransaction(input.context);
 	}
 
-	auto v = con.Query("select sql_string from " + string(openivm::VIEWS_TABLE) + " where view_name = '" +
-	                   SqlUtils::EscapeValue(view) + "';");
-	if (v->HasError()) {
-		throw Exception(ExceptionType::CATALOG,
-		                "IVM: cannot read view definition for '" + view + "': " + v->GetError());
-	}
-	if (v->RowCount() == 0 || v->GetValue(0, 0).IsNull()) {
+	auto view_query = RefreshMetadata(con).GetViewQuery(view);
+	if (view_query.empty()) {
 		throw Exception(ExceptionType::CATALOG, "IVM: missing view definition for '" + view + "'");
 	}
-	string view_query = v->GetValue(0, 0).ToString();
 
 	Parser parser;
 	Planner planner(input.context);

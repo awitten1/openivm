@@ -202,12 +202,12 @@ BuildLineageStandardAffectedKeysSQL(RefreshMetadata &metadata, Connection &con, 
 			continue;
 		}
 		string arm_sql;
-		if (op.kind == "direct") {
+		if (op.kind == WindowLineageKind::DIRECT) {
 			arm_sql =
 			    BuildStandardChangedValuesSQL(metadata, view_name, delta_table_names, op.source, op.source_col,
 			                                  op.source_cast, op.output_col, delta_ts_filter, view_catalog_name,
 			                                  view_schema_name, attached_db_catalog_name, attached_db_schema_name);
-		} else if (op.kind == "lookup") {
+		} else if (op.kind == WindowLineageKind::LOOKUP) {
 			arm_sql = BuildStandardLookupChangedKeysSQL(metadata, view_name, con, delta_table_names, op,
 			                                            delta_ts_filter, view_catalog_name, view_schema_name,
 			                                            attached_db_catalog_name, attached_db_schema_name);
@@ -438,12 +438,12 @@ static bool BuildLineageDuckLakeAffectedKeysSQL(RefreshMetadata &metadata, Conne
 		if (!source_spec) {
 			continue;
 		}
-		if (op.kind == "direct") {
+		if (op.kind == WindowLineageKind::DIRECT) {
 			arms.push_back(BuildDuckLakeChangedValuesSQL(*source_spec, op.source_col, op.source_cast, op.output_col));
 			covered_sources.insert(StripOpenIVMDataPrefix(source_spec->metadata_key));
 			continue;
 		}
-		if (op.kind == "lookup") {
+		if (op.kind == WindowLineageKind::LOOKUP) {
 			auto *lookup_spec = FindDuckLakeSourceSpec(specs, op.lookup);
 			if (!lookup_spec) {
 				continue;

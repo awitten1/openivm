@@ -289,7 +289,7 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 			    !ReadSource(*join.right, out.right_table, out.right_alias)) {
 				return false;
 			}
-			out.join_type = join.type == JoinType::SEMI ? "semi" : "anti";
+			out.join_type = join.type == JoinType::SEMI ? SemiAntiJoinType::SEMI : SemiAntiJoinType::ANTI;
 			if (join.condition) {
 				out.predicate = join.condition->ToString();
 			} else {
@@ -336,7 +336,7 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 	if (!right || !ReadSource(*right->from_table, out.right_table, out.right_alias)) {
 		return false;
 	}
-	out.join_type = anti ? "anti" : "semi";
+	out.join_type = anti ? SemiAntiJoinType::ANTI : SemiAntiJoinType::SEMI;
 	out.post_filter = StringUtil::Join(filters, " AND ");
 	bool simple_left = ReadSource(*select->from_table, out.left_table, out.left_alias);
 	if (subquery->subquery_type == SubqueryType::EXISTS) {
@@ -375,7 +375,8 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 		out.null_aware_left_expr = "(" + out.left_key_expr + " IS NULL)";
 		out.null_aware_right_expr = out.right_key_expr;
 	}
-	OPENIVM_DEBUG_PRINT("[EXTRACT] Parsed %s membership query\n", out.join_type.c_str());
+	OPENIVM_DEBUG_PRINT("[EXTRACT] Parsed %s membership query\n",
+	                    SEMI_ANTI_JOIN_TYPE_NAMES[static_cast<idx_t>(out.join_type)]);
 	return true;
 }
 

@@ -2,11 +2,12 @@
 #define OPENIVM_PARSER_SQL_EXTRACTORS_HPP
 
 #include "duckdb.hpp"
+#include "core/openivm_constants.hpp"
 
 namespace duckdb {
 
 struct SemiAntiExtract {
-	string join_type;
+	SemiAntiJoinType join_type = SemiAntiJoinType::SEMI;
 	string left_table;
 	string left_alias;
 	string right_table;
