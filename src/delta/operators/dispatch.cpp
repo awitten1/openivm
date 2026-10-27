@@ -10,56 +10,16 @@ static bool IsDelimJoinShape(LogicalOperatorType type) {
 	return type == LogicalOperatorType::LOGICAL_DELIM_JOIN || type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN;
 }
 
-} // namespace
-
-const char *DeltaOperatorStrategyName(DeltaOperatorStrategy strategy) {
-	switch (strategy) {
-	case DeltaOperatorStrategy::SCAN_DELTA:
-		return "SCAN_DELTA";
-	case DeltaOperatorStrategy::FILTER_LINEAR:
-		return "FILTER_LINEAR";
-	case DeltaOperatorStrategy::FILTER_HAVING_STRIP:
-		return "FILTER_HAVING_STRIP";
-	case DeltaOperatorStrategy::PROJECTION_APPEND_MULTIPLICITY:
-		return "PROJECTION_APPEND_MULTIPLICITY";
-	case DeltaOperatorStrategy::AGGREGATE_GROUP_BY_MULTIPLICITY:
-		return "AGGREGATE_GROUP_BY_MULTIPLICITY";
-	case DeltaOperatorStrategy::JOIN_INCLUSION_EXCLUSION:
-		return "JOIN_INCLUSION_EXCLUSION";
-	case DeltaOperatorStrategy::JOIN_REGULAR_N_TERM:
-		return "JOIN_REGULAR_N_TERM";
-	case DeltaOperatorStrategy::JOIN_DUCKLAKE_N_TERM:
-		return "JOIN_DUCKLAKE_N_TERM";
-	case DeltaOperatorStrategy::DELIM_JOIN_INCLUSION_EXCLUSION:
-		return "DELIM_JOIN_INCLUSION_EXCLUSION";
-	case DeltaOperatorStrategy::UNION_ALL_LINEAR:
-		return "UNION_ALL_LINEAR";
-	case DeltaOperatorStrategy::DISTINCT_COUNT_AGGREGATE:
-		return "DISTINCT_COUNT_AGGREGATE";
-	case DeltaOperatorStrategy::WINDOW_PASSTHROUGH:
-		return "WINDOW_PASSTHROUGH";
-	case DeltaOperatorStrategy::TOPK_STRIP:
-		return "TOPK_STRIP";
-	case DeltaOperatorStrategy::CTE_MATERIALIZED:
-		return "CTE_MATERIALIZED";
-	case DeltaOperatorStrategy::CTE_REF:
-		return "CTE_REF";
-	case DeltaOperatorStrategy::UNNEST_LINEAR:
-		return "UNNEST_LINEAR";
-	case DeltaOperatorStrategy::CONSTANT_ZERO_DELTA:
-		return "CONSTANT_ZERO_DELTA";
-	case DeltaOperatorStrategy::CONSTANT_STATIC:
-		return "CONSTANT_STATIC";
-	case DeltaOperatorStrategy::ASOF_AFFECTED_RECOMPUTE:
-		return "ASOF_AFFECTED_RECOMPUTE";
-	case DeltaOperatorStrategy::POSITIONAL_GLOBAL_RECOMPUTE:
-		return "POSITIONAL_GLOBAL_RECOMPUTE";
-	case DeltaOperatorStrategy::SAMPLE_GLOBAL_RECOMPUTE:
-		return "SAMPLE_GLOBAL_RECOMPUTE";
-	default:
-		return "UNKNOWN";
-	}
+static const char *DeltaOperatorStrategyName(DeltaOperatorStrategy strategy) {
+#define OPENIVM_DELTA_OPERATOR_STRATEGY_CASE(name)                                                                     \
+	case DeltaOperatorStrategy::name:                                                                                  \
+		return #name;
+	switch (strategy) { OPENIVM_DELTA_OPERATOR_STRATEGIES(OPENIVM_DELTA_OPERATOR_STRATEGY_CASE) }
+#undef OPENIVM_DELTA_OPERATOR_STRATEGY_CASE
+	return "UNKNOWN";
 }
+
+} // namespace
 
 void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStrategy strategy) {
 	// Both branches are debug-only descriptions of the already-selected strategy.
@@ -73,111 +33,43 @@ void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStra
 	                    LogicalOperatorToString(input.plan->type).c_str());
 }
 
-DeltaPlanFragment CompileDeltaOperatorWithModel(const DeltaOperatorInput &input, const DeltaModelNode &node) {
-	D_ASSERT(node.plan_node == input.plan.get());
-	auto node_input = input.WithNode(node);
-	switch (node.kind) {
+DeltaPlanFragment CompileDeltaOperatorByKind(const DeltaOperatorInput &input, DeltaModelNodeKind kind) {
+	D_ASSERT(!input.node || input.node->plan_node == input.plan.get());
+	switch (kind) {
 	case DeltaModelNodeKind::SCAN:
-		return CompileScanDelta(node_input);
+		return CompileScanDelta(input);
 	case DeltaModelNodeKind::FILTER:
-		return CompileFilterDelta(node_input);
+		return CompileFilterDelta(input);
 	case DeltaModelNodeKind::PROJECT:
-		return CompileProjectionDelta(node_input);
+		return CompileProjectionDelta(input);
 	case DeltaModelNodeKind::AGGREGATE:
-		return CompileAggregateDelta(node_input);
+		return CompileAggregateDelta(input);
 	case DeltaModelNodeKind::JOIN:
 	case DeltaModelNodeKind::SEMI_ANTI:
-		return IsDelimJoinShape(node_input.plan->type) ? CompileDelimJoinDelta(node_input)
-		                                               : CompileJoinDelta(node_input);
+		return IsDelimJoinShape(input.plan->type) ? CompileDelimJoinDelta(input) : CompileJoinDelta(input);
 	case DeltaModelNodeKind::UNION:
-		return CompileUnionDelta(node_input);
-	case DeltaModelNodeKind::DISTINCT:
-		return CompileDistinctDelta(node_input);
-	case DeltaModelNodeKind::WINDOW:
-		return CompileWindowDelta(node_input);
-	case DeltaModelNodeKind::TOP_K:
-		return CompileTopKDelta(node_input);
-	case DeltaModelNodeKind::CTE:
-		return CompileCteDelta(node_input);
-	case DeltaModelNodeKind::UNNEST:
-		return CompileUnnestDelta(node_input);
-	case DeltaModelNodeKind::CONSTANT:
-		return CompileConstantZeroDelta(node_input);
-	case DeltaModelNodeKind::ASOF_JOIN:
-		return CompileAsofJoinDelta(node_input);
-	case DeltaModelNodeKind::POSITIONAL_JOIN:
-		return CompilePositionalJoinDelta(node_input);
-	case DeltaModelNodeKind::SAMPLE:
-		return CompileSampleDelta(node_input);
-	default:
-		throw NotImplementedException("Delta model node kind %s not supported", DeltaModelNodeKindName(node.kind));
-	}
-}
-
-DeltaPlanFragment CompileCopiedDeltaSubtree(DeltaOperatorInput input) {
-	OPENIVM_DEBUG_PRINT("[Copied Delta Subtree] Visiting node: %s\n",
-	                    LogicalOperatorToString(input.plan->type).c_str());
-	OPENIVM_DEBUG_PRINT("[Copied Delta Subtree] Node detail: %s\n", input.plan->ToString().c_str());
-
-	switch (input.plan->type) {
-	case LogicalOperatorType::LOGICAL_GET:
-		return CompileScanDelta(input);
-	case LogicalOperatorType::LOGICAL_COMPARISON_JOIN:
-	case LogicalOperatorType::LOGICAL_JOIN:
-	case LogicalOperatorType::LOGICAL_CROSS_PRODUCT:
-	case LogicalOperatorType::LOGICAL_ANY_JOIN:
-		return CompileJoinDelta(input);
-	case LogicalOperatorType::LOGICAL_DELIM_JOIN:
-	case LogicalOperatorType::LOGICAL_DEPENDENT_JOIN:
-		return CompileDelimJoinDelta(input);
-	case LogicalOperatorType::LOGICAL_PROJECTION:
-		return CompileProjectionDelta(input);
-	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
-		return CompileAggregateDelta(input);
-	case LogicalOperatorType::LOGICAL_FILTER:
-		return CompileFilterDelta(input);
-	case LogicalOperatorType::LOGICAL_UNION:
 		return CompileUnionDelta(input);
-	case LogicalOperatorType::LOGICAL_DISTINCT:
+	case DeltaModelNodeKind::DISTINCT:
 		return CompileDistinctDelta(input);
-	case LogicalOperatorType::LOGICAL_WINDOW:
+	case DeltaModelNodeKind::WINDOW:
 		return CompileWindowDelta(input);
-	case LogicalOperatorType::LOGICAL_TOP_N:
-	case LogicalOperatorType::LOGICAL_LIMIT:
-	case LogicalOperatorType::LOGICAL_ORDER_BY:
+	case DeltaModelNodeKind::TOP_K:
 		return CompileTopKDelta(input);
-	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
-	case LogicalOperatorType::LOGICAL_CTE_REF:
+	case DeltaModelNodeKind::CTE:
 		return CompileCteDelta(input);
-	case LogicalOperatorType::LOGICAL_UNNEST:
+	case DeltaModelNodeKind::UNNEST:
 		return CompileUnnestDelta(input);
-	case LogicalOperatorType::LOGICAL_ASOF_JOIN:
+	case DeltaModelNodeKind::CONSTANT:
+		return input.copied_subtree ? CompileStaticConstantLeaf(input) : CompileConstantZeroDelta(input);
+	case DeltaModelNodeKind::ASOF_JOIN:
 		return CompileAsofJoinDelta(input);
-	case LogicalOperatorType::LOGICAL_POSITIONAL_JOIN:
+	case DeltaModelNodeKind::POSITIONAL_JOIN:
 		return CompilePositionalJoinDelta(input);
-	case LogicalOperatorType::LOGICAL_SAMPLE:
+	case DeltaModelNodeKind::SAMPLE:
 		return CompileSampleDelta(input);
-	case LogicalOperatorType::LOGICAL_CHUNK_GET:
-	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
-	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
-		return CompileStaticConstantLeaf(input);
 	default:
-		throw NotImplementedException("Copied subtree operator type %s not supported",
-		                              LogicalOperatorToString(input.plan->type));
-	}
-}
-
-DeltaPlanFragment CompileNonModelLeaf(DeltaOperatorInput input) {
-	switch (input.plan->type) {
-	case LogicalOperatorType::LOGICAL_CHUNK_GET:
-	case LogicalOperatorType::LOGICAL_DUMMY_SCAN:
-	case LogicalOperatorType::LOGICAL_EXPRESSION_GET:
-		OPENIVM_DEBUG_PRINT("[Delta Compiler] non-model constant leaf %s\n",
-		                    LogicalOperatorToString(input.plan->type).c_str());
-		return CompileConstantZeroDelta(input);
-	default:
-		throw InternalException("Delta compiler missing IR node for operator %s",
-		                        LogicalOperatorToString(input.plan->type).c_str());
+		throw NotImplementedException("Delta operator %s (node kind %s) not supported",
+		                              LogicalOperatorToString(input.plan->type), DeltaModelNodeKindName(kind));
 	}
 }
 

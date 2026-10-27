@@ -48,20 +48,29 @@ const DeltaModelNode *DeltaCompiler::FindNode(LogicalOperator *op) const {
 
 DeltaPlanFragment DeltaCompiler::CompileInternal(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root,
                                                  bool copied_subtree) {
+	DeltaOperatorInput op_input(context, plan, root, this, copied_subtree);
 	if (copied_subtree) {
 		OPENIVM_DEBUG_PRINT("[Delta Compiler] copied subtree %s; using copied-subtree compile\n",
 		                    LogicalOperatorToString(plan->type).c_str());
-		return CompileCopiedDeltaSubtree(DeltaOperatorInput(context, plan, root, this, true));
+		OPENIVM_DEBUG_PRINT("[Copied Delta Subtree] Node detail: %s\n", plan->ToString().c_str());
+		return CompileDeltaOperatorByKind(op_input, NodeKindForOperator(*plan));
 	}
 
 	auto *node = FindNode(plan.get());
 	if (!node) {
-		return CompileNonModelLeaf(DeltaOperatorInput(context, plan, root, this, false));
+		// Only constant leaves (dummy scans, expression/chunk gets) may lack an IR node; they carry a zero delta.
+		if (NodeKindForOperator(*plan) != DeltaModelNodeKind::CONSTANT) {
+			throw InternalException("Delta compiler missing IR node for operator %s",
+			                        LogicalOperatorToString(plan->type).c_str());
+		}
+		OPENIVM_DEBUG_PRINT("[Delta Compiler] non-model constant leaf %s\n",
+		                    LogicalOperatorToString(plan->type).c_str());
+		return CompileDeltaOperatorByKind(op_input, DeltaModelNodeKind::CONSTANT);
 	}
 
 	OPENIVM_DEBUG_PRINT("[Delta Compiler] Visiting %s node for operator %s\n", DeltaModelNodeKindName(node->kind),
 	                    LogicalOperatorToString(plan->type).c_str());
-	return CompileDeltaOperatorWithModel(DeltaOperatorInput(context, plan, root, this, false), *node);
+	return CompileDeltaOperatorByKind(op_input.WithNode(*node), node->kind);
 }
 
 DeltaPlanFragment DeltaCompiler::Compile(unique_ptr<LogicalOperator> &plan, LogicalOperator *&root) {
