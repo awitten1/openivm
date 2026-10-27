@@ -33,17 +33,9 @@
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 
 #include <algorithm>
+#include <bitset>
 
 namespace duckdb {
-
-static idx_t CountBits(uint64_t value) {
-	idx_t count = 0;
-	while (value) {
-		count += value & 1ULL;
-		value >>= 1ULL;
-	}
-	return count;
-}
 
 // A leaf's scan with its source's watermark, for key-domain probes. An empty last_update disables probing it.
 struct JoinProbeSource {
@@ -200,7 +192,7 @@ LogicalGet *FindGetInSubtree(LogicalOperator *node, vector<LogicalOperator *> *c
 	return node ? dynamic_cast<LogicalGet *>(node) : nullptr;
 }
 
-static LogicalGet *GetLeafScan(const JoinLeafInfo &leaf) {
+LogicalGet *GetLeafScan(const JoinLeafInfo &leaf) {
 	return leaf.get ? leaf.get : FindGetInSubtree(leaf.node);
 }
 
@@ -528,7 +520,7 @@ struct TransitioningKeyCTEDefinition {
 // post-delta) state -- i.e. old_count>0 && new_count==0, or old_count==0 && new_count>0. A key merely
 // appearing in the delta is NOT sufficient: for a 1:many relationship (e.g. one customer with many
 // orders) a single changed order must not suppress the customer's row when other, unchanged orders
-// still match. Returns nullptr if unsupported (caller must then skip the optimization, not guess).
+// still match.
 static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContext &context, Connection &con,
                                                                     Binder &binder, LogicalGet *base_get, idx_t key_pos,
                                                                     const string &view_name) {
@@ -684,9 +676,6 @@ GetTransitioningKeySetRef(ClientContext &context, Connection &con, Binder &binde
 	idx_t definition_index;
 	if (existing == transition_cte_indexes.end()) {
 		auto transitioning_keys = BuildTransitioningKeySetImpl(context, con, binder, base_get, key_pos, view_name);
-		if (!transitioning_keys) {
-			return nullptr;
-		}
 		D_ASSERT(transitioning_keys->node->types.size() == 1);
 		TransitioningKeyCTEDefinition definition;
 		definition.cte_index = binder.GenerateTableIndex();
@@ -788,49 +777,46 @@ GuardKeptOuterJoinsForMaskRec(ClientContext &context, Connection &con, Binder &b
 					auto transitioning_keys =
 					    GetTransitioningKeySetRef(context, con, binder, current_null_side_get, key_pos, null_leaf_idx,
 					                              view_name, transition_cte_indexes, transition_ctes);
-					if (transitioning_keys) {
-						auto &other_bcr = other_key_expr->Cast<BoundColumnRefExpression>();
-						auto left_expr = make_uniq<BoundColumnRefExpression>(other_bcr.return_type, other_bcr.binding);
-						auto right_expr =
-						    make_uniq<BoundColumnRefExpression>(other_bcr.return_type, transitioning_keys->key_binding);
-						auto anti_condition = make_uniq<BoundComparisonExpression>(
-						    ExpressionType::COMPARE_EQUAL, std::move(left_expr), std::move(right_expr));
-						auto &other_subtree = j->children[other_child];
-						if (portable_anti_guard) {
-							auto output_count = other_subtree->GetColumnBindings().size();
-							auto mark_join = LogicalComparisonJoin::CreateJoin(
-							    context, JoinType::MARK, JoinRefType::REGULAR, std::move(other_subtree),
-							    std::move(transitioning_keys->node), std::move(anti_condition));
-							auto &mark = mark_join->Cast<LogicalComparisonJoin>();
-							mark.mark_index = binder.GenerateTableIndex();
-							mark.convert_mark_to_semi = false;
-							mark_join->ResolveOperatorTypes();
+					auto &other_bcr = other_key_expr->Cast<BoundColumnRefExpression>();
+					auto left_expr = make_uniq<BoundColumnRefExpression>(other_bcr.return_type, other_bcr.binding);
+					auto right_expr =
+					    make_uniq<BoundColumnRefExpression>(other_bcr.return_type, transitioning_keys->key_binding);
+					auto anti_condition = make_uniq<BoundComparisonExpression>(
+					    ExpressionType::COMPARE_EQUAL, std::move(left_expr), std::move(right_expr));
+					auto &other_subtree = j->children[other_child];
+					if (portable_anti_guard) {
+						auto output_count = other_subtree->GetColumnBindings().size();
+						auto mark_join = LogicalComparisonJoin::CreateJoin(
+						    context, JoinType::MARK, JoinRefType::REGULAR, std::move(other_subtree),
+						    std::move(transitioning_keys->node), std::move(anti_condition));
+						auto &mark = mark_join->Cast<LogicalComparisonJoin>();
+						mark.mark_index = binder.GenerateTableIndex();
+						mark.convert_mark_to_semi = false;
+						mark_join->ResolveOperatorTypes();
 
-							auto mark_ref = make_uniq<BoundColumnRefExpression>(LogicalType::BOOLEAN,
-							                                                    ColumnBinding(mark.mark_index, 0));
-							auto keep_unmatched = make_uniq<BoundComparisonExpression>(
-							    ExpressionType::COMPARE_DISTINCT_FROM, std::move(mark_ref),
-							    make_uniq<BoundConstantExpression>(Value::BOOLEAN(true)));
-							auto filter = make_uniq<LogicalFilter>(std::move(keep_unmatched));
-							for (idx_t output_idx = 0; output_idx < output_count; output_idx++) {
-								filter->projection_map.push_back(output_idx);
-							}
-							filter->children.push_back(std::move(mark_join));
-							filter->ResolveOperatorTypes();
-							other_subtree = std::move(filter);
-							OPENIVM_DEBUG_PRINT(
-							    "[DeltaJoin] Rendered transition-key exclusion as portable MARK filter\n");
-						} else {
-							auto anti_join = LogicalComparisonJoin::CreateJoin(
-							    context, JoinType::ANTI, JoinRefType::REGULAR, std::move(other_subtree),
-							    std::move(transitioning_keys->node), std::move(anti_condition));
-							anti_join->ResolveOperatorTypes();
-							other_subtree = std::move(anti_join);
+						auto mark_ref = make_uniq<BoundColumnRefExpression>(LogicalType::BOOLEAN,
+						                                                    ColumnBinding(mark.mark_index, 0));
+						auto keep_unmatched = make_uniq<BoundComparisonExpression>(
+						    ExpressionType::COMPARE_DISTINCT_FROM, std::move(mark_ref),
+						    make_uniq<BoundConstantExpression>(Value::BOOLEAN(true)));
+						auto filter = make_uniq<LogicalFilter>(std::move(keep_unmatched));
+						for (idx_t output_idx = 0; output_idx < output_count; output_idx++) {
+							filter->projection_map.push_back(output_idx);
 						}
-						OPENIVM_DEBUG_PRINT("[DeltaJoin] Guarded kept outer join: excluded rows whose key "
-						                    "match-count transitions across zero via leaf %zu's delta\n",
-						                    null_leaf_idx);
+						filter->children.push_back(std::move(mark_join));
+						filter->ResolveOperatorTypes();
+						other_subtree = std::move(filter);
+						OPENIVM_DEBUG_PRINT("[DeltaJoin] Rendered transition-key exclusion as portable MARK filter\n");
+					} else {
+						auto anti_join = LogicalComparisonJoin::CreateJoin(
+						    context, JoinType::ANTI, JoinRefType::REGULAR, std::move(other_subtree),
+						    std::move(transitioning_keys->node), std::move(anti_condition));
+						anti_join->ResolveOperatorTypes();
+						other_subtree = std::move(anti_join);
 					}
+					OPENIVM_DEBUG_PRINT("[DeltaJoin] Guarded kept outer join: excluded rows whose key "
+					                    "match-count transitions across zero via leaf %zu's delta\n",
+					                    null_leaf_idx);
 				}
 			}
 		}
@@ -1026,35 +1012,23 @@ static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, c
 
 	for (size_t i = 0; i < leaves.size(); i++) {
 		LogicalGet *get = GetLeafScan(leaves[i]);
-		if (!get) {
-			// Constant relation leaves (VALUES/CHUNK/DUMMY), often wrapped in projections,
-			// have no catalog backing and therefore no delta. Other !get cases may contain
-			// real tables inside nested joins, so only prune when the whole leaf subtree is
-			// constant.
-			if (IsConstantLeafSubtree(leaves[i].node)) {
-				status.empty_mask |= (1ULL << i);
-				status.insert_only_mask |= (1ULL << i);
-				status.constant_mask |= (1ULL << i);
-				OPENIVM_DEBUG_PRINT("[DeltaJoin] Leaf %zu (constant values) has empty delta\n", i);
-			}
-			continue;
-		}
-		auto table_ref = get->GetTable();
-		if (table_ref.get() == nullptr) {
-			// Table function (generate_series, range, etc.) has no catalog-backing
-			// table, so no delta table exists. Its output is constant across
-			// refreshes — the "delta" is always empty. Mark it as empty so the
-			// inclusion-exclusion pruner drops every term where this leaf's bit
-			// is set: only the term that keeps the table function as its original
-			// scan on the "full" side contributes rows, matching the semantics of
-			// a non-changing input.
+		// Constant leaves have no catalog backing and therefore an always-empty delta: constant relation subtrees
+		// (VALUES/CHUNK/DUMMY, often wrapped in projections) and table functions (generate_series, range, ...).
+		// Other scan-less leaves may contain real tables inside nested joins, so only whole constant subtrees qualify.
+		// Marking the leaf empty makes the pruner drop every term where its bit is set, so only the terms that keep
+		// its original scan contribute rows, matching the semantics of a non-changing input.
+		if (get ? !get->GetTable() : IsConstantLeafSubtree(leaves[i].node)) {
 			status.empty_mask |= (1ULL << i);
 			status.insert_only_mask |= (1ULL << i);
 			status.constant_mask |= (1ULL << i);
-			OPENIVM_DEBUG_PRINT("[DeltaJoin] Leaf %zu (table function '%s') has empty delta\n", i,
-			                    get->function.name.c_str());
+			OPENIVM_DEBUG_PRINT("[DeltaJoin] Leaf %zu (%s) has empty delta\n", i,
+			                    get ? get->function.name.c_str() : "constant values");
 			continue;
 		}
+		if (!get) {
+			continue;
+		}
+		auto table_ref = get->GetTable();
 		// Get last_update timestamp for this view+table pair
 		auto &watermark = LoadDeltaWatermark(con, view_name, *table_ref, cache);
 		if (!watermark.watermark_error.empty() || watermark.last_update.IsNull()) {
@@ -1182,6 +1156,19 @@ static bool HasJoinEquality(const vector<vector<DeltaJoinKeyProbe>> &key_probes,
 	return false;
 }
 
+// Whether every FK column equals its referenced column in an INNER-join key. A missing match only disables pruning;
+// inclusion-exclusion remains complete.
+static bool AllFKColumnsJoined(const vector<vector<DeltaJoinKeyProbe>> &key_probes, size_t fk_leaf,
+                               const vector<string> &fk_columns, size_t pk_leaf, const vector<string> &pk_columns) {
+	// mull-ignore-next: cxx_lt_to_ge
+	for (idx_t col_idx = 0; col_idx < fk_columns.size(); col_idx++) {
+		if (!HasJoinEquality(key_probes, fk_leaf, fk_columns[col_idx], pk_leaf, pk_columns[col_idx])) {
+			return false;
+		}
+	}
+	return true;
+}
+
 static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector<JoinLeafInfo> &leaves,
                                             const vector<vector<DeltaJoinKeyProbe>> &key_probes,
                                             const vector<openivm::CachedConstraint> &declarations) {
@@ -1222,16 +1209,7 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 			if (fk.fk_columns.size() != fk.pk_columns.size()) { // mull-ignore: cxx_ne_to_eq
 				continue;
 			}
-			bool all_columns_joined = true;
-			// Missing an FK column match only disables pruning; inclusion-exclusion remains complete.
-			// mull-ignore-next: cxx_lt_to_ge
-			for (idx_t col_idx = 0; col_idx < fk.fk_columns.size(); col_idx++) {
-				if (!HasJoinEquality(key_probes, i, fk.fk_columns[col_idx], pk_leaf, fk.pk_columns[col_idx])) {
-					all_columns_joined = false;
-					break;
-				}
-			}
-			if (!all_columns_joined) {
+			if (!AllFKColumnsJoined(key_probes, i, fk.fk_columns, pk_leaf, fk.pk_columns)) {
 				continue;
 			}
 			relations.push_back({i, pk_leaf});
@@ -1259,17 +1237,7 @@ static vector<FKRelation> DetectFKRelations(ClientContext &context, const vector
 			if (cached.columns.empty() || cached.columns.size() != cached.referenced_columns.size()) {
 				continue;
 			}
-			bool all_columns_joined = true;
-			// Missing a cached FK column match only disables pruning; inclusion-exclusion remains complete.
-			// mull-ignore-next: cxx_lt_to_ge
-			for (idx_t col_idx = 0; col_idx < cached.columns.size(); col_idx++) {
-				if (!HasJoinEquality(key_probes, i, cached.columns[col_idx], pk_leaf,
-				                     cached.referenced_columns[col_idx])) {
-					all_columns_joined = false;
-					break;
-				}
-			}
-			if (!all_columns_joined) {
+			if (!AllFKColumnsJoined(key_probes, i, cached.columns, pk_leaf, cached.referenced_columns)) {
 				continue;
 			}
 			relations.push_back({i, pk_leaf});
@@ -1295,17 +1263,7 @@ static vector<FKRelation> DetectCompileFactsFKRelations(const openivm::CompileFa
 		    !TryFindLeaf(table_to_leaf, fact_fk.parent_table, parent_leaf) || child_leaf == parent_leaf) {
 			continue;
 		}
-		bool all_columns_joined = true;
-		// Missing a compile-fact FK column match only disables pruning; inclusion-exclusion remains complete.
-		// mull-ignore-next: cxx_lt_to_ge
-		for (idx_t col_idx = 0; col_idx < fact_fk.child_columns.size(); col_idx++) {
-			if (!HasJoinEquality(key_probes, child_leaf, fact_fk.child_columns[col_idx], parent_leaf,
-			                     fact_fk.parent_columns[col_idx])) {
-				all_columns_joined = false;
-				break;
-			}
-		}
-		if (!all_columns_joined) {
+		if (!AllFKColumnsJoined(key_probes, child_leaf, fact_fk.child_columns, parent_leaf, fact_fk.parent_columns)) {
 			OPENIVM_DEBUG_PRINT("[DeltaJoin] Ignoring compile FK %s -> %s; join keys do not match\n",
 			                    fact_fk.child_table.c_str(), fact_fk.parent_table.c_str());
 			continue;
@@ -1455,7 +1413,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	    DetectDeltaStatus(input.context.metadata_con, input.context.view, leaves, source_cache, leaf_refs);
 	uint64_t total_terms = (1ULL << N) - 1;
 	uint64_t non_empty_mask = total_terms & ~delta_status.empty_mask & ~delta_status.constant_mask;
-	idx_t non_empty_leaf_count = CountBits(non_empty_mask);
+	idx_t non_empty_leaf_count = std::bitset<64>(non_empty_mask).count();
 
 	// FK-aware pruning: detect insert-only PK leaves whose delta terms cancel algebraically.
 	bool fk_pruning_enabled = SqlUtils::GetBoolSetting(context, "openivm_fk_pruning", true);
@@ -1541,20 +1499,14 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 					if (leaf_refs[probe.other_leaf].last_update.empty()) {
 						continue;
 					}
-					bool has_match;
-					if (mask & (1ULL << probe.other_leaf)) {
-						// A probe always references a different leaf, so > and >= are equivalent here.
-						// Reversing the orientation only repeats or omits the same symmetric emptiness probe.
-						if (i > probe.other_leaf) { // mull-ignore: cxx_gt_to_ge,cxx_gt_to_le
-							continue;
-						}
-						has_match = DeltaKeyHasMatch(key_probe_con, leaf_refs[i], probe.delta_column,
-						                             leaf_refs[probe.other_leaf], probe.other_column, true);
-					} else {
-						has_match = DeltaKeyHasMatch(key_probe_con, leaf_refs[i], probe.delta_column,
-						                             leaf_refs[probe.other_leaf], probe.other_column, false);
+					bool other_is_delta = mask & (1ULL << probe.other_leaf);
+					// A probe always references a different leaf, so > and >= are equivalent here.
+					// Reversing the orientation only repeats or omits the same symmetric emptiness probe.
+					if (other_is_delta && i > probe.other_leaf) { // mull-ignore: cxx_gt_to_ge,cxx_gt_to_le
+						continue;
 					}
-					if (!has_match) {
+					if (!DeltaKeyHasMatch(key_probe_con, leaf_refs[i], probe.delta_column, leaf_refs[probe.other_leaf],
+					                      probe.other_column, other_is_delta)) {
 						key_domain_empty = true;
 						break;
 					}
@@ -1594,30 +1546,11 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 		// mull-ignore-next: cxx_lt_to_le
 		for (size_t i = 0; i < N; i++) {
 			if (mask & (1ULL << i)) {
-				if (leaves[i].get) {
-					// leaves[] was collected once on the ORIGINAL input.plan, before this
-					// mask's own renumber_and_rebind_subtree pass, so leaves[i].get is a
-					// stale pointer carrying the pre-renumbering table_index. The rest of
-					// `term` (join conditions, transitioning-key guards, etc.) was rebound
-					// to the FRESH per-term index, so the replacement delta node -- which
-					// reuses old_get->table_index verbatim -- must be built from term's own,
-					// already-renumbered GET at this leaf's (renumbering-invariant) path,
-					// not from leaves[i].get, or every reference elsewhere in `term` to this
-					// leaf's fresh index is left dangling.
-					auto &leaf_node_ref = GetNodeAtPath(term, leaves[i].path);
-					auto &term_local_get = leaf_node_ref->Cast<LogicalGet>();
-					DeltaGetResult delta_i = CreateDeltaGetNode(context, input.context.metadata_con, binder,
-					                                            &term_local_get, input.context.view, &source_cache);
-					mul_bindings.push_back(delta_i.mul_binding);
-					leaf_node_ref = std::move(delta_i.node);
-					UpdateParentProjectionMap(term, leaves[i], delta_i.mul_binding);
-				} else {
-					auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
-					auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root);
-					mul_bindings.push_back(rewritten.mul_binding);
-					subtree_ref = std::move(rewritten.op);
-					UpdateParentProjectionMap(term, leaves[i], rewritten.mul_binding);
-				}
+				auto &leaf_node_ref = GetNodeAtPath(term, leaves[i].path);
+				auto delta_i = CompileRegularLeafDelta(input, context, binder, leaf_node_ref, term_root, source_cache);
+				mul_bindings.push_back(delta_i.mul_binding);
+				leaf_node_ref = std::move(delta_i.op);
+				UpdateParentProjectionMap(term, leaves[i], delta_i.mul_binding);
 			}
 		}
 
@@ -1721,9 +1654,11 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 	return {std::move(old_node), ColumnBinding(output_table_index, current_bindings.size())};
 }
 
-static DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, ClientContext &context,
-                                                 Binder &binder, unique_ptr<LogicalOperator> &leaf_node,
-                                                 LogicalOperator *&term_root, DeltaSourceCache &source_cache) {
+DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, ClientContext &context, Binder &binder,
+                                          unique_ptr<LogicalOperator> &leaf_node, LogicalOperator *&term_root,
+                                          DeltaSourceCache &source_cache) {
+	// leaf_node must be the term's own renumbered copy, never JoinLeafInfo::get/node from the original plan: those
+	// carry pre-renumbering table indexes, and the delta scan reuses the GET's table_index verbatim.
 	if (leaf_node->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = leaf_node->Cast<LogicalGet>();
 		auto delta =

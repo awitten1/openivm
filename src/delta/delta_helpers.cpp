@@ -87,6 +87,17 @@ static DeltaGetResult RemapDeltaNode(ClientContext &context, unique_ptr<LogicalO
 	return {std::move(remap_proj), remapped_mul};
 }
 
+// Copy source's pushed-down table filters onto target. OPTIONAL_FILTER is advisory scan pruning; copying or omitting it
+// cannot change query results.
+static void CopyTableFilters(const LogicalGet &source, LogicalGet &target) {
+	for (auto &entry : source.table_filters.filters) {
+		if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) { // mull-ignore: cxx_eq_to_ne
+			continue;
+		}
+		target.table_filters.filters[entry.first] = entry.second->Copy();
+	}
+}
+
 static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> delta_node,
                                        idx_t output_table_index, ColumnBinding mul_binding) {
 	auto input_bindings = delta_node->GetColumnBindings();
@@ -236,13 +247,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 		auto get = make_uniq<LogicalGet>(table_idx, std::move(scan_fn), std::move(bind_data), std::move(col_types),
 		                                 std::move(col_names));
 		get->SetColumnIds(vector<ColumnIndex>(delta_col_ids));
-		for (auto &entry : old_get->table_filters.filters) {
-			// OPTIONAL_FILTER is advisory scan pruning; copying or omitting it cannot change query results.
-			if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) { // mull-ignore: cxx_eq_to_ne
-				continue;
-			}
-			get->table_filters.filters[entry.first] = entry.second->Copy();
-		}
+		CopyTableFilters(*old_get, *get);
 
 		// Set parameters so LPTS can reconstruct the ducklake_table_insertions/deletions SQL.
 		PopulateDuckLakeChangeScanParameters(*get);
@@ -392,13 +397,7 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 	delta_get_node = make_uniq<LogicalGet>(old_get->table_index, scan_function, std::move(bind_data),
 	                                       std::move(return_types), std::move(return_names));
 	delta_get_node->SetColumnIds(std::move(column_ids));
-	for (auto &entry : old_get->table_filters.filters) {
-		// OPTIONAL_FILTER is advisory scan pruning; copying or omitting it cannot change query results.
-		if (entry.second->filter_type == TableFilterType::OPTIONAL_FILTER) { // mull-ignore: cxx_eq_to_ne
-			continue;
-		}
-		delta_get_node->table_filters.filters[entry.first] = entry.second->Copy();
-	}
+	CopyTableFilters(*old_get, *delta_get_node);
 
 	// Timestamp filter
 	auto &watermark = LoadDeltaWatermark(con, view_name, *source_table, sources);

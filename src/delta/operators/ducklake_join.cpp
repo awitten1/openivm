@@ -142,7 +142,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		    snapshot_result->GetValue(1, row).GetValue<int64_t>();
 	}
 	for (size_t i = 0; i < N; i++) {
-		auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
+		auto *get = GetLeafScan(leaves[i]);
 		D_ASSERT(get);
 		auto table_ref = get->GetTable();
 		string table_name = table_ref.get()->name;
@@ -289,30 +289,16 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			}
 		}
 
-		// Replace leaf[i] with its delta scan.
-		ColumnBinding mul_binding;
+		// Replace leaf[i] with its delta: a bare GET directly, a GET wrapped in projections/filters by rewriting the
+		// entire subtree. Flattened leaves are always bare GETs under pass-through wrappers.
 		auto &delta_leaf_node = GetNodeAtPath(term, leaves[i].path);
-		auto *delta_get = delta_leaf_node->type == LogicalOperatorType::LOGICAL_GET
-		                      ? dynamic_cast<LogicalGet *>(delta_leaf_node.get())
-		                      : nullptr;
-		if (flattened_leaves || delta_get) {
-			// Simple GET leaf — replace directly.
-			D_ASSERT(delta_get);
-			DeltaGetResult delta_result = CreateDeltaGetNode(context, input.context.metadata_con, binder, delta_get,
-			                                                 input.context.view, &source_cache);
-			mul_binding = delta_result.mul_binding;
-			delta_leaf_node = std::move(delta_result.node);
-			if (flattened_leaves) {
-				mul_binding = PropagateMultiplicityThroughPath(term, leaves[i].path, mul_binding);
-			}
+		D_ASSERT(!flattened_leaves || delta_leaf_node->type == LogicalOperatorType::LOGICAL_GET);
+		auto delta = CompileRegularLeafDelta(input, context, binder, delta_leaf_node, term_root, source_cache);
+		delta_leaf_node = std::move(delta.op);
+		ColumnBinding mul_binding = delta.mul_binding;
+		if (flattened_leaves) {
+			mul_binding = PropagateMultiplicityThroughPath(term, leaves[i].path, mul_binding);
 		} else {
-			// GET wrapped in projections/filters — rewrite the entire subtree.
-			auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
-			auto rewritten = input.CompileCopiedSubtree(subtree_ref, term_root);
-			mul_binding = rewritten.mul_binding;
-			subtree_ref = std::move(rewritten.op);
-		}
-		if (!flattened_leaves) {
 			UpdateParentProjectionMap(term, leaves[i], mul_binding);
 		}
 
@@ -320,9 +306,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		// Leaves j < i stay at current state (already the default).
 		for (size_t j = i + 1; j < N; j++) {
 			auto &leaf_node = GetNodeAtPath(term, leaves[j].path);
-			auto *old_get = leaf_node->type == LogicalOperatorType::LOGICAL_GET
-			                    ? dynamic_cast<LogicalGet *>(leaf_node.get())
-			                    : FindGetInSubtree(leaf_node.get());
+			auto *old_get = FindGetInSubtree(leaf_node.get());
 			if (old_get && old_get->function.name == "ducklake_scan" && old_get->function.function_info) {
 				auto &func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
 				func_info.snapshot.snapshot_id = static_cast<idx_t>(old_snapshots[j]);

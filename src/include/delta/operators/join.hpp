@@ -25,6 +25,13 @@ struct DeltaJoinKeyProbe {
 // The scan at the bottom of node's unary chain, or nullptr when the chain branches first. When chain is given, the
 // operators above the scan are appended to it, outermost first.
 LogicalGet *FindGetInSubtree(LogicalOperator *node, vector<LogicalOperator *> *chain = nullptr);
+// The leaf's own scan, or the scan at the bottom of its unary chain.
+LogicalGet *GetLeafScan(const JoinLeafInfo &leaf);
+
+// The delta of one join leaf inside a term: a delta scan for a bare GET, otherwise the compiled copied subtree.
+DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, ClientContext &context, Binder &binder,
+                                          unique_ptr<LogicalOperator> &leaf_node, LogicalOperator *&term_root,
+                                          DeltaSourceCache &source_cache);
 
 // For each leaf, the INNER-join equalities between one of its scan columns and another leaf's scan column. Leaves
 // wrapped above their scan are traced only when trace_wrapped_leaves is set.
