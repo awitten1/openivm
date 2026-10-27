@@ -39,6 +39,27 @@ void PopulateDuckLakeChangeScanParameters(LogicalGet &get) {
 	                  Value::BIGINT(static_cast<int64_t>(info.snapshot.snapshot_id))};
 }
 
+DeltaSourceState &LoadDeltaWatermark(Connection &con, const string &view_name, TableCatalogEntry &source,
+                                     DeltaSourceCache &cache) {
+	auto &state = cache[&source];
+	if (state.watermark_loaded) {
+		return state;
+	}
+	state.watermark_loaded = true;
+	state.delta_key = SqlUtils::DeltaName(source.name);
+	auto result = con.Query(
+	    "SELECT last_update, table_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	    SqlUtils::EscapeValue(view_name) + "' AND " +
+	    RefreshMetadata::SourcePredicate(state.delta_key, source.ParentCatalog().GetName(), source.schema.name));
+	if (result->HasError()) {
+		state.watermark_error = result->GetError();
+	} else if (result->RowCount() > 0) {
+		state.last_update = result->GetValue(0, 0);
+		state.delta_key = result->GetValue(1, 0).ToString();
+	}
+	return state;
+}
+
 static DeltaGetResult RemapDeltaNode(ClientContext &context, unique_ptr<LogicalOperator> delta_node,
                                      idx_t output_table_index, ColumnBinding mul_binding) {
 	auto input_bindings = delta_node->GetColumnBindings();
@@ -134,7 +155,7 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
 /// Build a DuckLake delta scan by directly constructing LogicalGet nodes
 /// with SCAN_INSERTIONS / SCAN_DELETIONS, avoiding SQL string round-trips.
 static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection &con, Binder &binder,
-                                              LogicalGet *old_get, const string &view_name) {
+                                              LogicalGet *old_get, const string &view_name, DeltaSourceState &state) {
 	auto table_ref = old_get->GetTable();
 	string catalog_name = table_ref->ParentCatalog().GetName();
 	string schema_name = table_ref->schema.name;
@@ -143,15 +164,19 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 	OPENIVM_DEBUG_PRINT("[DuckLake] Creating delta node for '%s.%s'\n", catalog_name.c_str(), table_name.c_str());
 
 	// Reuse the compiler metadata connection, including its transaction-local snapshot.
-	auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	                             " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND " +
-	                             RefreshMetadata::SourcePredicate(table_name, catalog_name, schema_name));
-	if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
-		throw Exception(ExceptionType::CATALOG,
-		                "IVM: no snapshot ID recorded for DuckLake table '" + table_name + "' in view '" + view_name +
-		                    "' (metadata may be missing — try DROP MATERIALIZED VIEW and recreate)");
+	if (!state.has_last_snapshot) {
+		auto snap_result = con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		                             " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND " +
+		                             RefreshMetadata::SourcePredicate(table_name, catalog_name, schema_name));
+		if (snap_result->HasError() || snap_result->RowCount() == 0 || snap_result->GetValue(0, 0).IsNull()) {
+			throw Exception(ExceptionType::CATALOG,
+			                "IVM: no snapshot ID recorded for DuckLake table '" + table_name + "' in view '" +
+			                    view_name + "' (metadata may be missing — try DROP MATERIALIZED VIEW and recreate)");
+		}
+		state.last_snapshot = snap_result->GetValue(0, 0).GetValue<int64_t>();
+		state.has_last_snapshot = true;
 	}
-	int64_t last_snap = snap_result->GetValue(0, 0).GetValue<int64_t>();
+	int64_t last_snap = state.last_snapshot;
 
 	// Get current snapshot from the old_get's existing DuckLake scan info (no SQL needed).
 	auto &old_func_info = old_get->function.function_info->Cast<DuckLakeFunctionInfo>();
@@ -277,11 +302,13 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 // ============================================================================
 
 DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binder &binder, LogicalGet *old_get,
-                                  const string &view_name) {
+                                  const string &view_name, DeltaSourceCache *cache) {
+	DeltaSourceCache local_cache;
+	auto &sources = cache ? *cache : local_cache;
 	// DuckLake tables: use native change tracking via direct plan construction
 	auto table_ref = old_get->GetTable();
 	if (table_ref.get() && table_ref->ParentCatalog().GetCatalogType() == "ducklake") {
-		return CreateDuckLakeDeltaNode(context, con, binder, old_get, view_name);
+		return CreateDuckLakeDeltaNode(context, con, binder, old_get, view_name, sources[table_ref.get()]);
 	}
 	// Table functions (generate_series, range, etc.) have no catalog-backing table
 	// and therefore no delta table. Their output is constant across refreshes, so
@@ -303,19 +330,17 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 		                "IVM: cannot create a delta scan for a table function in view '" + view_name + "'");
 	}
 
-	optional_ptr<TableCatalogEntry> opt_catalog_entry;
 	// Metadata keys the delta by its source; the physical table may sit in an internal schema.
 	string delta_key = SqlUtils::DeltaName(source_table->name);
-	string source_catalog = source_table->catalog.GetName();
-	string source_schema = source_table->schema.name;
-	{
-		opt_catalog_entry =
-		    RefreshMetadata::FindSourceDelta(context, source_catalog, source_schema, source_table->name);
-		if (opt_catalog_entry == nullptr) {
+	auto &source_state = sources[source_table];
+	if (!source_state.delta_entry) {
+		source_state.delta_entry = RefreshMetadata::FindSourceDelta(context, source_table->catalog.GetName(),
+		                                                            source_table->schema.name, source_table->name);
+		if (!source_state.delta_entry) {
 			throw Exception(ExceptionType::BINDER, "Table " + delta_key + " does not exist, no deltas to compute!");
 		}
 	}
-	auto &table_entry = opt_catalog_entry->Cast<TableCatalogEntry>();
+	auto &table_entry = *source_state.delta_entry;
 	table_name = table_entry.name;
 	unique_ptr<FunctionData> bind_data;
 	auto scan_function = table_entry.GetScanFunction(context, bind_data);
@@ -376,19 +401,16 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 	}
 
 	// Timestamp filter
-	auto timestamp_query = "select last_update from " + string(openivm::DELTA_TABLES_TABLE) + " where view_name = '" +
-	                       SqlUtils::EscapeValue(view_name) + "' and " +
-	                       RefreshMetadata::SourcePredicate(delta_key, source_catalog, source_schema);
-	auto r = con.Query(timestamp_query);
-	if (r->HasError()) {
+	auto &watermark = LoadDeltaWatermark(con, view_name, *source_table, sources);
+	if (!watermark.watermark_error.empty()) {
 		throw Exception(ExceptionType::EXECUTOR, "IVM: failed to read last_update for view '" + view_name +
-		                                             "', table '" + table_name + "': " + r->GetError());
+		                                             "', table '" + table_name + "': " + watermark.watermark_error);
 	}
-	if (r->RowCount() == 0 || r->GetValue(0, 0).IsNull()) {
+	if (watermark.last_update.IsNull()) {
 		throw Exception(ExceptionType::CATALOG,
 		                "IVM: missing last_update for view '" + view_name + "', table '" + table_name + "'");
 	}
-	auto ts_value = r->GetValue(0, 0);
+	auto ts_value = watermark.last_update;
 	if (ts_value.type() != LogicalType::TIMESTAMP) {
 		ts_value = ts_value.DefaultCastAs(LogicalType::TIMESTAMP);
 	}

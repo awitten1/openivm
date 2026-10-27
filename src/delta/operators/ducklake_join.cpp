@@ -111,7 +111,8 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
                                                            bool has_left_join, bool flattened_leaves,
-                                                           const vector<vector<DeltaJoinKeyProbe>> &key_probes) {
+                                                           const vector<vector<DeltaJoinKeyProbe>> &key_probes,
+                                                           DeltaSourceCache &source_cache) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -155,6 +156,10 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			                                            "' in view '" + input.context.view + "'");
 		}
 		old_snapshots[i] = stored_snapshot->second;
+		// CreateDeltaGetNode reuses this snapshot instead of re-reading it for every term.
+		auto &source_state = source_cache[table_ref.get()];
+		source_state.last_snapshot = old_snapshots[i];
+		source_state.has_last_snapshot = true;
 		if (get->function.name == "ducklake_scan" && get->function.function_info) {
 			auto &func_info = get->function.function_info->Cast<DuckLakeFunctionInfo>();
 			current_snapshots[i] = static_cast<int64_t>(func_info.snapshot.snapshot_id);
@@ -293,8 +298,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		if (flattened_leaves || delta_get) {
 			// Simple GET leaf — replace directly.
 			D_ASSERT(delta_get);
-			DeltaGetResult delta_result =
-			    CreateDeltaGetNode(context, input.context.metadata_con, binder, delta_get, input.context.view);
+			DeltaGetResult delta_result = CreateDeltaGetNode(context, input.context.metadata_con, binder, delta_get,
+			                                                 input.context.view, &source_cache);
 			mul_binding = delta_result.mul_binding;
 			delta_leaf_node = std::move(delta_result.node);
 			if (flattened_leaves) {

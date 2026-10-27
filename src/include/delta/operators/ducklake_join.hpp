@@ -19,7 +19,8 @@ namespace duckdb {
 vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
                                                            bool has_left_join, bool flattened_leaves,
-                                                           const vector<vector<DeltaJoinKeyProbe>> &key_probes);
+                                                           const vector<vector<DeltaJoinKeyProbe>> &key_probes,
+                                                           DeltaSourceCache &source_cache);
 
 } // namespace duckdb
 

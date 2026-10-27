@@ -53,21 +53,6 @@ struct JoinProbeSource {
 	string last_update;
 };
 
-// The view's watermark for a source (first column) and the source's physical delta table.
-static unique_ptr<MaterializedQueryResult> DeltaWatermark(Connection &con, const string &view_name,
-                                                          TableCatalogEntry &source, string &delta_table_sql) {
-	auto catalog = source.ParentCatalog().GetName();
-	auto schema = source.schema.name;
-	auto filter = " FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND " +
-	              RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(source.name), catalog, schema);
-	auto result = con.Query("SELECT last_update, table_name" + filter);
-	auto delta_key = !result->HasError() && result->RowCount() > 0 ? result->GetValue(1, 0).ToString()
-	                                                               : SqlUtils::DeltaName(source.name);
-	delta_table_sql = RefreshMetadata(con).ResolveDeltaQualifiedName(view_name, delta_key, catalog, schema);
-	return result;
-}
-
 static string QualifyColumn(const string &alias, const string &column_name) {
 	return alias + "." + SqlUtils::QuoteIdentifier(column_name);
 }
@@ -1034,7 +1019,9 @@ struct DeltaStatus {
 
 /// For each leaf, detect delta status in a single query per table.
 /// Returns both insert_only_mask (no deletes) and empty_mask (no rows at all).
-static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, const vector<JoinLeafInfo> &leaves) {
+/// Also records each catalog leaf's watermark and physical delta in probe_sources for key-domain probes.
+static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, const vector<JoinLeafInfo> &leaves,
+                                     DeltaSourceCache &cache, vector<JoinProbeSource> &probe_sources) {
 	DeltaStatus status = {0, 0, 0, 0};
 
 	for (size_t i = 0; i < leaves.size(); i++) {
@@ -1068,13 +1055,15 @@ static DeltaStatus DetectDeltaStatus(Connection &con, const string &view_name, c
 			                    get->function.name.c_str());
 			continue;
 		}
-		string delta_table_sql;
 		// Get last_update timestamp for this view+table pair
-		auto ts_result = DeltaWatermark(con, view_name, *table_ref, delta_table_sql);
-		if (ts_result->HasError() || ts_result->RowCount() == 0) {
+		auto &watermark = LoadDeltaWatermark(con, view_name, *table_ref, cache);
+		if (!watermark.watermark_error.empty() || watermark.last_update.IsNull()) {
 			continue;
 		}
-		string last_update = ts_result->GetValue(0, 0).ToString();
+		string last_update = watermark.last_update.ToString();
+		auto delta_table_sql = RefreshMetadata(con).ResolveDeltaQualifiedName(
+		    view_name, watermark.delta_key, table_ref->ParentCatalog().GetName(), table_ref->schema.name);
+		probe_sources[i] = {get, delta_table_sql, last_update};
 
 		// Single query: get pending delta count, delete count, and current base
 		// cardinality. The base count lets us define "tiny" as <= max(8 rows,
@@ -1455,13 +1444,15 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
     DeltaOperatorInput input, ClientContext &context, Binder &binder, const vector<JoinLeafInfo> &leaves,
     bool has_left_join, const vector<ColumnBinding> &existing_multiplicity_bindings,
     vector<TransitioningKeyCTEDefinition> &transition_ctes, const vector<openivm::CachedConstraint> &declarations,
-    const vector<vector<DeltaJoinKeyProbe>> &key_probes) {
+    const vector<vector<DeltaJoinKeyProbe>> &key_probes, DeltaSourceCache &source_cache) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
 	// Detect delta status for all leaves (single query per table: total + delete count).
 	// Used by both FK pruning and empty-delta skipping.
-	DeltaStatus delta_status = DetectDeltaStatus(input.context.metadata_con, input.context.view, leaves);
+	vector<JoinProbeSource> leaf_refs(N);
+	DeltaStatus delta_status =
+	    DetectDeltaStatus(input.context.metadata_con, input.context.view, leaves, source_cache, leaf_refs);
 	uint64_t total_terms = (1ULL << N) - 1;
 	uint64_t non_empty_mask = total_terms & ~delta_status.empty_mask & ~delta_status.constant_mask;
 	idx_t non_empty_leaf_count = CountBits(non_empty_mask);
@@ -1501,7 +1492,6 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	uint64_t empty_mask = skip_empty_enabled ? known_empty_mask : 0;
 
 	Connection key_probe_con(*context.db);
-	vector<JoinProbeSource> leaf_refs(N);
 	// Key-domain pruning can erase the last remaining term when exactly one input
 	// changed and its delta keys cannot match the unchanged side. That is the
 	// important performance case covered by mv_inner_join. When multiple leaves
@@ -1516,24 +1506,6 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	if (key_domain_probe_enabled) {
 		// Probe committed watermarks in the metadata schema the compiler selected.
 		RefreshMetadata::UseSameLocation(*input.context.metadata_con.context, key_probe_con);
-		// The <= mutant indexes one past leaves.
-		// mull-ignore-next: cxx_lt_to_le
-		for (size_t i = 0; i < N; i++) {
-			LogicalGet *get = GetLeafScan(leaves[i]);
-			if (!get) {
-				continue;
-			}
-			auto table_ref = get->GetTable();
-			if (table_ref.get() == nullptr) {
-				continue;
-			}
-			string delta_table_sql;
-			auto ts_result = DeltaWatermark(key_probe_con, input.context.view, *table_ref, delta_table_sql);
-			if (ts_result->HasError() || ts_result->RowCount() == 0 || ts_result->GetValue(0, 0).IsNull()) {
-				continue;
-			}
-			leaf_refs[i] = {get, delta_table_sql, ts_result->GetValue(0, 0).ToString()};
-		}
 	}
 
 	uint64_t pruned_count = 0;
@@ -1635,7 +1607,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 					auto &leaf_node_ref = GetNodeAtPath(term, leaves[i].path);
 					auto &term_local_get = leaf_node_ref->Cast<LogicalGet>();
 					DeltaGetResult delta_i = CreateDeltaGetNode(context, input.context.metadata_con, binder,
-					                                            &term_local_get, input.context.view);
+					                                            &term_local_get, input.context.view, &source_cache);
 					mul_bindings.push_back(delta_i.mul_binding);
 					leaf_node_ref = std::move(delta_i.node);
 					UpdateParentProjectionMap(term, leaves[i], delta_i.mul_binding);
@@ -1751,10 +1723,11 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 
 static DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input, ClientContext &context,
                                                  Binder &binder, unique_ptr<LogicalOperator> &leaf_node,
-                                                 LogicalOperator *&term_root) {
+                                                 LogicalOperator *&term_root, DeltaSourceCache &source_cache) {
 	if (leaf_node->type == LogicalOperatorType::LOGICAL_GET) {
 		auto &get = leaf_node->Cast<LogicalGet>();
-		auto delta = CreateDeltaGetNode(context, input.context.metadata_con, binder, &get, input.context.view);
+		auto delta =
+		    CreateDeltaGetNode(context, input.context.metadata_con, binder, &get, input.context.view, &source_cache);
 		return {std::move(delta.node), delta.mul_binding};
 	}
 	return input.CompileCopiedSubtree(leaf_node, term_root);
@@ -1763,7 +1736,7 @@ static DeltaPlanFragment CompileRegularLeafDelta(const DeltaOperatorInput &input
 static vector<unique_ptr<LogicalOperator>>
 BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &binder,
                       const vector<JoinLeafInfo> &leaves, uint64_t unchanged_mask, bool has_left_join,
-                      const vector<ColumnBinding> &existing_multiplicity_bindings) {
+                      const vector<ColumnBinding> &existing_multiplicity_bindings, DeltaSourceCache &source_cache) {
 	vector<unique_ptr<LogicalOperator>> terms;
 	// Base scans see post-DML state. Term i uses current state before i, delta i, and reconstructs old state after i as
 	// current - delta. These disjoint telescoping terms cover every non-empty delta combination exactly once.
@@ -1807,7 +1780,7 @@ BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &
 		for (size_t leaf = 0; leaf < leaves.size(); leaf++) {
 			auto &leaf_node = GetNodeAtPath(term, leaves[leaf].path);
 			if (leaf == delta_leaf) {
-				auto delta = CompileRegularLeafDelta(input, context, binder, leaf_node, term_root);
+				auto delta = CompileRegularLeafDelta(input, context, binder, leaf_node, term_root, source_cache);
 				mul_bindings.push_back(delta.mul_binding);
 				leaf_node = std::move(delta.op);
 				UpdateParentProjectionMap(term, leaves[leaf], delta.mul_binding);
@@ -1824,7 +1797,7 @@ BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &
 			auto delta_renumbered = renumber_and_rebind_subtree(std::move(delta_source), binder);
 			delta_source = std::move(delta_renumbered.op);
 			LogicalOperator *delta_root = delta_source.get();
-			auto delta = CompileRegularLeafDelta(input, context, binder, delta_source, delta_root);
+			auto delta = CompileRegularLeafDelta(input, context, binder, delta_source, delta_root, source_cache);
 			auto old = CreateRegularOldNode(binder, std::move(leaf_node), std::move(delta), input.mul_type);
 			mul_bindings.push_back(old.mul_binding);
 			leaf_node = std::move(old.op);
@@ -1970,15 +1943,18 @@ DeltaPlanFragment CompileJoinDelta(DeltaOperatorInput input) {
 
 	vector<TransitioningKeyCTEDefinition> transition_ctes;
 	vector<unique_ptr<LogicalOperator>> terms;
+	// Source watermarks and delta tables are read once per compile, not once per term and leaf.
+	DeltaSourceCache source_cache;
 	if (all_ducklake) {
-		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake, key_probes);
+		terms = BuildDuckLakeJoinTerms(input, context, binder, leaves, has_left_join, flattened_ducklake, key_probes,
+		                               source_cache);
 	} else if (regular_nterm) {
 		terms = BuildRegularJoinTerms(input, context, binder, leaves, unchanged_mask, has_left_join,
-		                              join_facts.existing_multiplicity_bindings);
+		                              join_facts.existing_multiplicity_bindings, source_cache);
 	} else {
 		terms = BuildInclusionExclusionTerms(input, context, binder, leaves, has_left_join,
 		                                     join_facts.existing_multiplicity_bindings, transition_ctes, declarations,
-		                                     key_probes);
+		                                     key_probes, source_cache);
 	}
 
 	// 4. UNION ALL
