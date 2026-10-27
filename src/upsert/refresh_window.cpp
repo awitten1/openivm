@@ -304,17 +304,6 @@ static bool AddWindowRowKeyColumns(const vector<string> &specs, const vector<str
 	return true;
 }
 
-static string QualifiedColumns(const vector<string> &columns, const string &alias) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += ", ";
-		}
-		result += alias + "." + SqlUtils::QuoteIdentifier(columns[i]);
-	}
-	return result;
-}
-
 static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, const string &data_table,
                                                    const string &view_query_sql, const string &affected_keys_sql,
                                                    const vector<string> &partition_cols,
@@ -340,12 +329,13 @@ static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, cons
 	string recompute_affected =
 	    SqlUtils::BuildNullSafeMatch(partition_output_columns, "openivm_aff", "openivm_recompute");
 	string row_key_match = SqlUtils::BuildNullSafeMatch(row_keys, "openivm_old", "openivm_new");
-	string old_columns = QualifiedColumns(visible_columns, "openivm_target");
-	string new_columns = QualifiedColumns(visible_columns, "openivm_recompute");
-	string changed_new_columns = QualifiedColumns(visible_columns, "openivm_new");
+	string old_columns = SqlUtils::JoinQualifiedQuotedColumns(visible_columns, "openivm_target");
+	string new_columns = SqlUtils::JoinQualifiedQuotedColumns(visible_columns, "openivm_recompute");
+	string changed_new_columns = SqlUtils::JoinQualifiedQuotedColumns(visible_columns, "openivm_new");
 	string insert_columns = SqlUtils::JoinQuotedColumns(visible_columns);
-	string distinct_rows = "(" + QualifiedColumns(visible_columns, "openivm_old") + ") IS DISTINCT FROM (" +
-	                       QualifiedColumns(visible_columns, "openivm_new") + ")";
+	string distinct_rows = "(" + SqlUtils::JoinQualifiedQuotedColumns(visible_columns, "openivm_old") +
+	                       ") IS DISTINCT FROM (" +
+	                       SqlUtils::JoinQualifiedQuotedColumns(visible_columns, "openivm_new") + ")";
 
 	// Retain both row images from the diff already required for maintenance.
 	// Publication can then apply the exact signed bag without comparing again.
@@ -372,8 +362,8 @@ static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, cons
 		                                 changed_table + " WHERE openivm_new_present)";
 		publication_scope->cleanup_sql = "DROP TABLE IF EXISTS " + changed_table + ";\n";
 	}
-	string old_partition_by = QualifiedColumns(row_keys, "openivm_target");
-	string new_partition_by = QualifiedColumns(row_keys, "openivm_recompute");
+	string old_partition_by = SqlUtils::JoinQualifiedQuotedColumns(row_keys, "openivm_target");
+	string new_partition_by = SqlUtils::JoinQualifiedQuotedColumns(row_keys, "openivm_recompute");
 	string sql;
 	sql += "CREATE OR REPLACE TEMP TABLE " + affected_table + " AS\n" + affected_keys_sql + ";\n\n";
 	sql += "CREATE OR REPLACE TEMP TABLE " + recompute_table + " AS\nSELECT * FROM (" + view_query_sql +
@@ -393,7 +383,7 @@ static string BuildDuckLakeWindowRowDiffRefreshSQL(const string &view_name, cons
 	sql += "DELETE FROM " + data_table + " WHERE rowid IN (SELECT openivm_old_rowid FROM " + changed_table +
 	       " WHERE openivm_old_rowid IS NOT NULL);\n\n";
 	sql += "INSERT INTO " + data_table + " (" + insert_columns + ")\nSELECT " +
-	       QualifiedColumns(visible_columns, "openivm_changed") + "\nFROM " + changed_table +
+	       SqlUtils::JoinQualifiedQuotedColumns(visible_columns, "openivm_changed") + "\nFROM " + changed_table +
 	       " openivm_changed\nWHERE openivm_new_present;\n\n";
 	if (!publication_scope) {
 		sql += "DROP TABLE IF EXISTS " + changed_table + ";\n";

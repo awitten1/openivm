@@ -16,6 +16,8 @@
 namespace duckdb {
 
 constexpr const char *DUCKLAKE_SNAPSHOT_PLACEHOLDER = "__OPENIVM_DUCKLAKE_SNAPSHOT_ID__";
+// Precedes the synthetic timestamp of DuckLake signed delta rows, so every row in the range counts.
+constexpr const char *DUCKLAKE_SYNTHETIC_LAST_UPDATE = "1970-01-01 00:00:00";
 
 // A maintenance compiler may retain its affected rows until publication finishes.
 struct RefreshPublicationScope {
@@ -37,8 +39,12 @@ struct DuckLakeSourceLocation {
 	string table_name;
 };
 
+// Signed (+1 insert / -1 delete) rows of the snapshots after `last_snapshot_id` through the current one.
 string BuildDuckLakeSignedDeltaRelation(const DuckLakeSourceLocation &loc, int64_t last_snapshot_id,
                                         int64_t current_snapshot_id);
+RefreshMetadata::DeltaChangeStats GetDuckLakeDeltaChangeStats(RefreshMetadata &metadata,
+                                                              const DuckLakeSourceLocation &loc,
+                                                              int64_t last_snapshot_id, int64_t current_snapshot_id);
 
 struct DuckLakeSourceSpec {
 	string metadata_key;
@@ -109,21 +115,6 @@ struct DuckLakeTableActivity {
 	bool requires_full_refresh = false;
 };
 
-class DeltaActivityProvider {
-public:
-	static DeltaActivityProvider Build(RefreshMetadata &metadata, Connection &con, const string &view_name,
-	                                   const string &view_query_sql, const vector<string> &delta_table_names,
-	                                   const string &view_catalog_name, const string &view_schema_name,
-	                                   const string &attached_db_catalog_name, const string &attached_db_schema_name);
-
-	const DeltaActivityResult &Summary() const {
-		return summary;
-	}
-
-private:
-	DeltaActivityResult summary;
-};
-
 struct RefreshCostEstimate;
 
 struct RefreshCompileProfile {
@@ -143,21 +134,24 @@ struct RefreshCompileProfile {
 struct ProjectionDeleteRetryPlan {
 	string expected_count_statement;
 	string delete_statement;
+	//! The complete refresh program that runs the ranked deletion instead.
+	string fallback_program;
 
 	bool IsActive() const {
 		return !expected_count_statement.empty() && !delete_statement.empty();
 	}
 };
 
+// Mirrors the caller's session-scoped OpenIVM planning settings onto a fresh connection.
+void PropagateRefreshPlanningSettings(ClientContext &from, ClientContext &to);
+// Rewrites DuckDB-only casts, now() and IS NOT DISTINCT FROM into Spark-portable SQL.
+string SparkPortableRefreshSQL(string sql);
 string BuildDeltaTimestampFilter(Connection &con, const string &view_name, bool has_ts_col);
 bool IsEmptyDeltaPlan(LogicalOperator *op);
-string BuildEmptyDeltaInsert(const string &view_name, const vector<string> &column_names,
+string BuildEmptyDeltaInsert(const string &insert_target, const vector<string> &column_names,
                              const vector<LogicalType> &column_types, SqlDialect dialect = SqlDialect::DUCKDB);
 string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_view_name,
                                 const vector<string> &column_names, const string &delta_ts_filter);
-string BuildDeleteInsertRefreshSQL(const string &data_table, const string &view_query_sql,
-                                   const string &recompute_alias, const string &delete_where,
-                                   const string &insert_where, const string &statement_prefix = "");
 // When `upsert_keys` and `recompute_temp_table` are supplied, emits an INSERT OR REPLACE form that
 // never deletes and re-inserts the same key inside one transaction. Required when the data table
 // carries a UNIQUE index: DuckDB's on-disk unique index keeps deleted keys for constraint checking
@@ -173,10 +167,29 @@ string BuildAffectedKeyRefreshSQL(const string &data_table, const string &view_q
                                   RefreshPublicationScope *publication_scope = nullptr);
 string BuildSignedMultisetDeltaInsertSQL(const string &delta_table, const string &old_source, const string &new_source,
                                          const string &statement_prefix = "");
+// Insert column list plus the select lists that project a row as a retraction (-1) or an insertion (+1).
+struct SignedRowLists {
+	string columns;
+	string old_rows;
+	string new_rows;
+};
+SignedRowLists BuildSignedRowLists(const vector<string> &columns, const string &old_alias = "",
+                                   const string &new_alias = "", SqlDialect dialect = SqlDialect::DUCKDB);
+// Clears the current refresh's rows from a view delta before it is rewritten.
+string BuildDeltaResetSQL(const string &delta_table, const string &delta_ts_filter);
+// `snapshot` keeps the affected groups' rows before an in-place update; `publish` then replaces the
+// view delta with their exact retraction and the updated rows.
+struct AffectedGroupSignedDelta {
+	string snapshot;
+	string publish;
+};
+AffectedGroupSignedDelta BuildAffectedGroupSignedDelta(const string &data_table, const string &delta_table,
+                                                       const vector<string> &keys, const vector<string> &columns,
+                                                       const string &delta_ts_filter, const string &scratch_name,
+                                                       bool persistent_scratch);
 string BuildSnapshotDeltaRefreshSQL(const string &data_table, const string &query, const string &delta_table,
                                     const string &old_table, const string &new_table, const string &filter);
 bool IsSummableLogicalType(const LogicalType &type);
-string NormalizeColumnNameForMatch(const string &name);
 // Resolve a logical source to its metadata key using catalog and schema as well as its name.
 string ResolveDeltaMetadataKey(RefreshMetadata &metadata, const string &view_name, const string &table_name,
                                const vector<string> &delta_table_names);
@@ -185,11 +198,7 @@ string BuildGroupRecomputeDeltaRowsSQL(const GroupRecomputeDeltaSpec &spec);
 string BuildFullOuterUnmatchedGroups(RefreshMetadata &metadata, const string &view_name,
                                      const vector<string> &delta_table_names, const vector<string> &group_columns,
                                      const string &view_query_sql, const vector<GroupRecomputeDeltaSpec> &delta_specs);
-string BuildStandardDeltaRowsSQL(const string &delta_table_sql, const string &last_update,
-                                 const string &extra_predicate = "");
 
-string ResolveDuckLakeCatalogName(Connection &con, const string &view_catalog_name,
-                                  const string &attached_db_catalog_name);
 string BuildRecomputeQuery(RefreshMetadata &metadata, const string &view_name, const string &view_query_sql,
                            bool cross_system, const string &attached_catalog = "", const string &attached_schema = "",
                            const string &catalog_prefix = "", const string &metadata_prefix = "",
@@ -240,14 +249,13 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 DuckLakeSourceLocation ResolveDuckLakeSourceLocation(Connection &con, const string &view_name, const string &table_name,
                                                      const string &fallback_catalog, const string &fallback_schema,
                                                      const string &attached_catalog, const string &attached_schema);
+// Resolves each active source's delta rows; DuckLake sources read their snapshot range.
 vector<GroupRecomputeDeltaSpec> BuildGroupRecomputeDeltaSpecs(RefreshMetadata &metadata, const string &view_name,
                                                               Connection &con, const vector<string> &delta_table_names,
-                                                              const string &ducklake_catalog,
-                                                              const string &ducklake_schema);
-string BuildDuckLakeSnapshotQuery(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                  const string &view_query_sql, const vector<string> &delta_table_names,
-                                  const string &view_catalog_name, const string &view_schema_name,
-                                  const string &attached_db_catalog_name, const string &attached_db_schema_name);
+                                                              const string &view_catalog_name,
+                                                              const string &view_schema_name,
+                                                              const string &attached_db_catalog_name,
+                                                              const string &attached_db_schema_name);
 openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &view_name, string &view_query_sql,
                                                 const vector<RefreshMetadata::DeltaSource> &delta_sources,
                                                 const string &view_catalog_name, const string &view_schema_name,
@@ -256,16 +264,15 @@ openivm::TimeTravelPins PrepareViewQuerySources(Connection &con, const string &v
 string DuckLakeSnapshotPlaceholder(const string &catalog_name);
 
 DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMetadata &metadata, Connection &con,
-                                             const string &view_name, const string &view_query_sql,
-                                             const vector<string> &delta_table_names, const string &view_catalog_name,
-                                             const string &view_schema_name, const string &attached_db_catalog_name,
-                                             const string &attached_db_schema_name, bool cross_system,
+                                             const string &view_name, const vector<string> &delta_table_names,
+                                             const string &view_catalog_name, const string &view_schema_name,
+                                             const string &attached_db_catalog_name,
+                                             const string &attached_db_schema_name,
                                              const DeltaActivityResult *precomputed_delta_activity = nullptr,
                                              const openivm::CompileFacts *facts = nullptr);
 DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                             const string &view_query_sql, const vector<string> &delta_table_names,
-                                             const string &view_catalog_name, const string &view_schema_name,
-                                             const string &attached_db_catalog_name,
+                                             const vector<string> &delta_table_names, const string &view_catalog_name,
+                                             const string &view_schema_name, const string &attached_db_catalog_name,
                                              const string &attached_db_schema_name);
 DuckLakeTableActivity ProbeDuckLakeSnapshotActivity(RefreshMetadata &metadata, Connection &con, const string &view_name,
                                                     const string &table_name, const string &catalog_name,
