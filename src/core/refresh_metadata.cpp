@@ -748,6 +748,19 @@ string RefreshMetadata::SourceDeltaTableName(const string &source_schema, const 
 	return InternalSourceDeltaName(source_schema, table);
 }
 
+// Text of `column` in a `SELECT *` result row; `fallback` when NULL or when the metadata
+// table predates the column (catalogs other than the default are migrated only at CREATE).
+static string ColumnText(MaterializedQueryResult &result, idx_t row, const string &column,
+                         const string &fallback = "") {
+	for (idx_t i = 0; i < result.ColumnCount(); i++) {
+		if (result.ColumnName(i) == column) {
+			auto value = result.GetValue(i, row);
+			return value.IsNull() ? fallback : value.ToString();
+		}
+	}
+	return fallback;
+}
+
 // Legacy rows derive the physical name; new rows store it because a colocated
 // delta may already occupy the preferred name of a moved source.
 static void SetSourceDelta(const string &delta_key, const string &schema, const string &delta_schema,
@@ -1161,35 +1174,15 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 	SourceLocation loc;
 	loc.catalog_name = fallback_catalog;
 	loc.schema_name = fallback_schema;
-	loc.table_name = table_name;
 	string delta_schema;
 	string delta_table_name;
-	auto filter = " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
-	              SqlUtils::EscapeValue(table_name) + "'";
-	auto result = con.Query("SELECT source_catalog, source_schema, delta_schema, delta_table_name FROM " +
-	                        string(openivm::DELTA_TABLES_TABLE) + filter);
-	if (result->HasError()) {
-		// Metadata written before physical delta names were stored.
-		result = con.Query("SELECT source_catalog, source_schema, delta_schema, NULL FROM " +
-		                   string(openivm::DELTA_TABLES_TABLE) + filter);
-	}
-	if (result->HasError()) {
-		result = con.Query("SELECT source_catalog, source_schema, NULL, NULL FROM " +
-		                   string(openivm::DELTA_TABLES_TABLE) + filter);
-	}
+	auto result = con.Query("SELECT * FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = " +
+	                        Value(view_name).ToSQLString() + " AND table_name = " + Value(table_name).ToSQLString());
 	if (!result->HasError() && result->RowCount() > 0) {
-		if (!result->GetValue(0, 0).IsNull()) {
-			loc.catalog_name = result->GetValue(0, 0).ToString();
-		}
-		if (!result->GetValue(1, 0).IsNull()) {
-			loc.schema_name = result->GetValue(1, 0).ToString();
-		}
-		if (!result->GetValue(2, 0).IsNull()) {
-			delta_schema = result->GetValue(2, 0).ToString();
-		}
-		if (!result->GetValue(3, 0).IsNull()) {
-			delta_table_name = result->GetValue(3, 0).ToString();
-		}
+		loc.catalog_name = ColumnText(*result, 0, "source_catalog", loc.catalog_name);
+		loc.schema_name = ColumnText(*result, 0, "source_schema", loc.schema_name);
+		delta_schema = ColumnText(*result, 0, "delta_schema");
+		delta_table_name = ColumnText(*result, 0, "delta_table_name");
 	}
 	loc.table_name = SourceTableName(table_name, loc.catalog_name, loc.schema_name);
 	SetSourceDelta(loc.table_name, loc.schema_name, delta_schema, delta_table_name, loc.delta_schema_name,
@@ -1274,31 +1267,17 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source,
 vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
                                                                       const string &fallback_catalog,
                                                                       const string &fallback_schema) {
-	auto filter = " FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "'";
-	auto result = con.Query(
-	    "SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, delta_table_name" + filter);
-	if (result->HasError()) {
-		// Metadata written before physical delta names were stored.
-		result =
-		    con.Query("SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, NULL" + filter);
-	}
-	if (result->HasError()) {
-		result = con.Query("SELECT table_name, catalog_type, source_catalog, source_schema, NULL, NULL" + filter);
-	}
+	auto result = con.Query("SELECT * FROM " + string(openivm::DELTA_TABLES_TABLE) +
+	                        " WHERE view_name = " + Value(view_name).ToSQLString());
 	vector<DeltaSource> sources;
-	if (result->HasError()) {
-		return sources;
-	}
-	for (idx_t row = 0; row < result->RowCount(); row++) {
+	for (idx_t row = 0; !result->HasError() && row < result->RowCount(); row++) {
 		DeltaSource source;
-		source.table_name = result->GetValue(0, row).ToString();
-		source.catalog_type = result->GetValue(1, row).IsNull() ? "duckdb" : result->GetValue(1, row).ToString();
-		source.catalog_name =
-		    result->GetValue(2, row).IsNull() ? fallback_catalog : result->GetValue(2, row).ToString();
-		source.schema_name = result->GetValue(3, row).IsNull() ? fallback_schema : result->GetValue(3, row).ToString();
-		auto delta_schema = result->GetValue(4, row).IsNull() ? string() : result->GetValue(4, row).ToString();
-		auto delta_name = result->GetValue(5, row).IsNull() ? string() : result->GetValue(5, row).ToString();
+		source.table_name = ColumnText(*result, row, "table_name");
+		source.catalog_type = ColumnText(*result, row, "catalog_type", "duckdb");
+		source.catalog_name = ColumnText(*result, row, "source_catalog", fallback_catalog);
+		source.schema_name = ColumnText(*result, row, "source_schema", fallback_schema);
+		auto delta_schema = ColumnText(*result, row, "delta_schema");
+		auto delta_name = ColumnText(*result, row, "delta_table_name");
 		SetSourceDelta(SourceTableName(source.table_name, source.catalog_name, source.schema_name), source.schema_name,
 		               delta_schema, delta_name, source.delta_schema_name, source.delta_table_name);
 		sources.push_back(std::move(source));
