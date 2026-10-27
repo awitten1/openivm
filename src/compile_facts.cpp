@@ -267,49 +267,11 @@ struct CompileWithFactsGlobalState : public GlobalTableFunctionState {
 	idx_t offset = 0;
 };
 
-// Splits a SQL fragment on top-level `;` boundaries (ignoring `;` inside
-// quoted strings) and pushes each non-empty trimmed statement, tagged
-// with `kind`, into the bind result.
+// Pushes each top-level statement of a SQL fragment, tagged with `kind`, into the bind result.
 static void PushBucket(CompileWithFactsBindData &bd, const string &kind, const string &sql_block) {
-	if (sql_block.empty()) {
-		return;
-	}
-	string current;
-	current.reserve(sql_block.size());
-	char in_quote = 0; // either 0, '\'', or '"'
-	for (size_t i = 0; i < sql_block.size(); i++) {
-		char c = sql_block[i];
-		if (in_quote) {
-			current += c;
-			if (c == in_quote) {
-				in_quote = 0;
-			} else if (c == '\\' && i + 1 < sql_block.size()) {
-				current += sql_block[++i];
-			}
-			continue;
-		}
-		if (c == '\'' || c == '"') {
-			in_quote = c;
-			current += c;
-			continue;
-		}
-		if (c == ';') {
-			string trimmed = current;
-			StringUtil::Trim(trimmed);
-			if (!trimmed.empty()) {
-				bd.stmt_kinds.push_back(kind);
-				bd.stmt_sqls.push_back(trimmed + ";");
-			}
-			current.clear();
-		} else {
-			current += c;
-		}
-	}
-	string tail = current;
-	StringUtil::Trim(tail);
-	if (!tail.empty()) {
+	for (auto &statement : SqlUtils::SplitSQLStatements(sql_block)) {
 		bd.stmt_kinds.push_back(kind);
-		bd.stmt_sqls.push_back(tail + ";");
+		bd.stmt_sqls.push_back(statement + ";");
 	}
 }
 
