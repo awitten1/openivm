@@ -971,15 +971,10 @@ string CompileAggregateGroups(const string &view_name, const vector<string> &col
 			                    "empty-group cleanup so NULL-padded groups are not deleted\n");
 		}
 		if (!count_cols.empty()) {
-			string delete_query = "\ndelete from " + data_table + " where ";
-			for (size_t i = 0; i < count_cols.size(); i++) {
-				if (i > 0) {
-					delete_query += " and ";
-				}
-				delete_query += "COALESCE(" + count_cols[i] + ", 0) = 0";
-			}
-			delete_query += ";\n";
-			upsert_query += delete_query;
+			upsert_query += "\ndelete from " + data_table + " where " +
+			                StringUtil::Join(count_cols, count_cols.size(), " and ",
+			                                 [](const string &col) { return "COALESCE(" + col + ", 0) = 0"; }) +
+			                ";\n";
 		}
 	}
 
@@ -1100,25 +1095,15 @@ string CompileProjectionDelta(const string &data_table, const string &delta_view
 	string mul = string(openivm::MULTIPLICITY_COL);
 	string ts_where = delta_ts_filter.empty() ? "" : " WHERE " + delta_ts_filter;
 
-	string select_columns;
-	string delete_candidate_columns;
-	string match_conditions;
-	for (auto &raw_col : column_names) {
-		if (raw_col != mul) {
-			string column = SqlUtils::QuoteIdentifier(raw_col);
-			match_conditions += "v." + column + " IS NOT DISTINCT FROM d." + column + " AND ";
-			select_columns += column + ", ";
-			delete_candidate_columns += "v." + column + " AS " + column + ", ";
-		}
-	}
-	if (select_columns.empty()) {
+	auto data_columns = SqlUtils::WithoutMultiplicity(column_names);
+	if (data_columns.empty()) {
 		throw InvalidInputException("Cannot compile projection refresh for table '%s': delta relation '%s' has no "
 		                            "user-visible columns",
 		                            data_table, delta_view);
 	}
-	match_conditions.erase(match_conditions.size() - 5, 5);
-	select_columns.erase(select_columns.size() - 2, 2);
-	delete_candidate_columns.erase(delete_candidate_columns.size() - 2, 2);
+	string select_columns = SqlUtils::JoinQuotedColumns(data_columns);
+	string delete_candidate_columns = SqlUtils::JoinQualifiedAliasedColumns(data_columns, "v");
+	string match_conditions = SqlUtils::BuildNullSafeMatch(data_columns, "v", "d");
 
 	if (insert_only) {
 		// Insert-only fast path: append projected delta rows directly. Do not run the signed net
