@@ -2,6 +2,7 @@
 
 #include "core/ivm_delta_model.hpp"
 #include "core/openivm_debug.hpp"
+#include "core/plan_rewrite.hpp"
 #include "core/vector_utils.hpp"
 #include "rules/column_hider.hpp"
 #include "duckdb/common/string_util.hpp"
@@ -238,24 +239,18 @@ static bool HasStrategyReason(const DeltaViewModel &model, DeltaStrategyReason r
 	       model.strategy_reasons.end();
 }
 
-static bool IsTransparentDistinctWrapper(LogicalOperatorType type) {
-	return type == LogicalOperatorType::LOGICAL_CREATE_TABLE || type == LogicalOperatorType::LOGICAL_FILTER ||
-	       type == LogicalOperatorType::LOGICAL_ORDER_BY || type == LogicalOperatorType::LOGICAL_LIMIT ||
-	       type == LogicalOperatorType::LOGICAL_TOP_N;
+// Output path through projections and the wrappers that keep a DISTINCT/aggregate at the top of the view.
+static OutputSpine DistinctSpine(const CreateMVPlanFacts &facts) {
+	return FindOutputSpine(facts.root, [](const LogicalOperator &op) {
+		return op.type == LogicalOperatorType::LOGICAL_CREATE_TABLE || op.type == LogicalOperatorType::LOGICAL_FILTER ||
+		       op.type == LogicalOperatorType::LOGICAL_ORDER_BY || op.type == LogicalOperatorType::LOGICAL_LIMIT ||
+		       op.type == LogicalOperatorType::LOGICAL_TOP_N;
+	});
 }
 
 static bool HasOuterProjectionOverDistinct(const CreateMVPlanFacts &facts) {
-	auto *node = facts.root;
-	bool found_projection = false;
-	while (node && node->children.size() == 1) {
-		if (node->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			found_projection = true;
-		} else if (!IsTransparentDistinctWrapper(node->type)) {
-			break;
-		}
-		node = node->children[0].get();
-	}
-	return found_projection && node && node->type == LogicalOperatorType::LOGICAL_DISTINCT;
+	auto spine = DistinctSpine(facts);
+	return !spine.projections.empty() && spine.bottom && spine.bottom->type == LogicalOperatorType::LOGICAL_DISTINCT;
 }
 
 static void BuildGroupColumns(DeltaViewModel &model, const CreateMVPlanFacts &facts, const vector<string> &output_names,
@@ -571,12 +566,10 @@ bool IsDistinctAtTop(const CreateMVPlanFacts &facts, const vector<string> &outpu
 		return false;
 	}
 
-	auto *node = facts.root;
-	while (node && node->children.size() == 1) {
-		if (!IsTransparentDistinctWrapper(node->type)) {
-			break;
-		}
-		node = node->children[0].get();
+	auto spine = DistinctSpine(facts);
+	auto *node = spine.bottom;
+	if (!spine.projections.empty()) {
+		return false;
 	}
 	if (node && node->type == LogicalOperatorType::LOGICAL_DISTINCT) {
 		return true;
