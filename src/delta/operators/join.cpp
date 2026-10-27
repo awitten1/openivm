@@ -162,16 +162,17 @@ static void FilterInternalMultiplicityColumns(const vector<ColumnBinding> &bindi
 	}
 }
 
-static void AddRenumberedMultiplicityBindings(const vector<ColumnBinding> &bindings,
-                                              const unordered_map<old_idx, new_idx> &idx_map,
-                                              column_binding_set_t &mul_set) {
+static column_binding_set_t RenumberBindings(const vector<ColumnBinding> &bindings,
+                                             const unordered_map<old_idx, new_idx> &idx_map) {
+	column_binding_set_t result;
 	for (auto binding : bindings) {
 		auto remapped = idx_map.find(binding.table_index);
 		if (remapped != idx_map.end()) {
 			binding.table_index = remapped->second;
 		}
-		mul_set.insert(binding);
+		result.insert(binding);
 	}
+	return result;
 }
 
 static LogicalOperator *GetUnaryChild(LogicalOperator *node) {
@@ -1772,72 +1773,9 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 			}
 		}
 
-		term->ResolveOperatorTypes();
-
-		// Build projection: original columns + combined multiplicity
-		auto term_bindings = term->GetColumnBindings();
-		auto term_types = term->types;
-		vector<unique_ptr<Expression>> proj_exprs;
-
-		// Filter out multiplicity columns (O(1) lookup via hash set)
-		column_binding_set_t mul_set;
-		AddRenumberedMultiplicityBindings(existing_multiplicity_bindings, renumbered.idx_map, mul_set);
-		mul_set.insert(mul_bindings.begin(), mul_bindings.end());
-		for (idx_t i = 0; i < term_bindings.size(); i++) {
-			if (!mul_set.count(term_bindings[i])) {
-				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
-			}
-		}
-
-		// Combined multiplicity: (-1)^(k-1) * ∏ w_i where k = |mask|.
-		// Z-set bilinear product times a Möbius inclusion-exclusion sign.
-		//
-		// The IE sign is required because OpenIVM's "current base" scan reads
-		// R_now = R_old + ΔR (deltas have already been applied to the source by
-		// the RefreshInsertRule at DML time). Expanding
-		//   Δ(R⋈S) = (R_old+ΔR)⋈(S_old+ΔS) − R_old⋈S_old
-		// gives an inclusion-exclusion sum: terms with k delta-side leaves carry
-		// sign (-1)^(k-1) so the overcounting from "current includes pending"
-		// cancels exactly. This is NOT the textbook DBSP delta-join formula
-		// (which uses old bases and gives all-positive terms) — it is the
-		// algebraically equivalent Möbius form for OpenIVM's data layout.
-		//
-		// Equivalence to the previous BOOLEAN XOR chain (true=+1, false=-1):
-		//   k=1: w_1                 = w_1                       (no sign flip)
-		//   k=2: -w_1·w_2            = NOT(w_1 == w_2)            (XOR true,true=false=-1)
-		//   k=3: w_1·w_2·w_3         (no sign flip)
-		//   k=4: -w_1·w_2·w_3·w_4    (sign flip)
-		// — verified algebraically on all sign combinations.
-		FunctionBinder fbinder(binder);
-		unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(input.mul_type, mul_bindings[0]);
-		for (size_t i = 1; i < mul_bindings.size(); i++) {
-			vector<unique_ptr<Expression>> args;
-			args.push_back(std::move(product));
-			args.push_back(make_uniq<BoundColumnRefExpression>(input.mul_type, mul_bindings[i]));
-			ErrorData err;
-			product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true /* is_operator */);
-			if (!product) {
-				throw InternalException("DeltaJoin: failed to bind '*' for combined multiplicity: %s",
-				                        err.RawMessage());
-			}
-		}
-		// Apply Möbius sign: (-1)^(k-1). Only flip when k is even.
-		if (mul_bindings.size() % 2 == 0) {
-			vector<unique_ptr<Expression>> args;
-			args.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
-			args.push_back(std::move(product));
-			ErrorData err;
-			product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
-			if (!product) {
-				throw InternalException("DeltaJoin: failed to bind '*' for Möbius sign: %s", err.RawMessage());
-			}
-		}
-		proj_exprs.push_back(std::move(product));
-
-		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
-		projection->children.push_back(std::move(term));
-		projection->ResolveOperatorTypes();
-		terms.push_back(std::move(projection));
+		terms.push_back(FinalizeJoinTerm(binder, std::move(term),
+		                                 RenumberBindings(existing_multiplicity_bindings, renumbered.idx_map),
+		                                 mul_bindings, input.mul_type, true));
 	}
 	// This condition only suppresses an empty debug message; it cannot affect generated terms.
 	// mull-ignore-next
@@ -1906,18 +1844,8 @@ static DeltaPlanFragment CreateRegularOldNode(Binder &binder, unique_ptr<Logical
 		delta_exprs.push_back(make_uniq<BoundColumnRefExpression>(delta_types[delta_idx], delta_binding));
 		delta_idx++;
 	}
-	FunctionBinder function_binder(binder);
-	vector<unique_ptr<Expression>> negate_args;
-	negate_args.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
-	negate_args.push_back(make_uniq<BoundColumnRefExpression>(mul_type, delta.mul_binding));
-	ErrorData negate_error;
-	auto negated = function_binder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(negate_args), negate_error,
-	                                                  true /* is_operator */);
-	if (!negated) {
-		throw InternalException("DeltaJoin: failed to negate old-state delta multiplicity: %s",
-		                        negate_error.RawMessage());
-	}
-	delta_exprs.push_back(std::move(negated));
+	delta_exprs.push_back(MultiplyIntegers(binder, make_uniq<BoundConstantExpression>(Value::INTEGER(-1)),
+	                                       make_uniq<BoundColumnRefExpression>(mul_type, delta.mul_binding)));
 	auto delta_projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(delta_exprs));
 	delta_projection->children.push_back(std::move(delta.op));
 	delta_projection->ResolveOperatorTypes();
@@ -2013,39 +1941,9 @@ BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &
 			UpdateParentProjectionMap(term, leaves[leaf], old.mul_binding);
 		}
 
-		term->ResolveOperatorTypes();
-		auto term_bindings = term->GetColumnBindings();
-		auto term_types = term->types;
-		column_binding_set_t mul_set;
-		AddRenumberedMultiplicityBindings(existing_multiplicity_bindings, renumbered.idx_map, mul_set);
-		mul_set.insert(mul_bindings.begin(), mul_bindings.end());
-		vector<unique_ptr<Expression>> projection_exprs;
-		for (idx_t i = 0; i < term_bindings.size(); i++) {
-			if (!mul_set.count(term_bindings[i])) {
-				projection_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
-			}
-		}
-
-		FunctionBinder function_binder(binder);
-		D_ASSERT(!mul_bindings.empty());
-		unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(input.mul_type, mul_bindings[0]);
-		for (size_t i = 1; i < mul_bindings.size(); i++) {
-			vector<unique_ptr<Expression>> args;
-			args.push_back(std::move(product));
-			args.push_back(make_uniq<BoundColumnRefExpression>(input.mul_type, mul_bindings[i]));
-			ErrorData error;
-			product =
-			    function_binder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), error, true /* is_operator */);
-			if (!product) {
-				throw InternalException("DeltaJoin: failed to bind regular N-term multiplicity: %s",
-				                        error.RawMessage());
-			}
-		}
-		projection_exprs.push_back(std::move(product));
-		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(projection_exprs));
-		projection->children.push_back(std::move(term));
-		projection->ResolveOperatorTypes();
-		terms.push_back(std::move(projection));
+		terms.push_back(FinalizeJoinTerm(binder, std::move(term),
+		                                 RenumberBindings(existing_multiplicity_bindings, renumbered.idx_map),
+		                                 mul_bindings, input.mul_type, false));
 	}
 	OPENIVM_DEBUG_PRINT("[DeltaJoin] Regular N-term count: %zu\n", terms.size());
 	return terms;

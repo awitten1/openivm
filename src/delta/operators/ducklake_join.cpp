@@ -503,26 +503,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 			}
 		}
 
-		term->ResolveOperatorTypes();
-
-		// Build projection: original columns + multiplicity from the single delta leaf.
-		auto term_bindings = term->GetColumnBindings();
-		auto term_types = term->types;
-		vector<unique_ptr<Expression>> proj_exprs;
-
-		// Emit all columns except the multiplicity binding from the delta.
-		for (idx_t c = 0; c < term_bindings.size(); c++) {
-			if (term_bindings[c] != mul_binding) {
-				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[c], term_bindings[c]));
-			}
-		}
-		// Append multiplicity as the last column.
-		proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(input.mul_type, mul_binding));
-
-		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(proj_exprs));
-		projection->children.push_back(std::move(term));
-		projection->ResolveOperatorTypes();
-		terms.push_back(std::move(projection));
+		terms.push_back(FinalizeJoinTerm(binder, std::move(term), {}, {mul_binding}, input.mul_type, false));
 
 		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Term %zu: delta on leaf %zu, %zu leaves pinned to old\n", i, i, N - i - 1);
 	}

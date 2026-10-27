@@ -4,17 +4,14 @@
 #include "core/openivm_debug.hpp"
 #include "delta/operators/join.hpp"
 #include "upsert/refresh_index_regen.hpp"
-#include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
-#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
-#include "duckdb/planner/operator/logical_set_operation.hpp"
 
 #include <algorithm>
 
@@ -335,77 +332,6 @@ static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator>
 	return replaced;
 }
 
-static unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const LogicalType &mul_type,
-                                                       const vector<ColumnBinding> &mul_bindings) {
-	if (mul_bindings.empty()) {
-		throw InternalException("DeltaDelimJoin: cannot build an empty multiplicity product");
-	}
-	FunctionBinder fbinder(binder);
-	unique_ptr<Expression> product = make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[0]);
-	for (size_t i = 1; i < mul_bindings.size(); i++) {
-		vector<unique_ptr<Expression>> args;
-		args.push_back(std::move(product));
-		args.push_back(make_uniq<BoundColumnRefExpression>(mul_type, mul_bindings[i]));
-		ErrorData err;
-		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
-		if (!product) {
-			throw InternalException("DeltaDelimJoin: failed to bind multiplicity product: %s", err.RawMessage());
-		}
-	}
-	if (mul_bindings.size() % 2 == 0) {
-		vector<unique_ptr<Expression>> args;
-		args.push_back(make_uniq<BoundConstantExpression>(Value::INTEGER(-1)));
-		args.push_back(std::move(product));
-		ErrorData err;
-		product = fbinder.BindScalarFunction(DEFAULT_SCHEMA, "*", std::move(args), err, true);
-		if (!product) {
-			throw InternalException("DeltaDelimJoin: failed to bind multiplicity sign: %s", err.RawMessage());
-		}
-	}
-	return product;
-}
-
-static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOperator>> &terms,
-                                                    const vector<LogicalType> &types, Binder &binder) {
-	if (terms.empty()) {
-		throw InternalException("DeltaDelimJoin: cannot assemble an empty term set");
-	}
-	auto result = std::move(terms[0]);
-	for (size_t i = 1; i < terms.size(); i++) {
-		result = make_uniq<LogicalSetOperation>(binder.GenerateTableIndex(), types.size(), std::move(result),
-		                                        std::move(terms[i]), LogicalOperatorType::LOGICAL_UNION, true);
-		result->types = types;
-	}
-
-	auto bindings = result->GetColumnBindings();
-	vector<unique_ptr<Expression>> exprs;
-	for (idx_t i = 0; i < bindings.size(); i++) {
-		exprs.push_back(make_uniq<BoundColumnRefExpression>(types[i], bindings[i]));
-	}
-	auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
-	projection->children.push_back(std::move(result));
-	projection->types = types;
-	return std::move(projection);
-}
-
-static ColumnBinding ReplaceOutputBindings(const vector<ColumnBinding> &original_bindings,
-                                           unique_ptr<LogicalOperator> &result, LogicalOperator &root) {
-	auto new_bindings = result->GetColumnBindings();
-	// The additional binding is multiplicity; subtraction describes no valid rewritten output schema.
-	if (new_bindings.size() != original_bindings.size() + 1) { // mull-ignore: cxx_add_to_sub
-		throw InternalException("DeltaDelimJoin: expected %llu rewritten bindings, found %llu",
-		                        (idx_t)(original_bindings.size() + 1), // mull-ignore: cxx_add_to_sub
-		                        (idx_t)new_bindings.size());
-	}
-	ColumnBindingReplacer replacer;
-	for (idx_t col_idx = 0; col_idx < original_bindings.size(); col_idx++) {
-		replacer.replacement_bindings.emplace_back(original_bindings[col_idx], new_bindings[col_idx]);
-	}
-	replacer.stop_operator = result;
-	replacer.VisitOperator(root);
-	return new_bindings.back();
-}
-
 } // namespace
 
 static bool ReplaceSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<LogicalOperator> &node,
@@ -534,7 +460,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 			auto output_binding = FindOutputBinding(term_bindings, mapped_binding, output_idx);
 			exprs.push_back(make_uniq<BoundColumnRefExpression>(output_types[output_idx], output_binding));
 		}
-		exprs.push_back(BuildMultiplicityProduct(binder, input.mul_type, mul_bindings));
+		exprs.push_back(BuildJoinMultiplicityProduct(binder, input.mul_type, mul_bindings, true));
 
 		auto projection = make_uniq<LogicalProjection>(binder.GenerateTableIndex(), std::move(exprs));
 		projection->children.push_back(std::move(term));
@@ -542,8 +468,8 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 		terms.push_back(std::move(projection));
 	}
 
-	auto result = AssembleUnionAll(terms, types, binder);
-	ColumnBinding new_mul_binding = ReplaceOutputBindings(original_bindings, result, *input.root);
+	auto result = AssembleJoinUnionAll(terms, types, binder);
+	ColumnBinding new_mul_binding = ReplaceJoinOutputBindings(original_bindings, result, *input.root);
 	input.plan = std::move(result);
 	return {std::move(input.plan), new_mul_binding};
 }
