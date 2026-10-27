@@ -5,7 +5,6 @@
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
-#include "duckdb/common/unordered_map.hpp"
 #include "upsert/refresh_index_regen.hpp"
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "duckdb/main/connection.hpp"
@@ -27,7 +26,7 @@ struct DuckLakeJoinColumnRef {
 };
 
 static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo &leaf, size_t leaf_index,
-                                      unordered_map<uint64_t, DuckLakeJoinColumnRef> &column_refs) {
+                                      column_binding_map_t<DuckLakeJoinColumnRef> &column_refs) {
 	vector<LogicalOperator *> ancestors;
 	ancestors.reserve(leaf.path.size());
 	LogicalOperator *node = root;
@@ -45,7 +44,7 @@ static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo 
 	if (!get) {
 		return;
 	}
-	unordered_map<uint64_t, string> visible_columns;
+	column_binding_map_t<string> visible_columns;
 	auto bindings = get->GetColumnBindings();
 	auto &column_ids = get->GetColumnIds();
 	// The <= mutant indexes one past bindings.
@@ -61,7 +60,7 @@ static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo 
 		    column_ids[column_id_idx].IsVirtualColumn()) {
 			continue;
 		}
-		visible_columns[DeltaJoinBindingKey(bindings[output_idx])] = get->GetColumnName(column_ids[column_id_idx]);
+		visible_columns[bindings[output_idx]] = get->GetColumnName(column_ids[column_id_idx]);
 	}
 
 	auto record_visible = [&]() {
@@ -73,7 +72,7 @@ static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo 
 
 	for (size_t depth = leaf.path.size(); depth-- > 0;) {
 		auto *parent = ancestors[depth];
-		unordered_map<uint64_t, string> parent_columns;
+		column_binding_map_t<string> parent_columns;
 		if (parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			auto &projection = parent->Cast<LogicalProjection>();
 			auto parent_bindings = parent->GetColumnBindings();
@@ -83,16 +82,16 @@ static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo 
 				if (!TryGetDeltaJoinColumnRef(*projection.expressions[expr_idx], child_binding)) {
 					continue;
 				}
-				auto child_entry = visible_columns.find(DeltaJoinBindingKey(child_binding));
+				auto child_entry = visible_columns.find(child_binding);
 				if (child_entry != visible_columns.end()) {
-					parent_columns[DeltaJoinBindingKey(parent_bindings[expr_idx])] = child_entry->second;
+					parent_columns[parent_bindings[expr_idx]] = child_entry->second;
 				}
 			}
 		} else {
 			for (auto &binding : parent->GetColumnBindings()) {
-				auto child_entry = visible_columns.find(DeltaJoinBindingKey(binding));
+				auto child_entry = visible_columns.find(binding);
 				if (child_entry != visible_columns.end()) {
-					parent_columns[DeltaJoinBindingKey(binding)] = child_entry->second;
+					parent_columns[binding] = child_entry->second;
 				}
 			}
 		}
@@ -399,7 +398,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 
 	vector<vector<DeltaJoinKeyProbe>> key_probes(N);
 	if (skip_empty_enabled && !has_left_join) {
-		unordered_map<uint64_t, DuckLakeJoinColumnRef> column_refs;
+		column_binding_map_t<DuckLakeJoinColumnRef> column_refs;
 		for (size_t i = 0; i < N; i++) {
 			auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
 			if (!get) {
@@ -512,12 +511,8 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		vector<unique_ptr<Expression>> proj_exprs;
 
 		// Emit all columns except the multiplicity binding from the delta.
-		uint64_t mul_key =
-		    (uint64_t)mul_binding.table_index ^ ((uint64_t)mul_binding.column_index * 0x9e3779b97f4a7c15ULL);
 		for (idx_t c = 0; c < term_bindings.size(); c++) {
-			uint64_t key = (uint64_t)term_bindings[c].table_index ^
-			               ((uint64_t)term_bindings[c].column_index * 0x9e3779b97f4a7c15ULL);
-			if (key != mul_key) {
+			if (term_bindings[c] != mul_binding) {
 				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[c], term_bindings[c]));
 			}
 		}

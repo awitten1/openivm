@@ -3,8 +3,8 @@
 
 #include "core/openivm_debug.hpp"
 #include "duckdb/common/string.hpp"
-#include "duckdb/common/unordered_map.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
@@ -16,10 +16,6 @@ struct DeltaJoinKeyProbe {
 	string delta_column;
 	string other_column;
 };
-
-inline uint64_t DeltaJoinBindingKey(const ColumnBinding &binding) {
-	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
-}
 
 inline bool TryGetDeltaJoinColumnRef(Expression &expr, ColumnBinding &binding) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {
@@ -35,7 +31,7 @@ inline bool TryGetDeltaJoinColumnRef(Expression &expr, ColumnBinding &binding) {
 }
 
 template <class ColumnRef>
-void CollectDeltaJoinKeyProbes(LogicalOperator *node, const unordered_map<uint64_t, ColumnRef> &column_refs,
+void CollectDeltaJoinKeyProbes(LogicalOperator *node, const column_binding_map_t<ColumnRef> &column_refs,
                                vector<vector<DeltaJoinKeyProbe>> &probes, const char *debug_label = nullptr) {
 	if (!node) {
 		return;
@@ -56,8 +52,8 @@ void CollectDeltaJoinKeyProbes(LogicalOperator *node, const unordered_map<uint64
 					OPENIVM_DEBUG_PRINT("[%s] Join key bindings: %s = %s\n", debug_label,
 					                    left_binding.ToString().c_str(), right_binding.ToString().c_str());
 				}
-				auto left_entry = column_refs.find(DeltaJoinBindingKey(left_binding));
-				auto right_entry = column_refs.find(DeltaJoinBindingKey(right_binding));
+				auto left_entry = column_refs.find(left_binding);
+				auto right_entry = column_refs.find(right_binding);
 				if (left_entry == column_refs.end() || right_entry == column_refs.end()) {
 					continue;
 				}

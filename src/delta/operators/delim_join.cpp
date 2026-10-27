@@ -6,6 +6,7 @@
 #include "upsert/refresh_index_regen.hpp"
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
+#include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
@@ -27,8 +28,6 @@ struct BaseLeafInfo {
 	LogicalGet *get;
 	LogicalOperator *node;
 };
-
-static uint64_t BindingKey(const ColumnBinding &binding);
 
 static bool IsJoinNode(LogicalOperatorType type) {
 	switch (type) {
@@ -111,8 +110,7 @@ static bool IsSafeSemiAntiDelimJoin(LogicalOperator &op) {
 	return !join.duplicate_eliminated_columns.empty();
 }
 
-static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op,
-                                                           const unordered_set<uint64_t> &mul_set) {
+static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op, const column_binding_set_t &mul_set) {
 	if (IsJoinNode(op.type)) {
 		auto *join = dynamic_cast<LogicalComparisonJoin *>(&op);
 		if (join) {
@@ -136,8 +134,8 @@ static void AppendMultiplicityBindingsToJoinProjectionMaps(LogicalOperator &op,
 				// Disabling this bounded scan only creates an invalid internal projection map, not another SQL
 				// behavior.
 				for (idx_t binding_idx = 0; binding_idx < child_bindings.size(); // mull-ignore: cxx_lt_to_ge
-				     binding_idx++) { // mull-ignore: cxx_post_inc_to_post_dec
-					if (!mul_set.count(BindingKey(child_bindings[binding_idx]))) { // mull-ignore: cxx_remove_negation
+				     binding_idx++) {                                  // mull-ignore: cxx_post_inc_to_post_dec
+					if (!mul_set.count(child_bindings[binding_idx])) { // mull-ignore: cxx_remove_negation
 						continue;
 					}
 					if (std::find(proj_map.begin(), proj_map.end(), binding_idx) == proj_map.end()) {
@@ -213,10 +211,6 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 }
 
 static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &replacer);
-
-static uint64_t BindingKey(const ColumnBinding &binding) {
-	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
-}
 
 static void AddColumnBindingReplacements(const vector<ColumnBinding> &old_bindings,
                                          const vector<ColumnBinding> &new_bindings,
@@ -386,12 +380,6 @@ static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &rep
 			continue;
 		}
 		RebindAllExpressions(*child, replacer);
-	}
-}
-
-static void CollectMulBindings(const vector<ColumnBinding> &mul_bindings, unordered_set<uint64_t> &mul_set) {
-	for (auto &mb : mul_bindings) {
-		mul_set.insert(BindingKey(mb));
 	}
 }
 
@@ -580,8 +568,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 		ReplaceDelimGets(context, term, delim_replacements);
 		output_replacements.insert(output_replacements.end(), delim_replacements.begin(), delim_replacements.end());
 
-		unordered_set<uint64_t> mul_set;
-		CollectMulBindings(mul_bindings, mul_set);
+		column_binding_set_t mul_set(mul_bindings.begin(), mul_bindings.end());
 		AppendMultiplicityBindingsToJoinProjectionMaps(*term, mul_set);
 
 		auto term_bindings = term->GetColumnBindings();
@@ -589,7 +576,7 @@ DeltaPlanFragment CompileDelimJoinDelta(DeltaOperatorInput input) {
 		for (idx_t output_idx = 0; output_idx < original_bindings.size(); output_idx++) {
 			auto mapped_binding =
 			    MapTermBinding(original_bindings[output_idx], renumbered.idx_map, output_replacements);
-			if (mul_set.count(BindingKey(mapped_binding))) {
+			if (mul_set.count(mapped_binding)) {
 				throw InternalException("DeltaDelimJoin: original output remapped to multiplicity binding");
 			}
 			auto output_binding = FindOutputBinding(term_bindings, mapped_binding, output_idx);

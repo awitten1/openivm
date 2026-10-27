@@ -150,11 +150,11 @@ static bool DeltaKeyHasDeltaMatch(Connection &con, const JoinColumnRef &left_ref
 }
 
 static void FilterInternalMultiplicityColumns(const vector<ColumnBinding> &bindings, const vector<LogicalType> &types,
-                                              const unordered_set<uint64_t> &mul_set,
+                                              const column_binding_set_t &mul_set,
                                               vector<ColumnBinding> &filtered_bindings,
                                               vector<LogicalType> &filtered_types) {
 	for (idx_t i = 0; i < bindings.size(); i++) {
-		if (mul_set.count(DeltaJoinBindingKey(bindings[i]))) {
+		if (mul_set.count(bindings[i])) {
 			continue;
 		}
 		filtered_bindings.push_back(bindings[i]);
@@ -164,13 +164,13 @@ static void FilterInternalMultiplicityColumns(const vector<ColumnBinding> &bindi
 
 static void AddRenumberedMultiplicityBindings(const vector<ColumnBinding> &bindings,
                                               const unordered_map<old_idx, new_idx> &idx_map,
-                                              unordered_set<uint64_t> &mul_set) {
+                                              column_binding_set_t &mul_set) {
 	for (auto binding : bindings) {
 		auto remapped = idx_map.find(binding.table_index);
 		if (remapped != idx_map.end()) {
 			binding.table_index = remapped->second;
 		}
-		mul_set.insert(DeltaJoinBindingKey(binding));
+		mul_set.insert(binding);
 	}
 }
 
@@ -217,7 +217,7 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		// The <= mutant indexes one past bindings; valid plans only exercise [0, count).
 		// mull-ignore-next: cxx_lt_to_le
 		for (idx_t col_idx = 0; col_idx < count; col_idx++) {
-			if (DeltaJoinBindingKey(bindings[col_idx]) != DeltaJoinBindingKey(binding)) {
+			if (bindings[col_idx] != binding) {
 				continue;
 			}
 			idx_t column_id_idx = col_idx;
@@ -249,9 +249,7 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		auto bindings = node->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), projection.expressions.size());
 		auto search_end = bindings.begin() + NumericCast<int64_t>(count);
-		auto match = std::find_if(bindings.begin(), search_end, [&](const ColumnBinding &candidate) {
-			return std::equal_to<uint64_t>()(DeltaJoinBindingKey(candidate), DeltaJoinBindingKey(binding));
-		});
+		auto match = std::find(bindings.begin(), search_end, binding);
 		if (match != search_end) {
 			auto expr_idx = idx_t(match - bindings.begin());
 			ColumnBinding child_binding;
@@ -271,9 +269,7 @@ static bool ResolveLeafBindingToBaseColumn(LogicalOperator *node, const ColumnBi
 		auto child_bindings = child->GetColumnBindings();
 		idx_t count = std::min<idx_t>(bindings.size(), child_bindings.size());
 		auto search_end = bindings.begin() + NumericCast<int64_t>(count);
-		auto match = std::find_if(bindings.begin(), search_end, [&](const ColumnBinding &candidate) {
-			return std::equal_to<uint64_t>()(DeltaJoinBindingKey(candidate), DeltaJoinBindingKey(binding));
-		});
+		auto match = std::find(bindings.begin(), search_end, binding);
 		if (match != search_end) {
 			auto col_idx = idx_t(match - bindings.begin());
 			return ResolveLeafBindingToBaseColumn(child, child_bindings[col_idx], table_name, column_name);
@@ -320,7 +316,7 @@ struct JoinPlanFacts {
 	vector<JoinLeafInfo> leaves;
 	vector<JoinLeafInfo> ducklake_leaves;
 	vector<ColumnBinding> existing_multiplicity_bindings;
-	unordered_set<uint64_t> existing_multiplicity_binding_keys;
+	column_binding_set_t existing_multiplicity_binding_keys;
 	string ducklake_fallback_reason;
 	bool has_outer_join = false;
 	bool only_inner_joins = true;
@@ -335,8 +331,7 @@ static void CollectJoinPlanFacts(LogicalOperator *node, vector<size_t> &path, bo
 		auto &ref = node->Cast<LogicalCTERef>();
 		if (!ref.bound_columns.empty() && ref.bound_columns.back() == openivm::MULTIPLICITY_COL) {
 			auto bindings = node->GetColumnBindings();
-			if (!bindings.empty() &&
-			    facts.existing_multiplicity_binding_keys.insert(DeltaJoinBindingKey(bindings.back())).second) {
+			if (!bindings.empty() && facts.existing_multiplicity_binding_keys.insert(bindings.back()).second) {
 				facts.existing_multiplicity_bindings.push_back(bindings.back());
 			}
 		}
@@ -531,7 +526,7 @@ static bool ResolveKeyToGetPosition(LogicalOperator *node, const ColumnBinding &
 	if (!node) {
 		return false;
 	}
-	if (std::equal_to<LogicalOperator *>()(node, target_get)) {
+	if (node == target_get) {
 		auto bindings = node->GetColumnBindings();
 		// Failing to find the key position returns false and leaves the unoptimized outer-join term intact.
 		// The <= mutant indexes one past bindings.
@@ -1262,7 +1257,7 @@ static bool HasJoinEquality(const vector<vector<DeltaJoinKeyProbe>> &key_probes,
 static vector<vector<DeltaJoinKeyProbe>> BuildJoinKeyProbes(LogicalOperator *join_root,
                                                             const vector<JoinLeafInfo> &leaves) {
 	vector<vector<DeltaJoinKeyProbe>> key_probes(leaves.size());
-	unordered_map<uint64_t, JoinColumnRef> column_refs;
+	column_binding_map_t<JoinColumnRef> column_refs;
 	for (size_t i = 0; i < leaves.size(); i++) {
 		LogicalGet *get = GetLeafScan(leaves[i]);
 		if (!get || get->GetTable().get() == nullptr) {
@@ -1277,7 +1272,7 @@ static vector<vector<DeltaJoinKeyProbe>> BuildJoinKeyProbes(LogicalOperator *joi
 			    !TableNameMatches(resolved_table, table_name)) {
 				continue;
 			}
-			column_refs[DeltaJoinBindingKey(binding)] = {i, get, table_name, string(), resolved_column, string()};
+			column_refs[binding] = {i, get, table_name, string(), resolved_column, string()};
 		}
 	}
 	CollectDeltaJoinKeyProbes(join_root, column_refs, key_probes, "DeltaJoinFK");
@@ -1609,7 +1604,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 	if (key_domain_probe_enabled) {
 		// Probe committed watermarks in the metadata schema the compiler selected.
 		RefreshMetadata::UseSameLocation(*input.context.metadata_con.context, key_probe_con);
-		unordered_map<uint64_t, JoinColumnRef> column_refs;
+		column_binding_map_t<JoinColumnRef> column_refs;
 		// The <= mutant indexes one past leaves.
 		// mull-ignore-next: cxx_lt_to_le
 		for (size_t i = 0; i < N; i++) {
@@ -1644,8 +1639,7 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 				leaf_refs[i].column_name = resolved_column;
 				OPENIVM_DEBUG_PRINT("[DeltaJoin] Column ref leaf=%zu binding=%s -> %s.%s\n", i,
 				                    binding.ToString().c_str(), resolved_table.c_str(), resolved_column.c_str());
-				column_refs[DeltaJoinBindingKey(binding)] = {
-				    i, get, table_name, delta_table_sql, resolved_column, leaf_refs[i].last_update};
+				column_refs[binding] = {i, get, table_name, delta_table_sql, resolved_column, leaf_refs[i].last_update};
 			}
 		}
 		CollectDeltaJoinKeyProbes(input.plan.get(), column_refs, key_probes, "DeltaJoin");
@@ -1786,13 +1780,11 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 		vector<unique_ptr<Expression>> proj_exprs;
 
 		// Filter out multiplicity columns (O(1) lookup via hash set)
-		unordered_set<uint64_t> mul_set;
+		column_binding_set_t mul_set;
 		AddRenumberedMultiplicityBindings(existing_multiplicity_bindings, renumbered.idx_map, mul_set);
-		for (auto &mb : mul_bindings) {
-			mul_set.insert(DeltaJoinBindingKey(mb));
-		}
+		mul_set.insert(mul_bindings.begin(), mul_bindings.end());
 		for (idx_t i = 0; i < term_bindings.size(); i++) {
-			if (!mul_set.count(DeltaJoinBindingKey(term_bindings[i]))) {
+			if (!mul_set.count(term_bindings[i])) {
 				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
 			}
 		}
@@ -2024,14 +2016,12 @@ BuildRegularJoinTerms(DeltaOperatorInput input, ClientContext &context, Binder &
 		term->ResolveOperatorTypes();
 		auto term_bindings = term->GetColumnBindings();
 		auto term_types = term->types;
-		unordered_set<uint64_t> mul_set;
+		column_binding_set_t mul_set;
 		AddRenumberedMultiplicityBindings(existing_multiplicity_bindings, renumbered.idx_map, mul_set);
-		for (auto &binding : mul_bindings) {
-			mul_set.insert(DeltaJoinBindingKey(binding));
-		}
+		mul_set.insert(mul_bindings.begin(), mul_bindings.end());
 		vector<unique_ptr<Expression>> projection_exprs;
 		for (idx_t i = 0; i < term_bindings.size(); i++) {
-			if (!mul_set.count(DeltaJoinBindingKey(term_bindings[i]))) {
+			if (!mul_set.count(term_bindings[i])) {
 				projection_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[i], term_bindings[i]));
 			}
 		}
