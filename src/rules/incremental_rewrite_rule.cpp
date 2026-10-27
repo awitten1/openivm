@@ -125,15 +125,14 @@ void IncrementalRewriteRule::IncrementalRewriteRuleFunction(OptimizerExtensionIn
 	}
 
 	auto output_names = PrepareOutputNames(optimized_plan.get(), planner.names);
-	DeltaCompileAssumptions assumptions;
-	auto delta_model = BuildRefreshDeltaViewModel(input, con, view, optimized_plan.get(), output_names, &assumptions);
+	auto delta_model = BuildRefreshDeltaViewModel(input, optimized_plan.get(), output_names);
 	LogDeltaModelSummary(delta_model);
 
 	// Join delta compilation uses input.optimizer.binder, which may not have been advanced by the local optimizer.
 	while (input.optimizer.binder.GenerateTableIndex() <= delta_model.max_table_index) {
 	}
 
-	DeltaCompiler compiler(input, con, view, delta_model, assumptions);
+	DeltaCompiler compiler(input, con, view, delta_model);
 
 	OPENIVM_DEBUG_PRINT("[IVM Rewrite] === Starting IR delta compilation ===\n");
 	auto root = optimized_plan.get();

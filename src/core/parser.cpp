@@ -657,10 +657,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		                    view_query.c_str());
 	}
 	auto classification_start = create_profile_now();
-	// Keep partition metadata for joined windows. The refresh compiler uses plan-walk lineage when it can cover all
-	// changed sources and otherwise falls back to full recompute, so dropping the metadata here only prevents safe
-	// partial/cascade plans from being compiled.
-	bool keep_window_join_partitions = true;
 	bool has_full_outer_aggregate = analysis.found_full_outer && analysis.found_aggregation;
 	bool has_cte_self_join = facts.has_repeated_cte_ref_under_join;
 	bool has_unsupported_incremental_construct = facts.has_unsupported_set_operation || facts.has_pivot;
@@ -693,7 +689,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	model_input.output_names = &output_names;
 	model_input.visible_output_count = visible_output_count;
 	model_input.has_unsupported_incremental_construct = has_unsupported_incremental_construct;
-	model_input.keep_window_join_partitions = keep_window_join_partitions;
 	model_input.stored_query_has_aggregate_filter =
 	    stored_query_has_aggregate_filter || pre_rewrite_has_aggregate_filter || stored_query_retains_having;
 	model_input.stored_query_retains_aggregate_filter =
@@ -1085,33 +1080,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	                    aggregate_columns.size());
 	for (auto reason : view_model.strategy_reasons) {
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Strategy reason: %s\n", DeltaStrategyReasonName(reason));
-	}
-	for (auto feature : view_model.features) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta model feature: %s\n", DeltaModelFeatureName(feature));
-	}
-	for (auto reason : view_model.unsupported_reasons) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta unsupported reason: %s\n", DeltaUnsupportedReasonName(reason));
-	}
-	for (auto semantics : view_model.update_semantics) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta update semantics: %s\n", DeltaUpdateSemanticsName(semantics));
-	}
-	for (auto &domain : view_model.affected_domains) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Affected domain: %s keys=%zu sources=%zu delta_local=%d "
-		                    "needs_lookup=%d\n",
-		                    DeltaAffectedDomainKindName(domain.kind), domain.key_columns.size(),
-		                    domain.source_tables.size(), (int)domain.delta_local, (int)domain.needs_base_lookup);
-	}
-	for (auto &node : view_model.nodes) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta node %llu: %s rule=%s children=%zu sources=%zu "
-		                    "keys=%zu "
-		                    "occurrence=%llu domains=%zu lineage=%zu semantics=%zu unsupported=%zu "
-		                    "maintenance=%s state=%s\n",
-		                    static_cast<unsigned long long>(node.id), DeltaModelNodeKindName(node.kind),
-		                    DeltaRuleKindName(node.rule), node.children.size(), node.source_tables.size(),
-		                    node.affected_key_columns.size(), static_cast<unsigned long long>(node.source_occurrence),
-		                    node.affected_domains.size(), node.lineage_facts.size(), node.update_semantics.size(),
-		                    node.unsupported_reasons.size(), DeltaMaintenanceModeName(node.maintenance.mode),
-		                    DeltaMaintenanceStateKindName(node.maintenance.state));
 	}
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
 	for (const auto &t : table_names) {
