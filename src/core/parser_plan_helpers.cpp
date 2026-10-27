@@ -1892,7 +1892,7 @@ bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadat
 }
 
 struct WindowLineageOp {
-	string kind;
+	WindowLineageKind kind = WindowLineageKind::DIRECT;
 	string output_col;
 	string source_table;
 	idx_t source_occurrence = 0;
@@ -2056,7 +2056,7 @@ static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlan
 						continue;
 					}
 					WindowLineageOp op;
-					op.kind = "direct";
+					op.kind = WindowLineageKind::DIRECT;
 					op.output_col = output_col;
 					op.source_table = ref.table;
 					op.source_occurrence = ref.occurrence;
@@ -2096,7 +2096,7 @@ static void AddUniqueLineageOp(vector<WindowLineageOp> &ops, WindowLineageOp op)
 static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const OccurrenceColumnRef &ref,
                                       const string &output_col) {
 	for (auto &op : ops) {
-		if (op.kind == "direct" && StringUtil::CIEquals(op.output_col, output_col) &&
+		if (op.kind == WindowLineageKind::DIRECT && StringUtil::CIEquals(op.output_col, output_col) &&
 		    StringUtil::CIEquals(op.source_table, ref.table) && op.source_occurrence == ref.occurrence &&
 		    StringUtil::CIEquals(op.source_col, ref.column)) {
 			return true;
@@ -2184,7 +2184,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 					continue;
 				}
 				WindowLineageOp equivalent;
-				equivalent.kind = "direct";
+				equivalent.kind = WindowLineageKind::DIRECT;
 				equivalent.output_col = direct.output_col;
 				equivalent.source_table = other.table;
 				equivalent.source_occurrence = other.occurrence;
@@ -2214,7 +2214,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 				continue;
 			}
 			WindowLineageOp lookup;
-			lookup.kind = "lookup";
+			lookup.kind = WindowLineageKind::LOOKUP;
 			lookup.output_col = direct.output_col;
 			lookup.source_table = edge.changed_join.table;
 			lookup.source_occurrence = edge.changed_join.occurrence;

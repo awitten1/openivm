@@ -130,7 +130,7 @@ string BuildCountDistinctAuxStateCreateSQL(const string &target_table, const str
                                            const string &distinct_col, const string &distinct_expr,
                                            const string &filter_sql, bool replace);
 
-string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
+string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, SemiAntiJoinType join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
                                 const string &right_alias, const string &predicate, const string &post_filter,
                                 const string &right_filter, const vector<string> &left_cols,
@@ -144,7 +144,7 @@ string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &
                                       const string &post_filter, const string &right_filter,
                                       const vector<string> &left_cols, const vector<string> &left_exprs, bool replace,
                                       bool null_aware = false, const string &null_aware_right_expr = "");
-string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, const string &join_type,
+string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, SemiAntiJoinType join_type,
                                    const vector<string> &left_cols, const vector<string> &output_cols,
                                    bool null_aware = false, const string &null_aware_left_col = "");
 

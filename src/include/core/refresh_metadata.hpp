@@ -358,7 +358,7 @@ public:
 
 	struct SemiAntiAuxMeta {
 		string aux_table;
-		string join_type;
+		SemiAntiJoinType join_type = SemiAntiJoinType::SEMI;
 		string left_table;
 		string left_alias;
 		string right_table;
@@ -378,7 +378,7 @@ public:
 	static string SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta);
 
 	struct WindowPartitionLineageOp {
-		string kind;
+		WindowLineageKind kind = WindowLineageKind::DIRECT;
 		string output_col;
 		string source;
 		string source_col;

@@ -1921,91 +1921,190 @@ vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetRefreshHistory(
 	return entries;
 }
 
-namespace {
+// --- JSON metadata: each struct lists its fields once; MetadataJson::Write/Read serialize them. ---
+using MetadataJson::Presence;
 
-static vector<string> SplitPipeFields(const string &value) {
-	vector<string> fields;
-	string current;
-	for (char c : value) {
-		if (c == '|') {
-			fields.push_back(std::move(current));
-			current.clear();
-			continue;
-		}
-		current += c;
-	}
-	fields.push_back(std::move(current));
-	return fields;
+template <class IO>
+static void Fields(IO &io, DerivedAggregateOutput &m) {
+	io.Str("column", m.output_column);
+	io.Str("expression", m.expression_sql);
 }
 
-static bool ParseJsonIndex(const string &json, const string &key, idx_t &out) {
-	string text;
-	if (!MetadataJson::ExtractJsonString(json, key, text)) {
-		return false;
-	}
-	try {
-		out = static_cast<idx_t>(std::stoull(text));
-		return true;
-	} catch (...) {
-		return false;
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::GroupRecomputeSourceOccurrence &m) {
+	io.Str("table", m.table_name);
+	io.Index("count", m.count);
+}
+
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::DistinctAuxMeta &m) {
+	io.Str("aux_table", m.aux_table);
+	io.Arr("cols", m.cols);
+	io.Arr("source_exprs", m.source_exprs, Presence::OPTIONAL);
+	io.Str("input_sql", m.input_sql);
+	io.Str("source", m.source);
+	io.Str("filter", m.filter, Presence::OPTIONAL); // empty without a WHERE clause
+	io.Str("sum_arg", m.sum_arg);
+	io.Str("sum_out", m.sum_out);
+}
+
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::CountDistinctAuxMeta &m) {
+	io.Str("aux_table", m.aux_table);
+	io.Str("source", m.source);
+	io.Arr("group_cols", m.group_cols);
+	io.Arr("group_source_exprs", m.group_source_exprs, Presence::OPTIONAL);
+	io.Str("distinct_col", m.distinct_col);
+	io.Str("distinct_expr", m.distinct_expr);
+	io.Str("output_col", m.output_col);
+	io.Str("filter", m.filter, Presence::OPTIONAL);
+}
+
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::SemiAntiAuxMeta &m) {
+	io.Str("aux_table", m.aux_table);
+	io.Enum("join_type", m.join_type, SEMI_ANTI_JOIN_TYPE_NAMES);
+	io.Str("left_table", m.left_table);
+	io.Str("left_alias", m.left_alias);
+	io.Str("right_table", m.right_table);
+	io.Str("right_alias", m.right_alias);
+	io.Str("predicate", m.predicate);
+	io.Str("post_filter", m.post_filter, Presence::OPTIONAL);
+	io.Str("right_filter", m.right_filter, Presence::OPTIONAL);
+	io.Bool("null_aware", m.null_aware, Presence::OPTIONAL);
+	io.Str("null_aware_left_col", m.null_aware_left_col, Presence::OPTIONAL);
+	io.Str("null_aware_right_expr", m.null_aware_right_expr, Presence::OPTIONAL);
+	io.Arr("left_cols", m.left_cols);
+	io.Arr("left_exprs", m.left_exprs, Presence::OPTIONAL);
+	io.Arr("output_cols", m.output_cols);
+}
+
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::WindowPartitionLineageOp &m) {
+	io.Enum("k", m.kind, WINDOW_LINEAGE_KIND_NAMES);
+	io.Str("out", m.output_col);
+	io.Str("source", m.source);
+	io.Str("source_col", m.source_col);
+	io.Str("source_cast", m.source_cast, Presence::OMIT_EMPTY);
+	if (m.kind == WindowLineageKind::LOOKUP) {
+		io.Str("lookup", m.lookup);
+		io.Str("lookup_col", m.lookup_col);
+		io.Str("lookup_out", m.lookup_out);
+		io.Str("lookup_cast", m.lookup_cast, Presence::OMIT_EMPTY);
+		io.Str("lookup_out_cast", m.lookup_out_cast, Presence::OMIT_EMPTY);
 	}
 }
 
-static bool ReadRefreshLineageEntry(const string &json, const string &kind, string &entry) {
-	if (json.empty()) {
-		return false;
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::ProjectionKeyLineage &m) {
+	io.Tag("k", "projection_key");
+	io.Str("out", m.output_col);
+	io.Str("key_source", m.key_source);
+	io.Index("key_occ", m.key_occurrence);
+	io.Str("key_col", m.key_col);
+}
+
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::ProjectionKeyLineageArm &m) {
+	io.Str("source", m.source);
+	io.Index("occ", m.occurrence);
+	io.Str("source_col", m.source_col);
+}
+
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::LeftJoinKeySource &m) {
+	io.Tag("k", "left_join_key_source");
+	io.Str("table", m.table);
+	io.Index("occ", m.occurrence);
+	io.Str("column", m.column);
+	io.Bool("cardinality_transition_check_safe", m.cardinality_transition_check_safe, Presence::OPTIONAL);
+}
+
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::LeftJoinNullableSources &m) {
+	io.Tag("k", "left_join_nullable");
+	io.Bool("complete", m.complete, Presence::OPTIONAL);
+	io.Arr("tables", m.tables, Presence::OPTIONAL);
+}
+
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::FilteredGroupCountAuxMeta &m) {
+	io.Tag("kind", "filtered_group_count");
+	io.Str("aux_table", m.aux_table);
+	io.Str("source", m.source);
+	io.Str("group_col", m.group_col);
+	io.Str("sum_col", m.sum_col);
+	io.Str("source_group_expr", m.source_group_expr, Presence::OPTIONAL);
+	io.Str("source_sum_expr", m.source_sum_expr, Presence::OPTIONAL);
+	io.Str("output_col", m.output_col);
+	io.Str("op", m.comparison_op);
+	io.Str("threshold", m.threshold_sql);
+}
+
+template <class IO>
+static void Fields(IO &io, RefreshMetadata::LeftJoinSecondaryMeta &m) {
+	io.Tag("kind", "leftjoin_secondary");
+	io.Str("sql", m.sql);
+	io.Arr("preserved_cols", m.preserved_cols);
+	io.Arr("inner_tables", m.inner_tables);
+	io.Arr("inner_keys", m.inner_keys);
+	io.Arr("pres_tables", m.pres_tables);
+	io.Arr("pres_keys", m.pres_keys);
+}
+
+template <class T>
+static vector<string> WriteEach(const vector<T> &values) {
+	vector<string> objects;
+	for (auto &value : values) {
+		objects.push_back(MetadataJson::Write(value));
 	}
-	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "items");
-	for (auto &object : objects) {
+	return objects;
+}
+
+// One entry of the lineage_json `items` array, selected by its "k".
+static string ReadRefreshLineageEntry(const string &json, const string &kind) {
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "items")) {
 		string object_kind;
 		if (MetadataJson::ExtractJsonString(object, "k", object_kind) && object_kind == kind) {
-			entry = std::move(object);
-			return true;
+			return object;
 		}
 	}
-	return false;
+	return "";
 }
-
-} // namespace
 
 vector<RefreshMetadata::GroupRecomputeSourceOccurrence>
 RefreshMetadata::GetGroupRecomputeSourceOccurrences(const string &view_name) {
 	vector<GroupRecomputeSourceOccurrence> occurrences;
-	string json = ReadViewString(view_name, "group_recompute_source_occurrences_json");
-	if (json.empty()) {
-		return occurrences;
-	}
-	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "sources");
-	for (auto &object : objects) {
+	auto json = ReadViewString(view_name, "group_recompute_source_occurrences_json");
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "sources")) {
 		GroupRecomputeSourceOccurrence occurrence;
-		if (!MetadataJson::ExtractJsonString(object, "table", occurrence.table_name) ||
-		    !ParseJsonIndex(object, "count", occurrence.count) || occurrence.table_name.empty()) {
-			continue;
+		if (MetadataJson::Read(object, occurrence) && !occurrence.table_name.empty()) {
+			occurrences.push_back(std::move(occurrence));
 		}
-		occurrences.push_back(std::move(occurrence));
 	}
 	return occurrences;
+}
+
+string
+RefreshMetadata::GroupRecomputeSourceOccurrencesToJson(const vector<GroupRecomputeSourceOccurrence> &occurrences) {
+	MetadataJson::Writer writer;
+	writer.Objects("sources", WriteEach(occurrences));
+	return writer.Finish();
 }
 
 DerivedAggregateOutputInfo RefreshMetadata::GetDerivedAggregateOutputs(const string &view_name) {
 	DerivedAggregateOutputInfo info;
 	const auto json = ReadViewString(view_name, "derived_aggregate_outputs_json");
-	const string complete_prefix = "{\"complete\":true,\"outputs\":[";
-	const string incomplete_prefix = "{\"complete\":false,\"outputs\":[";
-	const bool has_complete_prefix = json.rfind(complete_prefix, 0) == 0;
-	const bool has_incomplete_prefix = json.rfind(incomplete_prefix, 0) == 0;
-	bool parsed_outputs_complete = false;
-	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "outputs", parsed_outputs_complete);
-	info.complete = has_complete_prefix && parsed_outputs_complete && json.size() >= 2 &&
-	                json.compare(json.size() - 2, 2, "]}") == 0;
-	if (!has_complete_prefix && !has_incomplete_prefix) {
+	const bool has_complete_prefix = StringUtil::StartsWith(json, "{\"complete\":true,\"outputs\":[");
+	if (!has_complete_prefix && !StringUtil::StartsWith(json, "{\"complete\":false,\"outputs\":[")) {
 		return info;
 	}
+	bool parsed_outputs_complete = false;
+	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "outputs", parsed_outputs_complete);
+	info.complete = has_complete_prefix && parsed_outputs_complete && StringUtil::EndsWith(json, "]}");
 	for (auto &object : objects) {
 		DerivedAggregateOutput output;
-		if (MetadataJson::ExtractJsonString(object, "column", output.output_column) &&
-		    MetadataJson::ExtractJsonString(object, "expression", output.expression_sql) &&
-		    !output.output_column.empty() && !output.expression_sql.empty()) {
+		if (MetadataJson::Read(object, output) && !output.output_column.empty() && !output.expression_sql.empty()) {
 			info.outputs.push_back(std::move(output));
 		} else {
 			info.complete = false;
@@ -2015,229 +2114,84 @@ DerivedAggregateOutputInfo RefreshMetadata::GetDerivedAggregateOutputs(const str
 }
 
 string RefreshMetadata::DerivedAggregateOutputsToJson(const DerivedAggregateOutputInfo &info) {
-	string json = string("{\"complete\":") + (info.complete ? "true" : "false") + ",\"outputs\":[";
-	for (idx_t i = 0; i < info.outputs.size(); i++) {
-		if (i > 0) {
-			json += ",";
-		}
-		json += "{\"column\":" + SqlUtils::JsonQuote(info.outputs[i].output_column) +
-		        ",\"expression\":" + SqlUtils::JsonQuote(info.outputs[i].expression_sql) + "}";
-	}
-	json += "]}";
-	return json;
-}
-
-string
-RefreshMetadata::GroupRecomputeSourceOccurrencesToJson(const vector<GroupRecomputeSourceOccurrence> &occurrences) {
-	string json = "{\"sources\":[";
-	for (idx_t i = 0; i < occurrences.size(); i++) {
-		if (i > 0) {
-			json += ",";
-		}
-		json += "{\"table\":" + SqlUtils::JsonQuote(occurrences[i].table_name) +
-		        ",\"count\":" + SqlUtils::JsonQuote(to_string(occurrences[i].count)) + "}";
-	}
-	json += "]}";
-	return json;
+	MetadataJson::Writer writer;
+	writer.Raw("complete", info.complete ? "true" : "false");
+	writer.Objects("outputs", WriteEach(info.outputs));
+	return writer.Finish();
 }
 
 bool RefreshMetadata::GetDistinctAuxMeta(const string &view_name, DistinctAuxMeta &out) {
-	string json = ReadViewString(view_name, "distinct_aux_meta_json");
-	if (json.empty()) {
-		return false;
-	}
-	bool ok = true;
-	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= MetadataJson::ExtractJsonStringArray(json, "cols", out.cols);
-	MetadataJson::ExtractJsonStringArray(json, "source_exprs", out.source_exprs);
-	ok &= MetadataJson::ExtractJsonString(json, "input_sql", out.input_sql);
-	ok &= MetadataJson::ExtractJsonString(json, "source", out.source);
-	// filter is optional — empty when the user didn't write a WHERE clause.
-	MetadataJson::ExtractJsonString(json, "filter", out.filter);
-	ok &= MetadataJson::ExtractJsonString(json, "sum_arg", out.sum_arg);
-	ok &= MetadataJson::ExtractJsonString(json, "sum_out", out.sum_out);
-	return ok;
+	return MetadataJson::Read(ReadViewString(view_name, "distinct_aux_meta_json"), out);
 }
 
 string RefreshMetadata::DistinctAuxMetaToJson(const DistinctAuxMeta &meta) {
-	return "{\"aux_table\":" + SqlUtils::JsonQuote(meta.aux_table) + ",\"cols\":" + SqlUtils::JsonArray(meta.cols) +
-	       ",\"source_exprs\":" + SqlUtils::JsonArray(meta.source_exprs) +
-	       ",\"input_sql\":" + SqlUtils::JsonQuote(meta.input_sql) + ",\"source\":" + SqlUtils::JsonQuote(meta.source) +
-	       ",\"filter\":" + SqlUtils::JsonQuote(meta.filter) + ",\"sum_arg\":" + SqlUtils::JsonQuote(meta.sum_arg) +
-	       ",\"sum_out\":" + SqlUtils::JsonQuote(meta.sum_out) + "}";
+	return MetadataJson::Write(meta);
 }
 
 bool RefreshMetadata::GetCountDistinctAuxMeta(const string &view_name, CountDistinctAuxMeta &out) {
-	string json = ReadViewString(view_name, "count_distinct_aux_meta_json");
-	if (json.empty()) {
-		return false;
-	}
-	bool ok = true;
-	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= MetadataJson::ExtractJsonString(json, "source", out.source);
-	ok &= MetadataJson::ExtractJsonStringArray(json, "group_cols", out.group_cols);
-	MetadataJson::ExtractJsonStringArray(json, "group_source_exprs", out.group_source_exprs);
-	ok &= MetadataJson::ExtractJsonString(json, "distinct_col", out.distinct_col);
-	ok &= MetadataJson::ExtractJsonString(json, "distinct_expr", out.distinct_expr);
-	ok &= MetadataJson::ExtractJsonString(json, "output_col", out.output_col);
-	MetadataJson::ExtractJsonString(json, "filter", out.filter);
-	return ok;
+	return MetadataJson::Read(ReadViewString(view_name, "count_distinct_aux_meta_json"), out);
 }
 
 string RefreshMetadata::CountDistinctAuxMetaToJson(const CountDistinctAuxMeta &meta) {
-	return "{\"aux_table\":" + SqlUtils::JsonQuote(meta.aux_table) + ",\"source\":" + SqlUtils::JsonQuote(meta.source) +
-	       ",\"group_cols\":" + SqlUtils::JsonArray(meta.group_cols) +
-	       ",\"group_source_exprs\":" + SqlUtils::JsonArray(meta.group_source_exprs) +
-	       ",\"distinct_col\":" + SqlUtils::JsonQuote(meta.distinct_col) +
-	       ",\"distinct_expr\":" + SqlUtils::JsonQuote(meta.distinct_expr) +
-	       ",\"output_col\":" + SqlUtils::JsonQuote(meta.output_col) +
-	       ",\"filter\":" + SqlUtils::JsonQuote(meta.filter) + "}";
+	return MetadataJson::Write(meta);
 }
 
 bool RefreshMetadata::GetSemiAntiAuxMeta(const string &view_name, SemiAntiAuxMeta &out) {
-	string json = ReadViewString(view_name, "semi_anti_aux_meta_json");
-	if (json.empty()) {
-		return false;
-	}
-	bool ok = true;
-	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= MetadataJson::ExtractJsonString(json, "join_type", out.join_type);
-	ok &= MetadataJson::ExtractJsonString(json, "left_table", out.left_table);
-	ok &= MetadataJson::ExtractJsonString(json, "left_alias", out.left_alias);
-	ok &= MetadataJson::ExtractJsonString(json, "right_table", out.right_table);
-	ok &= MetadataJson::ExtractJsonString(json, "right_alias", out.right_alias);
-	ok &= MetadataJson::ExtractJsonString(json, "predicate", out.predicate);
-	MetadataJson::ExtractJsonString(json, "post_filter", out.post_filter);
-	MetadataJson::ExtractJsonString(json, "right_filter", out.right_filter);
-	string null_aware;
-	if (MetadataJson::ExtractJsonString(json, "null_aware", null_aware)) {
-		out.null_aware = StringUtil::CIEquals(null_aware, "true");
-	}
-	MetadataJson::ExtractJsonString(json, "null_aware_left_col", out.null_aware_left_col);
-	MetadataJson::ExtractJsonString(json, "null_aware_right_expr", out.null_aware_right_expr);
-	ok &= MetadataJson::ExtractJsonStringArray(json, "left_cols", out.left_cols);
-	MetadataJson::ExtractJsonStringArray(json, "left_exprs", out.left_exprs);
-	ok &= MetadataJson::ExtractJsonStringArray(json, "output_cols", out.output_cols);
-	return ok;
+	return MetadataJson::Read(ReadViewString(view_name, "semi_anti_aux_meta_json"), out);
 }
 
 string RefreshMetadata::SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta) {
-	return "{\"aux_table\":" + SqlUtils::JsonQuote(meta.aux_table) +
-	       ",\"join_type\":" + SqlUtils::JsonQuote(meta.join_type) +
-	       ",\"left_table\":" + SqlUtils::JsonQuote(meta.left_table) +
-	       ",\"left_alias\":" + SqlUtils::JsonQuote(meta.left_alias) +
-	       ",\"right_table\":" + SqlUtils::JsonQuote(meta.right_table) +
-	       ",\"right_alias\":" + SqlUtils::JsonQuote(meta.right_alias) +
-	       ",\"predicate\":" + SqlUtils::JsonQuote(meta.predicate) +
-	       ",\"post_filter\":" + SqlUtils::JsonQuote(meta.post_filter) +
-	       ",\"right_filter\":" + SqlUtils::JsonQuote(meta.right_filter) +
-	       ",\"null_aware\":" + SqlUtils::JsonQuote(meta.null_aware ? "true" : "false") +
-	       ",\"null_aware_left_col\":" + SqlUtils::JsonQuote(meta.null_aware_left_col) +
-	       ",\"null_aware_right_expr\":" + SqlUtils::JsonQuote(meta.null_aware_right_expr) +
-	       ",\"left_cols\":" + SqlUtils::JsonArray(meta.left_cols) +
-	       ",\"left_exprs\":" + SqlUtils::JsonArray(meta.left_exprs) +
-	       ",\"output_cols\":" + SqlUtils::JsonArray(meta.output_cols) + "}";
+	return MetadataJson::Write(meta);
 }
 
 bool RefreshMetadata::GetWindowPartitionLineage(const string &view_name, vector<WindowPartitionLineageOp> &out) {
 	out.clear();
-	string json;
-	if (!ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "window_partition", json)) {
-		return false;
-	}
-	vector<string> objects = MetadataJson::ExtractJsonObjectsFromArray(json, "ops");
-	for (auto &object : objects) {
+	auto json = ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "window_partition");
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "ops")) {
 		WindowPartitionLineageOp op;
-		if (!MetadataJson::ExtractJsonString(object, "k", op.kind) ||
-		    !MetadataJson::ExtractJsonString(object, "out", op.output_col) ||
-		    !MetadataJson::ExtractJsonString(object, "source", op.source) ||
-		    !MetadataJson::ExtractJsonString(object, "source_col", op.source_col)) {
-			continue;
+		if (MetadataJson::Read(object, op)) {
+			out.push_back(std::move(op));
 		}
-		MetadataJson::ExtractJsonString(object, "source_cast", op.source_cast);
-		if (op.kind == "lookup") {
-			if (!MetadataJson::ExtractJsonString(object, "lookup", op.lookup) ||
-			    !MetadataJson::ExtractJsonString(object, "lookup_col", op.lookup_col) ||
-			    !MetadataJson::ExtractJsonString(object, "lookup_out", op.lookup_out)) {
-				continue;
-			}
-			MetadataJson::ExtractJsonString(object, "lookup_cast", op.lookup_cast);
-			MetadataJson::ExtractJsonString(object, "lookup_out_cast", op.lookup_out_cast);
-		} else if (op.kind != "direct") {
-			continue;
-		}
-		out.push_back(std::move(op));
 	}
 	return !out.empty();
 }
 
 string RefreshMetadata::WindowPartitionLineageToJson(const vector<WindowPartitionLineageOp> &ops) {
-	string json = "{\"k\":\"window_partition\",\"ops\":[";
-	for (idx_t i = 0; i < ops.size(); i++) {
-		auto &op = ops[i];
-		if (i > 0) {
-			json += ",";
-		}
-		json += "{\"k\":" + SqlUtils::JsonQuote(op.kind) + ",\"out\":" + SqlUtils::JsonQuote(op.output_col) +
-		        ",\"source\":" + SqlUtils::JsonQuote(op.source) +
-		        ",\"source_col\":" + SqlUtils::JsonQuote(op.source_col);
-		if (!op.source_cast.empty()) {
-			json += ",\"source_cast\":" + SqlUtils::JsonQuote(op.source_cast);
-		}
-		if (op.kind == "lookup") {
-			json += ",\"lookup\":" + SqlUtils::JsonQuote(op.lookup) +
-			        ",\"lookup_col\":" + SqlUtils::JsonQuote(op.lookup_col) +
-			        ",\"lookup_out\":" + SqlUtils::JsonQuote(op.lookup_out);
-			if (!op.lookup_cast.empty()) {
-				json += ",\"lookup_cast\":" + SqlUtils::JsonQuote(op.lookup_cast);
-			}
-			if (!op.lookup_out_cast.empty()) {
-				json += ",\"lookup_out_cast\":" + SqlUtils::JsonQuote(op.lookup_out_cast);
-			}
-		}
-		json += "}";
-	}
-	json += "]}";
-	return json;
+	MetadataJson::Writer writer;
+	writer.Tag("k", "window_partition");
+	writer.Objects("ops", WriteEach(ops));
+	return writer.Finish();
 }
 
 bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, ProjectionKeyLineage &out) {
-	string json;
-	if (!ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "projection_key", json)) {
+	auto json = ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "projection_key");
+	if (!MetadataJson::Read(json, out)) {
 		return false;
 	}
-	if (!MetadataJson::ExtractJsonString(json, "out", out.output_col) ||
-	    !MetadataJson::ExtractJsonString(json, "key_source", out.key_source) ||
-	    !ParseJsonIndex(json, "key_occ", out.key_occurrence) ||
-	    !MetadataJson::ExtractJsonString(json, "key_col", out.key_col)) {
-		return false;
-	}
-	out.arms.clear();
-	auto objects = MetadataJson::ExtractJsonObjectsFromArray(json, "arms");
-	for (auto &object : objects) {
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "arms")) {
 		ProjectionKeyLineageArm arm;
-		if (!MetadataJson::ExtractJsonString(object, "source", arm.source) ||
-		    !ParseJsonIndex(object, "occ", arm.occurrence) ||
-		    !MetadataJson::ExtractJsonString(object, "source_col", arm.source_col)) {
+		if (!MetadataJson::Read(object, arm)) {
 			continue;
 		}
+		// Each step is "table|occurrence|lookup_col|lookup_out".
 		vector<string> steps;
 		MetadataJson::ExtractJsonStringArray(object, "steps", steps);
 		for (auto &step_text : steps) {
-			auto fields = SplitPipeFields(step_text);
-			if (fields.size() != 4) {
-				continue;
+			vector<string> parts(1);
+			for (char c : step_text) {
+				if (c == '|') {
+					parts.emplace_back();
+				} else {
+					parts.back() += c;
+				}
 			}
 			ProjectionKeyLineageStep step;
-			step.table = fields[0];
-			try {
-				step.occurrence = static_cast<idx_t>(std::stoull(fields[1]));
-			} catch (...) {
-				continue;
+			if (parts.size() == 4 && MetadataJson::ParseIndex(parts[1], step.occurrence)) {
+				step.table = parts[0];
+				step.lookup_col = parts[2];
+				step.lookup_out = parts[3];
+				arm.steps.push_back(std::move(step));
 			}
-			step.lookup_col = fields[2];
-			step.lookup_out = fields[3];
-			arm.steps.push_back(std::move(step));
 		}
 		out.arms.push_back(std::move(arm));
 	}
@@ -2245,147 +2199,57 @@ bool RefreshMetadata::GetProjectionKeyLineage(const string &view_name, Projectio
 }
 
 string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &lineage) {
-	string json = "{\"k\":\"projection_key\",\"out\":" + SqlUtils::JsonQuote(lineage.output_col) +
-	              ",\"key_source\":" + SqlUtils::JsonQuote(lineage.key_source) +
-	              ",\"key_occ\":" + SqlUtils::JsonQuote(to_string(lineage.key_occurrence)) +
-	              ",\"key_col\":" + SqlUtils::JsonQuote(lineage.key_col) + ",\"arms\":[";
-	for (idx_t i = 0; i < lineage.arms.size(); i++) {
-		auto &arm = lineage.arms[i];
-		if (i > 0) {
-			json += ",";
+	vector<string> arms;
+	for (auto &arm : lineage.arms) {
+		MetadataJson::Writer arm_writer;
+		Fields(arm_writer, const_cast<ProjectionKeyLineageArm &>(arm));
+		vector<string> steps;
+		for (auto &step : arm.steps) {
+			steps.push_back(step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" +
+			                step.lookup_out);
 		}
-		json += "{\"source\":" + SqlUtils::JsonQuote(arm.source) +
-		        ",\"occ\":" + SqlUtils::JsonQuote(to_string(arm.occurrence)) +
-		        ",\"source_col\":" + SqlUtils::JsonQuote(arm.source_col) + ",\"steps\":[";
-		for (idx_t j = 0; j < arm.steps.size(); j++) {
-			auto &step = arm.steps[j];
-			if (j > 0) {
-				json += ",";
-			}
-			json += SqlUtils::JsonQuote(step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" +
-			                            step.lookup_out);
-		}
-		json += "]}";
+		arm_writer.Arr("steps", steps);
+		arms.push_back(arm_writer.Finish());
 	}
-	json += "]}";
-	return json;
+	MetadataJson::Writer writer;
+	Fields(writer, const_cast<ProjectionKeyLineage &>(lineage));
+	writer.Objects("arms", arms);
+	return writer.Finish();
 }
 
 bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeySource &out) {
-	string json;
-	if (!ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "left_join_key_source", json)) {
-		return false;
-	}
-	out.cardinality_transition_check_safe = false;
-	string cardinality_transition_check_safe;
-	if (MetadataJson::ExtractJsonString(json, "cardinality_transition_check_safe", cardinality_transition_check_safe)) {
-		out.cardinality_transition_check_safe = StringUtil::CIEquals(cardinality_transition_check_safe, "true");
-	}
-	return MetadataJson::ExtractJsonString(json, "table", out.table) && ParseJsonIndex(json, "occ", out.occurrence) &&
-	       MetadataJson::ExtractJsonString(json, "column", out.column);
+	return MetadataJson::Read(
+	    ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "left_join_key_source"), out);
 }
 
 string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
-	return "{\"k\":\"left_join_key_source\",\"table\":" + SqlUtils::JsonQuote(source.table) +
-	       ",\"occ\":" + SqlUtils::JsonQuote(to_string(source.occurrence)) +
-	       ",\"column\":" + SqlUtils::JsonQuote(source.column) + ",\"cardinality_transition_check_safe\":" +
-	       SqlUtils::JsonQuote(source.cardinality_transition_check_safe ? "true" : "false") + "}";
-}
-
-string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src) {
-	string json = "{\"k\":\"left_join_nullable\",\"complete\":" + SqlUtils::JsonQuote(src.complete ? "true" : "false") +
-	              ",\"tables\":[";
-	for (idx_t i = 0; i < src.tables.size(); i++) {
-		if (i > 0) {
-			json += ",";
-		}
-		json += SqlUtils::JsonQuote(src.tables[i]);
-	}
-	json += "]}";
-	return json;
+	return MetadataJson::Write(source);
 }
 
 bool RefreshMetadata::GetLeftJoinNullableSources(const string &view_name, LeftJoinNullableSources &out) {
-	string json;
-	if (!ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "left_join_nullable", json)) {
-		return false;
-	}
-	out.tables.clear();
-	out.complete = false;
-	string complete;
-	if (MetadataJson::ExtractJsonString(json, "complete", complete)) {
-		out.complete = StringUtil::CIEquals(complete, "true");
-	}
-	MetadataJson::ExtractJsonStringArray(json, "tables", out.tables);
-	return true;
+	return MetadataJson::Read(ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "left_join_nullable"),
+	                          out);
+}
+
+string RefreshMetadata::LeftJoinNullableSourcesToJson(const LeftJoinNullableSources &src) {
+	return MetadataJson::Write(src);
 }
 
 bool RefreshMetadata::GetFilteredGroupCountAuxMeta(const string &view_name, FilteredGroupCountAuxMeta &out) {
-	string json = ReadViewString(view_name, "aggregate_decomposition_json");
-	if (json.empty()) {
-		return false;
-	}
-	string kind;
-	if (!MetadataJson::ExtractJsonString(json, "kind", kind) || kind != "filtered_group_count") {
-		return false;
-	}
-	bool ok = true;
-	ok &= MetadataJson::ExtractJsonString(json, "aux_table", out.aux_table);
-	ok &= MetadataJson::ExtractJsonString(json, "source", out.source);
-	ok &= MetadataJson::ExtractJsonString(json, "group_col", out.group_col);
-	ok &= MetadataJson::ExtractJsonString(json, "sum_col", out.sum_col);
-	MetadataJson::ExtractJsonString(json, "source_group_expr", out.source_group_expr);
-	MetadataJson::ExtractJsonString(json, "source_sum_expr", out.source_sum_expr);
-	ok &= MetadataJson::ExtractJsonString(json, "output_col", out.output_col);
-	ok &= MetadataJson::ExtractJsonString(json, "op", out.comparison_op);
-	ok &= MetadataJson::ExtractJsonString(json, "threshold", out.threshold_sql);
-	return ok;
+	return MetadataJson::Read(ReadViewString(view_name, "aggregate_decomposition_json"), out);
 }
 
 string RefreshMetadata::FilteredGroupCountAuxMetaToJson(const FilteredGroupCountAuxMeta &meta) {
-	return "{\"kind\":\"filtered_group_count\",\"aux_table\":" + SqlUtils::JsonQuote(meta.aux_table) +
-	       ",\"source\":" + SqlUtils::JsonQuote(meta.source) + ",\"group_col\":" + SqlUtils::JsonQuote(meta.group_col) +
-	       ",\"sum_col\":" + SqlUtils::JsonQuote(meta.sum_col) +
-	       ",\"source_group_expr\":" + SqlUtils::JsonQuote(meta.source_group_expr) +
-	       ",\"source_sum_expr\":" + SqlUtils::JsonQuote(meta.source_sum_expr) +
-	       ",\"output_col\":" + SqlUtils::JsonQuote(meta.output_col) +
-	       ",\"op\":" + SqlUtils::JsonQuote(meta.comparison_op) +
-	       ",\"threshold\":" + SqlUtils::JsonQuote(meta.threshold_sql) + "}";
+	return MetadataJson::Write(meta);
 }
 
+// Metadata written before the side lists were JSON arrays fails to parse; refresh then group-recomputes.
 bool RefreshMetadata::GetLeftJoinSecondaryMeta(const string &view_name, LeftJoinSecondaryMeta &out) {
-	string json = ReadViewString(view_name, "leftjoin_secondary_meta_json");
-	if (json.empty()) {
-		return false;
-	}
-	string kind;
-	if (!MetadataJson::ExtractJsonString(json, "kind", kind) || kind != "leftjoin_secondary") {
-		return false;
-	}
-	auto extract_array_or_legacy_csv = [&](const string &array_key, const string &legacy_key, vector<string> &values) {
-		if (MetadataJson::ExtractJsonStringArray(json, array_key, values)) {
-			return;
-		}
-		string legacy;
-		if (MetadataJson::ExtractJsonString(json, legacy_key, legacy) && !legacy.empty()) {
-			values = StringUtil::Split(legacy, ',');
-		}
-	};
-	extract_array_or_legacy_csv("preserved_cols", "preserved_cols", out.preserved_cols);
-	extract_array_or_legacy_csv("inner_tables", "inner_table", out.inner_tables);
-	extract_array_or_legacy_csv("inner_keys", "inner_key", out.inner_keys);
-	extract_array_or_legacy_csv("pres_tables", "pres_table", out.pres_tables);
-	extract_array_or_legacy_csv("pres_keys", "pres_key", out.pres_keys);
-	return MetadataJson::ExtractJsonString(json, "sql", out.sql);
+	return MetadataJson::Read(ReadViewString(view_name, "leftjoin_secondary_meta_json"), out);
 }
 
 string RefreshMetadata::LeftJoinSecondaryMetaToJson(const LeftJoinSecondaryMeta &meta) {
-	return "{\"kind\":\"leftjoin_secondary\",\"sql\":" + SqlUtils::JsonQuote(meta.sql) +
-	       ",\"preserved_cols\":" + SqlUtils::JsonArray(meta.preserved_cols) +
-	       ",\"inner_tables\":" + SqlUtils::JsonArray(meta.inner_tables) +
-	       ",\"inner_keys\":" + SqlUtils::JsonArray(meta.inner_keys) +
-	       ",\"pres_tables\":" + SqlUtils::JsonArray(meta.pres_tables) +
-	       ",\"pres_keys\":" + SqlUtils::JsonArray(meta.pres_keys) + "}";
+	return MetadataJson::Write(meta);
 }
 
 vector<string> RefreshMetadata::ExpectedDistinctAuxColumns(const DistinctAuxMeta &meta) {
@@ -2409,7 +2273,7 @@ vector<string> RefreshMetadata::ExpectedSemiAntiAuxColumns(const SemiAntiAuxMeta
 	auto expected = meta.left_cols;
 	expected.push_back("_left_count");
 	expected.push_back("_match_count");
-	if (meta.null_aware && StringUtil::Lower(meta.join_type) == "anti") {
+	if (meta.null_aware && meta.join_type == SemiAntiJoinType::ANTI) {
 		expected.push_back("_right_count");
 		expected.push_back("_right_null_count");
 	}
