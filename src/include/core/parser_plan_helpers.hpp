@@ -103,7 +103,6 @@ struct CreateMVPlanFacts {
 	bool has_pivot = false;
 	bool has_filter_above_aggregate = false;
 	bool has_cardinality_changing_filter = false;
-	idx_t outer_join_count = 0;
 	bool has_hidden_minmax_having_column = false;
 	bool has_computed_minmax_aggregate_projection = false;
 	bool has_computed_sum_aggregate_projection = false;
@@ -134,11 +133,12 @@ bool OuterJoinAggregateNeedsRecompute(const CreateMVPlanFacts &facts, idx_t grou
 // The returned SQL carries LJSEC_INNER_DELTA_PLACEHOLDER / LJSEC_PRES_DELTA_PLACEHOLDER where each
 // side's pending changes belong; refresh substitutes them (see openivm_constants.hpp). The out_*
 // params report the two sides' identities so refresh can pick the right row source per backend.
-string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
-                                      const vector<string> &output_names, const string &view_name,
-                                      vector<string> &preserved_cols, const string &delta_view_catalog_prefix,
-                                      vector<string> &out_inner_tables, vector<string> &out_inner_keys,
-                                      vector<string> &out_pres_tables, vector<string> &out_pres_keys);
+// The Larson & Zhou secondary-delta correction for every LEFT JOIN level; empty sql when unsupported.
+RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(ClientContext &context,
+                                                                      const CreateMVPlanFacts &facts,
+                                                                      const vector<string> &output_names,
+                                                                      const string &view_name,
+                                                                      const string &delta_view_catalog_prefix);
 bool OuterJoinPreservedSideHasTableFunction(const CreateMVPlanFacts &facts);
 vector<string> DeriveGroupColumnNames(const CreateMVPlanFacts &facts, idx_t group_index, size_t group_count,
                                       const vector<string> &output_names);

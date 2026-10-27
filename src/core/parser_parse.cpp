@@ -5,9 +5,12 @@
 #include "core/sql_utils.hpp"
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/extension_callback_manager.hpp"
+#include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "duckdb/parser/statement/create_statement.hpp"
 #include "duckdb/parser/statement/extension_statement.hpp"
 #include "lpts_parser.hpp"
+#include "lpts_sql_scanner.hpp"
 
 #include <regex>
 
@@ -139,7 +142,7 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 			cleaned[token->start] = ' ';
 		}
 		if (token && token->type == SimplifiedTokenType::SIMPLIFIED_TOKEN_KEYWORD &&
-		    StringUtil::CIEquals(SqlUtils::TrimSQLFragment(cleaned.substr(token->start, end - token->start)), "as")) {
+		    MatchesKeywordAt(cleaned, token->start, "as")) {
 			query_body = query.substr(token->start + 2);
 			cleaned.resize(token->start + 2);
 			break;
@@ -196,37 +199,47 @@ ParserExtensionParseResult ParseMaterializedViewStatement(const string &query, S
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Intercepted query: %s\n", query_lower.c_str());
 
-	// Rewrite only the CREATE header; quoted names can contain the same keywords.
 	bool is_replace = StringUtil::StartsWith(header, "create or replace materialized view ");
-	if (is_replace) {
-		query_lower = std::regex_replace(query_lower, std::regex("^create\\s+or\\s+replace\\s+"), "create ");
-	}
-
-	// Extract REFRESH EVERY clause before structural rewrite (strips it from the query)
+	// Extract REFRESH EVERY clause before structural rewrite (strips it from the header)
 	int64_t refresh_interval = SqlUtils::ExtractRefreshInterval(query_lower);
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Refresh interval: %lld seconds\n", (long long)refresh_interval);
 
-	SqlUtils::ReplaceMaterializedView(query_lower);
-	query_lower += query_body;
+	// Plan the view as CREATE TABLE AS. Rewrite only the header keywords; quoted names can
+	// contain the same words. LPTS owns input syntax; the parsed AT clause carries the snapshot.
+	idx_t name_start = 0;
+	for (auto keyword : {"create", "or", "replace", "materialized", "view"}) {
+		name_start = SkipWhitespace(query_lower, name_start);
+		if (MatchesKeywordAt(query_lower, name_start, keyword)) {
+			name_start += strlen(keyword);
+		}
+	}
+	auto create_sql = NormalizeInputSqlToDuckDB(
+	    "create table if not exists" + query_lower.substr(name_start) + query_body, input_dialect);
+	auto as_pos = FindTopLevelAs(create_sql);
+	auto view_query = as_pos == DConstants::INVALID_INDEX ? string() : create_sql.substr(as_pos + 2);
 	// All other rewrites (DISTINCT, AVG, LEFT JOIN key, aggregate aliases) are done
 	// at the plan level in PlanFunction via PlanRewrite + LPTS.
-	OPENIVM_DEBUG_PRINT("[CREATE MV] After structural rewrite: %s\n", query_lower.c_str());
-
-	if (input_dialect != SqlDialect::DUCKDB) {
-		// LPTS owns input syntax; the parsed AT clause below carries the snapshot and its relation.
-		query_lower = NormalizeInputSqlToDuckDB(query_lower, input_dialect);
-		OPENIVM_DEBUG_PRINT("[CREATE MV] After %s input normalization: %s\n", SqlDialectToString(input_dialect).c_str(),
-		                    query_lower.c_str());
-	}
+	OPENIVM_DEBUG_PRINT("[CREATE MV] After structural rewrite: %s\n", create_sql.c_str());
 
 	Parser p;
-	p.ParseQuery(query_lower);
+	p.ParseQuery(create_sql);
+	if (p.statements.size() != 1 || p.statements[0]->type != StatementType::CREATE_STATEMENT) {
+		throw ParserException("Invalid CREATE MATERIALIZED VIEW statement");
+	}
+	auto &info = p.statements[0]->Cast<CreateStatement>().info->Cast<CreateTableInfo>();
+	vector<string> target_parts;
+	for (auto &part : {info.catalog, info.schema, info.table}) {
+		if (!part.empty()) {
+			target_parts.push_back(SqlUtils::QuoteIdentifier(part));
+		}
+	}
 
 	auto parse_data = make_uniq_base<ParserExtensionParseData, MaterializedViewParseData>(std::move(p.statements[0]),
 	                                                                                      refresh_interval);
 	auto &materialized_view_data = dynamic_cast<MaterializedViewParseData &>(*parse_data);
 	materialized_view_data.is_replace = is_replace;
-	materialized_view_data.target_name = SqlUtils::ExtractTableName(query_lower);
+	materialized_view_data.target_name = StringUtil::Join(target_parts, ".");
+	materialized_view_data.view_query = std::move(view_query);
 	materialized_view_data.original_query = query;
 	return ParserExtensionParseResult(std::move(parse_data));
 }
