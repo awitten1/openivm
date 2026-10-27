@@ -71,6 +71,15 @@ INSERT INTO s2 VALUES (1,2);
 statement ok
 PRAGMA refresh('mv2');
 
+query I
+SELECT count(*) FROM (
+  ((SELECT * FROM mv2) EXCEPT ALL (SELECT k,SUM(v) AS sv FROM s2 GROUP BY k))
+  UNION ALL
+  ((SELECT k,SUM(v) AS sv FROM s2 GROUP BY k) EXCEPT ALL (SELECT * FROM mv2))
+);
+----
+0
+
 query II
 SELECT * FROM mv2;
 ----
@@ -110,6 +119,15 @@ ALTER TABLE openivm_delta_tables DROP COLUMN last_snapshot_id;
 
 statement ok
 PRAGMA refresh('mv');
+
+query I
+SELECT count(*) FROM (
+  ((SELECT * FROM mv) EXCEPT ALL (SELECT k,MIN(v) AS lo FROM s GROUP BY k))
+  UNION ALL
+  ((SELECT k,MIN(v) AS lo FROM s GROUP BY k) EXCEPT ALL (SELECT * FROM mv))
+);
+----
+0
 
 query II
 SELECT * FROM mv;
@@ -163,7 +181,8 @@ source_catalog
 statement ok
 ALTER TABLE openivm_delta_tables ADD COLUMN source_catalog VARCHAR;
 
-# An unreadable delta metadata table must not look like "no downstream views" during CREATE OR REPLACE
+# An unreadable delta metadata table must abort CREATE OR REPLACE. Current lifecycle planning reads
+# source ownership before downstream ownership, so the first failing read names the missing source columns.
 statement ok
 ALTER TABLE openivm_delta_tables RENAME TO openivm_delta_tables_saved;
 
@@ -173,7 +192,7 @@ CREATE TABLE openivm_delta_tables(view_name VARCHAR);
 statement error
 CREATE OR REPLACE MATERIALIZED VIEW mv2 AS SELECT k, SUM(v) AS sv FROM s2 GROUP BY k;
 ----
-could not resolve downstream dependencies
+Could not read IVM delta source metadata
 
 statement ok
 DROP TABLE openivm_delta_tables;

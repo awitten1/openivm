@@ -1200,6 +1200,17 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForMutation(Clie
 	return delta;
 }
 
+string RefreshMetadata::SourceOwnerPredicate(const string &table, const string &catalog, const string &schema,
+                                             bool ducklake) {
+	// The catalog type keeps a native `openivm_delta_<name>` key and a DuckLake source
+	// that happens to use that name from being mistaken for each other.
+	if (ducklake) {
+		return SourcePredicate(table, catalog, schema) + " AND catalog_type = 'ducklake'";
+	}
+	return SourcePredicate(SqlUtils::DeltaName(table), catalog, schema) +
+	       " AND COALESCE(catalog_type, 'duckdb') <> 'ducklake'";
+}
+
 RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string &view_name, const string &table_name,
                                                                    const string &fallback_catalog,
                                                                    const string &fallback_schema) {
@@ -1506,7 +1517,7 @@ static vector<string> GetDownstreamViewsInternal(Connection &con, const string &
 		    "' OR table_name = '" + SqlUtils::EscapeValue(PublishedViewName(vn)) + "' OR table_name = '" +
 		    SqlUtils::EscapeValue(SqlUtils::DeltaName(PublishedViewName(vn))) + "' ORDER BY view_name");
 		if (dependents->HasError() && throw_on_error) {
-			throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view_name,
+			throw CatalogException("Cannot resolve downstream consumers for '%s': %s", view_name,
 			                       dependents->GetError());
 		}
 		if (!dependents->HasError()) {
@@ -1652,7 +1663,7 @@ bool RefreshMetadata::HasDownstreamViews(const string &view_name, bool include_p
 	auto matches = [&](Connection &reader, const MetadataLocation &, const string &target) {
 		auto result = reader.Query("SELECT 1 FROM " + target + " WHERE " + predicate + " LIMIT 1");
 		if (result->HasError()) {
-			throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view_name, result->GetError());
+			throw CatalogException("Cannot resolve downstream consumers for '%s': %s", view_name, result->GetError());
 		}
 		OPENIVM_DEBUG_PRINT("[DELTA OWNERSHIP] Downstream consumers for %s in %s: %d\n", view_name.c_str(),
 		                    target.c_str(), result->RowCount() != 0);
