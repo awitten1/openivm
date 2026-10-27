@@ -13,7 +13,6 @@
 #include "duckdb/planner/operator/logical_comparison_join.hpp"
 #include "duckdb/planner/operator/logical_delim_get.hpp"
 #include "duckdb/planner/operator/logical_distinct.hpp"
-#include "duckdb/planner/operator/logical_aggregate.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 
@@ -210,8 +209,6 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, L
 	return std::move(distinct);
 }
 
-static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &replacer);
-
 static void AddColumnBindingReplacements(const vector<ColumnBinding> &old_bindings,
                                          const vector<ColumnBinding> &new_bindings,
                                          vector<ReplacementBinding> &replacement_bindings,
@@ -329,58 +326,13 @@ static bool ReplaceDelimGets(ClientContext &context, unique_ptr<LogicalOperator>
 	    replaced && !replacement_bindings.empty()) {
 		ColumnBindingReplacer replacer;
 		replacer.replacement_bindings = replacement_bindings;
-		RebindAllExpressions(*node, replacer);
+		replacer.VisitOperator(*node);
 	}
 	if (node->type == LogicalOperatorType::LOGICAL_DELIM_JOIN) {
 		node->Cast<LogicalComparisonJoin>().duplicate_eliminated_columns.clear();
 		node->type = LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
 	}
 	return replaced;
-}
-
-static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &replacer) {
-	for (auto &expr : op.expressions) {
-		if (!expr) {
-			continue;
-		}
-		replacer.VisitExpression(&expr);
-	}
-	if (op.type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN || op.type == LogicalOperatorType::LOGICAL_DELIM_JOIN ||
-	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
-		auto &join = op.Cast<LogicalComparisonJoin>();
-		for (auto &condition : join.conditions) {
-			if (condition.left) {
-				replacer.VisitExpression(&condition.left);
-			}
-			if (condition.right) {
-				replacer.VisitExpression(&condition.right);
-			}
-		}
-		for (auto &expr : join.duplicate_eliminated_columns) {
-			if (!expr) {
-				continue;
-			}
-			replacer.VisitExpression(&expr);
-		}
-		if (join.predicate) {
-			replacer.VisitExpression(&join.predicate);
-		}
-	}
-	if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
-		auto &aggregate = op.Cast<LogicalAggregate>();
-		for (auto &expr : aggregate.groups) {
-			if (!expr) {
-				continue;
-			}
-			replacer.VisitExpression(&expr);
-		}
-	}
-	for (auto &child : op.children) {
-		if (!child) {
-			continue;
-		}
-		RebindAllExpressions(*child, replacer);
-	}
 }
 
 static unique_ptr<Expression> BuildMultiplicityProduct(Binder &binder, const LogicalType &mul_type,
@@ -493,7 +445,7 @@ static bool ReplaceSafeSemiAntiDelimGets(ClientContext &context, unique_ptr<Logi
 		if (replaced && !local_replacements.empty()) {
 			ColumnBindingReplacer replacer;
 			replacer.replacement_bindings = local_replacements;
-			RebindAllExpressions(*node, replacer);
+			replacer.VisitOperator(*node);
 			join.duplicate_eliminated_columns.clear();
 			node->type = LogicalOperatorType::LOGICAL_COMPARISON_JOIN;
 			node->ResolveOperatorTypes();
