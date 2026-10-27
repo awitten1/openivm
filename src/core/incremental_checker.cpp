@@ -18,6 +18,7 @@
 #include "duckdb/planner/operator/logical_set_operation.hpp"
 #include "duckdb/planner/operator/logical_unnest.hpp"
 
+#include <functional>
 #include <unordered_set>
 
 namespace duckdb {
@@ -63,64 +64,79 @@ static bool HasSimpleOrderBy(const vector<BoundOrderByNode> &orders) {
 	return true;
 }
 
-/// Check if any expression in the given list contains a non-deterministic function.
-static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {
+static bool AnyExpression(vector<unique_ptr<Expression>> &expressions,
+                          const std::function<bool(const Expression &)> &predicate) {
 	for (auto &expr : expressions) {
-		bool found_volatile = false;
-		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) {
-			if (child.expression_class == ExpressionClass::BOUND_FUNCTION) {
-				auto &func = child.Cast<BoundFunctionExpression>();
-				if (func.function.name.rfind("__internal_compress", 0) == 0 ||
-				    func.function.name.rfind("__internal_decompress", 0) == 0 || func.function.name == "error") {
-					return;
-				}
-				if (func.function.GetStability() != FunctionStability::CONSISTENT) {
-					found_volatile = true;
-				}
-			}
-		});
-		if (found_volatile) {
+		bool found = false;
+		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) { found = found || predicate(child); });
+		if (found) {
 			return true;
 		}
 	}
 	return false;
 }
 
-static bool HasNonFoldableUnnestExpression(vector<unique_ptr<Expression>> &expressions) {
-	for (auto &expr : expressions) {
-		bool found_non_foldable_unnest = false;
-		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) {
-			if (child.expression_class == ExpressionClass::BOUND_UNNEST) {
-				auto &unnest = child.Cast<BoundUnnestExpression>();
-				if (!unnest.child || !unnest.child->IsFoldable()) {
-					found_non_foldable_unnest = true;
-				}
-			}
-		});
-		if (found_non_foldable_unnest) {
-			return true;
-		}
+static bool IsVolatileExpression(const Expression &expr) {
+	if (expr.expression_class != ExpressionClass::BOUND_FUNCTION) {
+		return false;
 	}
-	return false;
+	auto &name = expr.Cast<BoundFunctionExpression>().function.name;
+	if (StringUtil::StartsWith(name, "__internal_compress") || StringUtil::StartsWith(name, "__internal_decompress") ||
+	    name == "error") {
+		return false;
+	}
+	return expr.Cast<BoundFunctionExpression>().function.GetStability() != FunctionStability::CONSISTENT;
 }
 
-static void MergeCompatibilityAndNonLocalFacts(PlanAnalysis &result, const PlanAnalysis &body) {
-	result.incremental_compatible = result.incremental_compatible && body.incremental_compatible;
-	result.found_volatile_expression = result.found_volatile_expression || body.found_volatile_expression;
-	result.found_non_foldable_unnest = result.found_non_foldable_unnest || body.found_non_foldable_unnest;
-	result.found_unsupported_aggregate = result.found_unsupported_aggregate || body.found_unsupported_aggregate;
-	result.found_unsupported_filtered_aggregate =
-	    result.found_unsupported_filtered_aggregate || body.found_unsupported_filtered_aggregate;
-	result.found_unsupported_join_type = result.found_unsupported_join_type || body.found_unsupported_join_type;
-	result.found_unsupported_order_by = result.found_unsupported_order_by || body.found_unsupported_order_by;
-	result.found_unsupported_operator = result.found_unsupported_operator || body.found_unsupported_operator;
-	result.found_asof_join = result.found_asof_join || body.found_asof_join;
-	result.found_positional_join = result.found_positional_join || body.found_positional_join;
-	result.found_sample = result.found_sample || body.found_sample;
+static bool IsNonFoldableUnnestExpression(const Expression &expr) {
+	if (expr.expression_class != ExpressionClass::BOUND_UNNEST) {
+		return false;
+	}
+	auto &unnest = expr.Cast<BoundUnnestExpression>();
+	return !unnest.child || !unnest.child->IsFoldable();
 }
+
+/// Expressions whose non-deterministic functions make the operator incompatible with IVM.
+static vector<unique_ptr<Expression>> *VolatileCheckedExpressions(LogicalOperator &op) {
+	switch (op.type) {
+	case LogicalOperatorType::LOGICAL_UNNEST:
+	case LogicalOperatorType::LOGICAL_FILTER:
+	case LogicalOperatorType::LOGICAL_PROJECTION:
+	case LogicalOperatorType::LOGICAL_UNION:
+	case LogicalOperatorType::LOGICAL_DISTINCT:
+	case LogicalOperatorType::LOGICAL_WINDOW:
+		return &op.expressions;
+	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY:
+		return &op.Cast<LogicalAggregate>().groups;
+	default:
+		return nullptr;
+	}
+}
+
+// Safety facts that propagate from a materialized CTE body regardless of how the outer query consumes it.
+static bool PlanAnalysis::*const NON_LOCAL_FACTS[] = {
+    &PlanAnalysis::found_volatile_expression,   &PlanAnalysis::found_non_foldable_unnest,
+    &PlanAnalysis::found_unsupported_aggregate, &PlanAnalysis::found_unsupported_filtered_aggregate,
+    &PlanAnalysis::found_unsupported_join_type, &PlanAnalysis::found_unsupported_order_by,
+    &PlanAnalysis::found_unsupported_operator,  &PlanAnalysis::found_asof_join,
+    &PlanAnalysis::found_positional_join,       &PlanAnalysis::found_sample};
+
+// Query-shape facts a pass-through CTE consumer inherits from the body.
+static bool PlanAnalysis::*const SHAPE_FACTS[] = {
+    &PlanAnalysis::found_aggregation,    &PlanAnalysis::found_projection,     &PlanAnalysis::found_having,
+    &PlanAnalysis::found_distinct,       &PlanAnalysis::found_union_distinct, &PlanAnalysis::found_minmax,
+    &PlanAnalysis::found_list,           &PlanAnalysis::found_filtered_list,  &PlanAnalysis::found_left_join,
+    &PlanAnalysis::found_full_outer,     &PlanAnalysis::found_semi_anti_join, &PlanAnalysis::found_join,
+    &PlanAnalysis::found_delim_join,     &PlanAnalysis::found_single_join,    &PlanAnalysis::found_window,
+    &PlanAnalysis::found_count_distinct, &PlanAnalysis::found_grouping_sets,  &PlanAnalysis::found_nested_aggregate};
 
 void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	auto *node = &op;
+	auto *volatile_checked = VolatileCheckedExpressions(op);
+	if (volatile_checked && AnyExpression(*volatile_checked, IsVolatileExpression)) {
+		result.incremental_compatible = false;
+		result.found_volatile_expression = true;
+	}
 	switch (node->type) {
 	// Infrastructure nodes — always compatible, no metadata
 	case LogicalOperatorType::LOGICAL_CREATE_TABLE:
@@ -135,21 +151,10 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		break;
 
 	case LogicalOperatorType::LOGICAL_UNNEST:
-		if (HasVolatileExpression(node->expressions)) {
-			result.incremental_compatible = false;
-			result.found_volatile_expression = true;
-		}
-		break;
-
 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE:
 		break;
 
 	case LogicalOperatorType::LOGICAL_FILTER:
-		// Check for volatile functions
-		if (HasVolatileExpression(node->expressions)) {
-			result.incremental_compatible = false;
-			result.found_volatile_expression = true;
-		}
 		// Detect HAVING: a FILTER above an AGGREGATE
 		if (!node->children.empty() && node->children[0]->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
 			result.found_having = true;
@@ -158,11 +163,7 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 
 	case LogicalOperatorType::LOGICAL_PROJECTION:
 		result.found_projection = true;
-		if (HasVolatileExpression(node->expressions)) {
-			result.incremental_compatible = false;
-			result.found_volatile_expression = true;
-		}
-		if (HasNonFoldableUnnestExpression(node->expressions)) {
+		if (AnyExpression(node->expressions, IsNonFoldableUnnestExpression)) {
 			result.incremental_compatible = false;
 			result.found_non_foldable_unnest = true;
 		}
@@ -172,10 +173,6 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 		if (!node->Cast<LogicalSetOperation>().setop_all) {
 			result.found_distinct = true;
 			result.found_union_distinct = true;
-		}
-		if (HasVolatileExpression(node->expressions)) {
-			result.incremental_compatible = false;
-			result.found_volatile_expression = true;
 		}
 		break;
 
@@ -191,14 +188,10 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 
 	case LogicalOperatorType::LOGICAL_DISTINCT: {
 		result.found_distinct = true;
-		if (HasVolatileExpression(node->expressions)) {
-			result.incremental_compatible = false;
-			result.found_volatile_expression = true;
-		}
 		// DISTINCT columns become group-by keys after IVM rewrite
-		auto *distinct_node = dynamic_cast<LogicalDistinct *>(node);
-		if (distinct_node && !distinct_node->distinct_targets.empty()) {
-			for (auto &target : distinct_node->distinct_targets) {
+		auto &distinct_node = node->Cast<LogicalDistinct>();
+		if (!distinct_node.distinct_targets.empty()) {
+			for (auto &target : distinct_node.distinct_targets) {
 				result.aggregate_columns.emplace_back(target->GetName());
 			}
 		} else {
@@ -259,79 +252,73 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 
 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
 		result.found_aggregation = true;
-		auto *agg = dynamic_cast<LogicalAggregate *>(node);
-		if (agg) {
-			// GROUPING SETS / ROLLUP / CUBE produce multiple grouping_sets entries.
-			// Routed to RECOMPUTE (full DELETE+INSERT with empty-delta skip) in the parser.
-			if (agg->grouping_sets.size() > 1) {
-				result.found_grouping_sets = true;
-			}
-			for (auto &expr : agg->expressions) {
-				if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
-					auto &bound_agg = expr->Cast<BoundAggregateExpression>();
-					const auto &supported = GetSupportedAggregates();
-					const bool scalar_subquery_first =
-					    bound_agg.function.name == "first" && result.group_index != DConstants::INVALID_INDEX;
-					if (supported.find(bound_agg.function.name) == supported.end() && !scalar_subquery_first) {
-						result.incremental_compatible = false;
-						result.found_unsupported_aggregate = true;
-					}
-					// COUNT(DISTINCT x) can't be summed from delta counts, but group-recompute
-					// (delete affected groups + re-insert from original query) is correct.
-					if (bound_agg.IsDistinct()) {
-						result.found_count_distinct = true;
-					}
-					if (bound_agg.filter) {
-						// LIST keeps NULL elements, so LIST(CASE WHEN p THEN x ELSE NULL END)
-						// is not equivalent to LIST(x) FILTER (WHERE p). Keep the raw FILTER
-						// and route the view to affected-group recompute using the original SQL.
-						if (bound_agg.function.name == "list") {
-							result.found_filtered_list = true;
-						} else {
-							// Other FILTER aggregates should have been normalized before the
-							// checker runs. If one reaches here, use full refresh.
-							result.incremental_compatible = false;
-							result.found_unsupported_filtered_aggregate = true;
-						}
-					}
-					if (bound_agg.function.name == "min" || bound_agg.function.name == "max" ||
-					    bound_agg.function.name == "arg_min" || bound_agg.function.name == "arg_max") {
-						result.found_minmax = true;
-					}
-					// LIST aggregates aren't element-wise summable — different deltas
-					// produce lists of different lengths/contents. Mark the view so the
-					// upsert compiler uses group-recompute (delete affected groups,
-					// re-insert from the original query) rather than the failing
-					// list_reduce/lambda path.
+		auto &agg = node->Cast<LogicalAggregate>();
+		// GROUPING SETS / ROLLUP / CUBE produce multiple grouping_sets entries.
+		// Routed to RECOMPUTE (full DELETE+INSERT with empty-delta skip) in the parser.
+		if (agg.grouping_sets.size() > 1) {
+			result.found_grouping_sets = true;
+		}
+		for (auto &expr : agg.expressions) {
+			if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
+				auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+				const auto &supported = GetSupportedAggregates();
+				const bool scalar_subquery_first =
+				    bound_agg.function.name == "first" && result.group_index != DConstants::INVALID_INDEX;
+				if (supported.find(bound_agg.function.name) == supported.end() && !scalar_subquery_first) {
+					result.incremental_compatible = false;
+					result.found_unsupported_aggregate = true;
+				}
+				// COUNT(DISTINCT x) can't be summed from delta counts, but group-recompute
+				// (delete affected groups + re-insert from original query) is correct.
+				if (bound_agg.IsDistinct()) {
+					result.found_count_distinct = true;
+				}
+				if (bound_agg.filter) {
+					// LIST keeps NULL elements, so LIST(CASE WHEN p THEN x ELSE NULL END)
+					// is not equivalent to LIST(x) FILTER (WHERE p). Keep the raw FILTER
+					// and route the view to affected-group recompute using the original SQL.
 					if (bound_agg.function.name == "list") {
-						result.found_list = true;
-					}
-					// Record aggregate function types only for the outermost aggregate in the plan.
-					// Nested aggregates (CTE re-aggregate, subquery-join inner agg) would misalign
-					// aggregate_types with the output column count and confuse CompileAggregateGroups.
-					// Compatibility flags (found_minmax, found_list, found_count_distinct) are
-					// recorded for all aggregates above so unsafe inner aggs still gate classification.
-					if (result.group_index == DConstants::INVALID_INDEX) {
-						result.aggregate_types.push_back(bound_agg.function.name);
+						result.found_filtered_list = true;
+					} else {
+						// Other FILTER aggregates should have been normalized before the
+						// checker runs. If one reaches here, use full refresh.
+						result.incremental_compatible = false;
+						result.found_unsupported_filtered_aggregate = true;
 					}
 				}
+				if (bound_agg.function.name == "min" || bound_agg.function.name == "max" ||
+				    bound_agg.function.name == "arg_min" || bound_agg.function.name == "arg_max") {
+					result.found_minmax = true;
+				}
+				// LIST aggregates aren't element-wise summable — different deltas
+				// produce lists of different lengths/contents. Mark the view so the
+				// upsert compiler uses group-recompute (delete affected groups,
+				// re-insert from the original query) rather than the failing
+				// list_reduce/lambda path.
+				if (bound_agg.function.name == "list") {
+					result.found_list = true;
+				}
+				// Record aggregate function types only for the outermost aggregate in the plan.
+				// Nested aggregates (CTE re-aggregate, subquery-join inner agg) would misalign
+				// aggregate_types with the output column count and confuse CompileAggregateGroups.
+				// Compatibility flags (found_minmax, found_list, found_count_distinct) are
+				// recorded for all aggregates above so unsafe inner aggs still gate classification.
+				if (result.group_index == DConstants::INVALID_INDEX) {
+					result.aggregate_types.push_back(bound_agg.function.name);
+				}
 			}
-			if (HasVolatileExpression(agg->groups)) {
-				result.incremental_compatible = false;
-				result.found_volatile_expression = true;
-			}
-			// Record group count and group_index for the outermost (first-found) aggregate only.
-			// In plans with nested aggregates the DFS visits the outer aggregate first; overwriting
-			// with an inner aggregate's binding causes find_group_cols to miss the top projection.
-			if (result.group_index == DConstants::INVALID_INDEX) {
-				result.group_count = agg->groups.size();
-				result.group_index = agg->group_index;
-			} else {
-				// A second aggregate node below the outermost one → nested aggregate pattern.
-				// COUNT(*)/COUNT(x) in the outer aggregate counts inner-group rows, not source rows,
-				// so the standard linear delta rule is incorrect. Route to group-recompute.
-				result.found_nested_aggregate = true;
-			}
+		}
+		// Record group count and group_index for the outermost (first-found) aggregate only.
+		// In plans with nested aggregates the DFS visits the outer aggregate first; overwriting
+		// with an inner aggregate's binding causes find_group_cols to miss the top projection.
+		if (result.group_index == DConstants::INVALID_INDEX) {
+			result.group_count = agg.groups.size();
+			result.group_index = agg.group_index;
+		} else {
+			// A second aggregate node below the outermost one → nested aggregate pattern.
+			// COUNT(*)/COUNT(x) in the outer aggregate counts inner-group rows, not source rows,
+			// so the standard linear delta rule is incorrect. Route to group-recompute.
+			result.found_nested_aggregate = true;
 		}
 		break;
 	}
@@ -339,10 +326,6 @@ void AnalyzePlanOperator(LogicalOperator &op, PlanAnalysis &result) {
 	case LogicalOperatorType::LOGICAL_WINDOW: {
 		result.found_window = true;
 		auto &window = node->Cast<LogicalWindow>();
-		if (HasVolatileExpression(window.expressions)) {
-			result.incremental_compatible = false;
-			result.found_volatile_expression = true;
-		}
 		// Extract PARTITION BY column names from ALL window expressions. Also retain
 		// a common simple PARTITION BY + ORDER BY key when every window agrees. The
 		// latter lets DuckLake pair old/new row occurrences without assuming that the
@@ -458,31 +441,17 @@ static void MergeWindowAnalysis(PlanAnalysis &result, PlanAnalysis &body) {
 
 void MergeMaterializedCteBodyAnalysis(PlanAnalysis &result, PlanAnalysis body) {
 	const bool outer_passthrough = !result.found_aggregation && !result.found_distinct && !result.found_join;
+	result.incremental_compatible = result.incremental_compatible && body.incremental_compatible;
+	for (auto fact : NON_LOCAL_FACTS) {
+		result.*fact = result.*fact || body.*fact;
+	}
 	if (!outer_passthrough) {
-		MergeCompatibilityAndNonLocalFacts(result, body);
 		return;
 	}
-
-	MergeCompatibilityAndNonLocalFacts(result, body);
 	MergeWindowAnalysis(result, body);
-	result.found_aggregation = result.found_aggregation || body.found_aggregation;
-	result.found_projection = result.found_projection || body.found_projection;
-	result.found_having = result.found_having || body.found_having;
-	result.found_distinct = result.found_distinct || body.found_distinct;
-	result.found_union_distinct = result.found_union_distinct || body.found_union_distinct;
-	result.found_minmax = result.found_minmax || body.found_minmax;
-	result.found_list = result.found_list || body.found_list;
-	result.found_filtered_list = result.found_filtered_list || body.found_filtered_list;
-	result.found_left_join = result.found_left_join || body.found_left_join;
-	result.found_full_outer = result.found_full_outer || body.found_full_outer;
-	result.found_semi_anti_join = result.found_semi_anti_join || body.found_semi_anti_join;
-	result.found_join = result.found_join || body.found_join;
-	result.found_delim_join = result.found_delim_join || body.found_delim_join;
-	result.found_single_join = result.found_single_join || body.found_single_join;
-	result.found_window = result.found_window || body.found_window;
-	result.found_count_distinct = result.found_count_distinct || body.found_count_distinct;
-	result.found_grouping_sets = result.found_grouping_sets || body.found_grouping_sets;
-	result.found_nested_aggregate = result.found_nested_aggregate || body.found_nested_aggregate;
+	for (auto fact : SHAPE_FACTS) {
+		result.*fact = result.*fact || body.*fact;
+	}
 	D_ASSERT(result.aggregate_columns.empty());
 	result.aggregate_columns = std::move(body.aggregate_columns);
 	result.aggregate_types = std::move(body.aggregate_types);

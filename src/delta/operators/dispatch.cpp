@@ -1,31 +1,10 @@
 #include "delta/delta_operator.hpp"
 
 #include "core/openivm_debug.hpp"
-#include "duckdb/planner/operator/logical_get.hpp"
 
 namespace duckdb {
 
 namespace {
-
-static void ValidateCompileNode(const DeltaModelNode &node, LogicalOperator *op) {
-	D_ASSERT(op);
-	D_ASSERT(node.plan_node == op);
-	D_ASSERT(node.id != DConstants::INVALID_INDEX);
-	if (node.kind == DeltaModelNodeKind::SCAN) {
-		auto *get = dynamic_cast<LogicalGet *>(op);
-		if (get && node.source_table_index != DConstants::INVALID_INDEX) {
-			D_ASSERT(get->table_index == node.source_table_index);
-		}
-	}
-	OPENIVM_DEBUG_PRINT("[IR Rewrite] node=%llu kind=%s rule=%s maintenance=%s/%s sources=%zu outputs=%zu hidden=%zu "
-	                    "children=%zu domains=%zu lineage=%zu semantics=%zu unsupported=%zu aux=%zu\n",
-	                    (unsigned long long)node.id, DeltaModelNodeKindName(node.kind), DeltaRuleKindName(node.rule),
-	                    DeltaMaintenanceModeName(node.maintenance.mode),
-	                    DeltaMaintenanceStateKindName(node.maintenance.state), node.source_tables.size(),
-	                    node.output_columns.size(), node.hidden_columns.size(), node.children.size(),
-	                    node.affected_domains.size(), node.lineage_facts.size(), node.update_semantics.size(),
-	                    node.unsupported_reasons.size(), node.required_aux_states.size());
-}
 
 static bool IsDelimJoinShape(LogicalOperatorType type) {
 	return type == LogicalOperatorType::LOGICAL_DELIM_JOIN || type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN;
@@ -86,11 +65,8 @@ void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStra
 	// Both branches are debug-only descriptions of the already-selected strategy.
 	// mull-ignore-next
 	if (input.node) {
-		OPENIVM_DEBUG_PRINT("[Delta Operator] strategy=%s node=%llu kind=%s rule=%s maintenance=%s/%s\n",
-		                    DeltaOperatorStrategyName(strategy), (unsigned long long)input.node->id,
-		                    DeltaModelNodeKindName(input.node->kind), DeltaRuleKindName(input.node->rule),
-		                    DeltaMaintenanceModeName(input.node->maintenance.mode),
-		                    DeltaMaintenanceStateKindName(input.node->maintenance.state));
+		OPENIVM_DEBUG_PRINT("[Delta Operator] strategy=%s kind=%s\n", DeltaOperatorStrategyName(strategy),
+		                    DeltaModelNodeKindName(input.node->kind));
 		return;
 	}
 	OPENIVM_DEBUG_PRINT("[Delta Operator] strategy=%s shape=%s\n", DeltaOperatorStrategyName(strategy),
@@ -98,7 +74,7 @@ void LogDeltaOperatorStrategy(const DeltaOperatorInput &input, DeltaOperatorStra
 }
 
 DeltaPlanFragment CompileDeltaOperatorWithModel(const DeltaOperatorInput &input, const DeltaModelNode &node) {
-	ValidateCompileNode(node, input.plan.get());
+	D_ASSERT(node.plan_node == input.plan.get());
 	auto node_input = input.WithNode(node);
 	switch (node.kind) {
 	case DeltaModelNodeKind::SCAN:
@@ -133,8 +109,6 @@ DeltaPlanFragment CompileDeltaOperatorWithModel(const DeltaOperatorInput &input,
 		return CompilePositionalJoinDelta(node_input);
 	case DeltaModelNodeKind::SAMPLE:
 		return CompileSampleDelta(node_input);
-	case DeltaModelNodeKind::OTHER:
-		throw NotImplementedException("Delta model node kind %s not supported", DeltaModelNodeKindName(node.kind));
 	default:
 		throw NotImplementedException("Delta model node kind %s not supported", DeltaModelNodeKindName(node.kind));
 	}
