@@ -56,14 +56,6 @@ struct JoinColumnRef {
 	string last_update;
 };
 
-static string JoinSourceSQL(const JoinColumnRef &ref, bool delta) {
-	if (delta) {
-		return ref.delta_table_sql;
-	}
-	auto table = ref.get->GetTable();
-	return SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, ref.table_name);
-}
-
 // The view's watermark for a source (first column) and the source's physical delta table.
 static unique_ptr<MaterializedQueryResult> DeltaWatermark(Connection &con, const string &view_name,
                                                           TableCatalogEntry &source, string &delta_table_sql) {
@@ -101,52 +93,42 @@ static string BuildPushedFilterSQL(LogicalGet &get, const string &alias) {
 	return filters;
 }
 
-static string AppendFilterSQL(const string &predicate) {
-	return predicate.empty() ? string() : " AND " + predicate;
-}
-
-static bool DeltaKeyHasBaseMatch(Connection &con, const JoinColumnRef &delta_ref, const string &delta_column,
-                                 const JoinColumnRef &other_ref, const string &other_column) {
-	string delta_filter = delta_ref.get ? BuildPushedFilterSQL(*delta_ref.get, "openivm_delta") : string();
-	string other_filter = other_ref.get ? BuildPushedFilterSQL(*other_ref.get, "openivm_other") : string();
-	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("openivm_delta", delta_column) +
-	             " AS openivm_key FROM " + JoinSourceSQL(delta_ref, true) + " openivm_delta WHERE " +
-	             QualifyColumn("openivm_delta", openivm::TIMESTAMP_COL) + " >= '" +
-	             SqlUtils::EscapeValue(delta_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(delta_filter) +
-	             ") openivm_delta_keys JOIN " + JoinSourceSQL(other_ref, false) +
-	             " openivm_other ON openivm_delta_keys.openivm_key = " + QualifyColumn("openivm_other", other_column) +
-	             (other_filter.empty() ? string() : " WHERE " + other_filter) + " LIMIT 1)";
-	OPENIVM_DEBUG_PRINT("[DeltaJoin] Key probe SQL: %s\n", sql.c_str());
+bool DeltaJoinProbeExists(Connection &con, const string &relation_sql, const char *label) {
+	auto sql = "SELECT EXISTS(SELECT 1 FROM " + relation_sql + " LIMIT 1)";
+	OPENIVM_DEBUG_PRINT("[%s] Key probe SQL: %s\n", label, sql.c_str());
 	auto result = con.Query(sql);
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		OPENIVM_DEBUG_PRINT("[DeltaJoin] Could not probe key-domain intersection: %s\n",
+		OPENIVM_DEBUG_PRINT("[%s] Could not probe key-domain intersection: %s\n", label,
 		                    result->HasError() ? result->GetError().c_str() : "no result");
 		return true;
 	}
 	return result->GetValue(0, 0).GetValue<bool>();
 }
 
-static bool DeltaKeyHasDeltaMatch(Connection &con, const JoinColumnRef &left_ref, const string &left_column,
-                                  const JoinColumnRef &right_ref, const string &right_column) {
-	string left_filter = left_ref.get ? BuildPushedFilterSQL(*left_ref.get, "openivm_left_delta") : string();
-	string right_filter = right_ref.get ? BuildPushedFilterSQL(*right_ref.get, "openivm_right_delta") : string();
-	string sql = "SELECT EXISTS(SELECT 1 FROM (SELECT " + QualifyColumn("openivm_left_delta", left_column) +
-	             " AS openivm_key FROM " + JoinSourceSQL(left_ref, true) + " openivm_left_delta WHERE " +
-	             QualifyColumn("openivm_left_delta", openivm::TIMESTAMP_COL) + " >= '" +
-	             SqlUtils::EscapeValue(left_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(left_filter) +
-	             ") openivm_left_delta_keys JOIN (SELECT " + QualifyColumn("openivm_right_delta", right_column) +
-	             " AS openivm_key FROM " + JoinSourceSQL(right_ref, true) + " openivm_right_delta WHERE " +
-	             QualifyColumn("openivm_right_delta", openivm::TIMESTAMP_COL) + " >= '" +
-	             SqlUtils::EscapeValue(right_ref.last_update) + "'::TIMESTAMP" + AppendFilterSQL(right_filter) +
-	             ") openivm_right_delta_keys ON openivm_left_delta_keys.openivm_key = "
-	             "openivm_right_delta_keys.openivm_key LIMIT 1)";
-	auto result = con.Query(sql);
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		OPENIVM_DEBUG_PRINT("[DeltaJoin] Could not probe delta key-domain intersection: %s\n",
-		                    result->HasError() ? result->GetError().c_str() : "no result");
-		return true;
+// The pending delta keys of ref's source since its watermark, honouring the leaf's pushed-down filters.
+static string DeltaKeysSQL(const JoinColumnRef &ref, const string &column, const string &alias) {
+	auto filter = BuildPushedFilterSQL(*ref.get, alias);
+	return "(SELECT " + QualifyColumn(alias, column) + " AS openivm_key FROM " + ref.delta_table_sql + " " + alias +
+	       " WHERE " + QualifyColumn(alias, openivm::TIMESTAMP_COL) + " >= '" + SqlUtils::EscapeValue(ref.last_update) +
+	       "'::TIMESTAMP" + (filter.empty() ? "" : " AND " + filter) + ")";
+}
+
+// Whether delta_ref's pending keys meet other_ref's pending delta keys (other_is_delta) or its current base rows.
+static bool DeltaKeyHasMatch(Connection &con, const JoinColumnRef &delta_ref, const string &delta_column,
+                             const JoinColumnRef &other_ref, const string &other_column, bool other_is_delta) {
+	string relation = DeltaKeysSQL(delta_ref, delta_column, "openivm_delta") + " openivm_delta_keys JOIN ";
+	if (other_is_delta) {
+		relation += DeltaKeysSQL(other_ref, other_column, "openivm_other") +
+		            " openivm_other_keys ON openivm_delta_keys.openivm_key = openivm_other_keys.openivm_key";
+	} else {
+		auto table = other_ref.get->GetTable();
+		auto filter = BuildPushedFilterSQL(*other_ref.get, "openivm_other");
+		relation +=
+		    SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, table->name) +
+		    " openivm_other ON openivm_delta_keys.openivm_key = " + QualifyColumn("openivm_other", other_column) +
+		    (filter.empty() ? "" : " WHERE " + filter);
 	}
-	return result->GetValue(0, 0).GetValue<bool>();
+	return DeltaJoinProbeExists(con, relation, "DeltaJoin");
 }
 
 static void FilterInternalMultiplicityColumns(const vector<ColumnBinding> &bindings, const vector<LogicalType> &types,
@@ -1678,11 +1660,11 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(
 						if (i > probe.other_leaf) { // mull-ignore: cxx_gt_to_ge,cxx_gt_to_le
 							continue;
 						}
-						has_match = DeltaKeyHasDeltaMatch(key_probe_con, leaf_refs[i], probe.delta_column,
-						                                  leaf_refs[probe.other_leaf], probe.other_column);
+						has_match = DeltaKeyHasMatch(key_probe_con, leaf_refs[i], probe.delta_column,
+						                             leaf_refs[probe.other_leaf], probe.other_column, true);
 					} else {
-						has_match = DeltaKeyHasBaseMatch(key_probe_con, leaf_refs[i], probe.delta_column,
-						                                 leaf_refs[probe.other_leaf], probe.other_column);
+						has_match = DeltaKeyHasMatch(key_probe_con, leaf_refs[i], probe.delta_column,
+						                             leaf_refs[probe.other_leaf], probe.other_column, false);
 					}
 					if (!has_match) {
 						key_domain_empty = true;

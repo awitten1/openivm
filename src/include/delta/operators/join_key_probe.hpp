@@ -4,6 +4,7 @@
 #include "core/openivm_debug.hpp"
 #include "duckdb/common/string.hpp"
 #include "duckdb/common/vector.hpp"
+#include "duckdb/main/connection.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -16,6 +17,9 @@ struct DeltaJoinKeyProbe {
 	string delta_column;
 	string other_column;
 };
+
+// SELECT EXISTS over relation_sql. A failed or NULL probe answers true, so callers keep the term (fail open).
+bool DeltaJoinProbeExists(Connection &con, const string &relation_sql, const char *label);
 
 inline bool TryGetDeltaJoinColumnRef(Expression &expr, ColumnBinding &binding) {
 	if (expr.GetExpressionClass() == ExpressionClass::BOUND_CAST) {

@@ -111,37 +111,15 @@ static string DuckLakeQualifiedTable(const string &catalog, const string &schema
 	return result;
 }
 
-static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, const string &schema,
-                                     const string &table_name, const string &delta_column, int64_t old_snapshot,
-                                     int64_t current_snapshot, const string &other_catalog, const string &other_schema,
-                                     const string &other_table, const string &other_column, int64_t other_snapshot) {
-	string delta_col = SqlUtils::QuoteIdentifier(delta_column);
-	string other_col = SqlUtils::QuoteIdentifier(other_column);
-	string other_relation = DuckLakeQualifiedTable(other_catalog, other_schema, other_table, other_snapshot);
-	string old_snap = to_string(old_snapshot);
-	string cur_snap = to_string(current_snapshot);
-	string sql = "SELECT EXISTS(SELECT 1 FROM ("
-	             "SELECT " +
-	             delta_col + " AS openivm_key FROM ducklake_table_insertions('" + SqlUtils::EscapeValue(catalog) +
-	             "', '" + SqlUtils::EscapeValue(schema) + "', '" + SqlUtils::EscapeValue(table_name) + "', " +
-	             old_snap + ", " + cur_snap +
-	             ") "
-	             "UNION ALL "
-	             "SELECT " +
-	             delta_col + " AS openivm_key FROM ducklake_table_deletions('" + SqlUtils::EscapeValue(catalog) +
-	             "', '" + SqlUtils::EscapeValue(schema) + "', '" + SqlUtils::EscapeValue(table_name) + "', " +
-	             old_snap + ", " + cur_snap +
-	             ")) openivm_delta_keys "
-	             "JOIN (SELECT * FROM " +
-	             other_relation + ") openivm_other ON openivm_delta_keys.openivm_key = openivm_other." + other_col +
-	             " LIMIT 1)";
-	auto result = con.Query(sql);
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe key-domain intersection: %s\n",
-		                    result->HasError() ? result->GetError().c_str() : "no result");
-		return true;
-	}
-	return result->GetValue(0, 0).GetValue<bool>();
+// Rows inserted into or deleted from a DuckLake table between two snapshots, projected to select_list.
+static string DuckLakeChangesSQL(const string &select_list, const string &catalog, const string &schema,
+                                 const string &table_name, int64_t old_snapshot, int64_t current_snapshot) {
+	auto rows = [&](const char *function_name) {
+		return "SELECT " + select_list + " FROM " +
+		       SqlUtils::DuckLakeTableFunction(function_name, catalog, schema, table_name, old_snapshot,
+		                                       current_snapshot);
+	};
+	return rows("ducklake_table_insertions") + " UNION ALL " + rows("ducklake_table_deletions");
 }
 
 static idx_t FindBindingPosition(LogicalOperator &op, const ColumnBinding &binding, const char *context_label) {
@@ -319,29 +297,10 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				}
 				continue;
 			}
-			string has_changes_sql =
-			    "SELECT EXISTS(SELECT 1 FROM ("
-			    "(SELECT 1 FROM ducklake_table_insertions('" +
-			    SqlUtils::EscapeValue(table_catalogs[i]) + "', '" + SqlUtils::EscapeValue(table_schemas[i]) + "', '" +
-			    SqlUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
-			    to_string(current_snapshots[i]) +
-			    ") LIMIT 1) "
-			    "UNION ALL "
-			    "(SELECT 1 FROM ducklake_table_deletions('" +
-			    SqlUtils::EscapeValue(table_catalogs[i]) + "', '" + SqlUtils::EscapeValue(table_schemas[i]) + "', '" +
-			    SqlUtils::EscapeValue(table_names[i]) + "', " + to_string(old_snapshots[i]) + ", " +
-			    to_string(current_snapshots[i]) + ") LIMIT 1)) openivm_delta_probe LIMIT 1)";
-			auto has_changes = con.Query(has_changes_sql);
-			if (has_changes->HasError()) {
-				OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Could not probe changes for %s.%s.%s: %s\n",
-				                    table_catalogs[i].c_str(), table_schemas[i].c_str(), table_names[i].c_str(),
-				                    has_changes->GetError().c_str());
-				continue;
-			}
-			// Malformed/no-result probes fail open. The metadata path normally handles this before the SQL fallback.
-			if (has_changes->RowCount() > 0 &&                   // mull-ignore: cxx_gt_to_ge,cxx_gt_to_le
-			    !has_changes->GetValue(0, 0).IsNull() &&         // mull-ignore: cxx_remove_negation
-			    !has_changes->GetValue(0, 0).GetValue<bool>()) { // mull-ignore: cxx_remove_negation
+			auto changes = DuckLakeChangesSQL("1", table_catalogs[i], table_schemas[i], table_names[i],
+			                                  old_snapshots[i], current_snapshots[i]);
+			// Failed probes fail open; the metadata path normally handles this before the SQL fallback.
+			if (!DeltaJoinProbeExists(con, "(" + changes + ") openivm_delta_probe", "DuckLakeJoin")) {
 				empty_table_delta[i] = true;
 			}
 		}
@@ -379,10 +338,16 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 				size_t other = probe.other_leaf;
 				// A probe always targets another leaf, so > and >= differ only for an impossible self-probe.
 				int64_t other_snapshot = other > i ? old_snapshots[other] : -1; // mull-ignore: cxx_gt_to_ge
-				if (!DuckLakeDeltaKeyHasMatch(con, table_catalogs[i], table_schemas[i], table_names[i],
-				                              probe.delta_column, old_snapshots[i], current_snapshots[i],
-				                              table_catalogs[other], table_schemas[other], table_names[other],
-				                              probe.other_column, other_snapshot)) {
+				auto changes = DuckLakeChangesSQL(SqlUtils::QuoteIdentifier(probe.delta_column) + " AS openivm_key",
+				                                  table_catalogs[i], table_schemas[i], table_names[i], old_snapshots[i],
+				                                  current_snapshots[i]);
+				auto other_relation = DuckLakeQualifiedTable(table_catalogs[other], table_schemas[other],
+				                                             table_names[other], other_snapshot);
+				if (!DeltaJoinProbeExists(con,
+				                          "(" + changes + ") openivm_delta_keys JOIN (SELECT * FROM " + other_relation +
+				                              ") openivm_other ON openivm_delta_keys.openivm_key = openivm_other." +
+				                              SqlUtils::QuoteIdentifier(probe.other_column),
+				                          "DuckLakeJoin")) {
 					key_domain_empty = true;
 					OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Skipping term %zu: delta key %s.%s has no match in %s.%s\n", i,
 					                    table_names[i].c_str(), probe.delta_column.c_str(), table_names[other].c_str(),
