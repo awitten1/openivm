@@ -16,7 +16,23 @@ struct JoinLeafInfo {
 	bool is_right_of_left_join; // true if this leaf is on the nullable side of an outer join
 };
 
-LogicalGet *FindGetInSubtree(LogicalOperator *node);
+struct DeltaJoinKeyProbe {
+	size_t other_leaf;
+	string delta_column;
+	string other_column;
+};
+
+// The scan at the bottom of node's unary chain, or nullptr when the chain branches first. When chain is given, the
+// operators above the scan are appended to it, outermost first.
+LogicalGet *FindGetInSubtree(LogicalOperator *node, vector<LogicalOperator *> *chain = nullptr);
+
+// For each leaf, the INNER-join equalities between one of its scan columns and another leaf's scan column. Leaves
+// wrapped above their scan are traced only when trace_wrapped_leaves is set.
+vector<vector<DeltaJoinKeyProbe>> BuildJoinKeyProbes(LogicalOperator *root, const vector<JoinLeafInfo> &leaves,
+                                                     bool trace_wrapped_leaves);
+
+// SELECT EXISTS over relation_sql. A failed or NULL probe answers true, so callers keep the term (fail open).
+bool DeltaJoinProbeExists(Connection &con, const string &relation_sql, const char *label);
 
 unique_ptr<LogicalOperator> &GetNodeAtPath(unique_ptr<LogicalOperator> &root, const vector<size_t> &path);
 

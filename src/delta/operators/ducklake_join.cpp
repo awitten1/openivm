@@ -1,6 +1,5 @@
 #include "delta/operators/ducklake_join.hpp"
 #include "delta/operators/join.hpp"
-#include "delta/operators/join_key_probe.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
 #include "core/refresh_metadata.hpp"
@@ -19,86 +18,6 @@
 #include <algorithm>
 
 namespace duckdb {
-
-struct DuckLakeJoinColumnRef {
-	size_t leaf_index;
-	string column_name;
-};
-
-static void AddDuckLakeLeafColumnRefs(LogicalOperator *root, const JoinLeafInfo &leaf, size_t leaf_index,
-                                      column_binding_map_t<DuckLakeJoinColumnRef> &column_refs) {
-	vector<LogicalOperator *> ancestors;
-	ancestors.reserve(leaf.path.size());
-	LogicalOperator *node = root;
-	for (auto child_idx : leaf.path) {
-		// Equality is already out of bounds for this planner-owned path.
-		if (child_idx >= node->children.size()) { // mull-ignore: cxx_ge_to_gt
-			throw InternalException("DuckLakeJoin: leaf path child %llu is out of bounds",
-			                        static_cast<idx_t>(child_idx));
-		}
-		ancestors.push_back(node);
-		node = node->children[child_idx].get();
-	}
-
-	auto *get = leaf.get;
-	if (!get) {
-		return;
-	}
-	column_binding_map_t<string> visible_columns;
-	auto bindings = get->GetColumnBindings();
-	auto &column_ids = get->GetColumnIds();
-	// The <= mutant indexes one past bindings.
-	for (idx_t output_idx = 0; output_idx < bindings.size(); output_idx++) { // mull-ignore: cxx_lt_to_le
-		idx_t column_id_idx = output_idx;
-		if (!get->projection_ids.empty()) {
-			if (output_idx >= get->projection_ids.size()) { // mull-ignore: cxx_ge_to_gt
-				continue;
-			}
-			column_id_idx = get->projection_ids[output_idx];
-		}
-		if (column_id_idx >= column_ids.size() || // mull-ignore: cxx_ge_to_gt
-		    column_ids[column_id_idx].IsVirtualColumn()) {
-			continue;
-		}
-		visible_columns[bindings[output_idx]] = get->GetColumnName(column_ids[column_id_idx]);
-	}
-
-	auto record_visible = [&]() {
-		for (auto &entry : visible_columns) {
-			column_refs[entry.first] = {leaf_index, entry.second};
-		}
-	};
-	record_visible();
-
-	for (size_t depth = leaf.path.size(); depth-- > 0;) {
-		auto *parent = ancestors[depth];
-		column_binding_map_t<string> parent_columns;
-		if (parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
-			auto &projection = parent->Cast<LogicalProjection>();
-			auto parent_bindings = parent->GetColumnBindings();
-			idx_t count = std::min<idx_t>(projection.expressions.size(), parent_bindings.size());
-			for (idx_t expr_idx = 0; expr_idx < count; expr_idx++) {
-				ColumnBinding child_binding;
-				if (!TryGetDeltaJoinColumnRef(*projection.expressions[expr_idx], child_binding)) {
-					continue;
-				}
-				auto child_entry = visible_columns.find(child_binding);
-				if (child_entry != visible_columns.end()) {
-					parent_columns[parent_bindings[expr_idx]] = child_entry->second;
-				}
-			}
-		} else {
-			for (auto &binding : parent->GetColumnBindings()) {
-				auto child_entry = visible_columns.find(binding);
-				if (child_entry != visible_columns.end()) {
-					parent_columns[binding] = child_entry->second;
-				}
-			}
-		}
-		visible_columns = std::move(parent_columns);
-		record_visible();
-	}
-}
 
 static string DuckLakeQualifiedTable(const string &catalog, const string &schema, const string &table_name,
                                      int64_t snapshot_id) {
@@ -191,7 +110,8 @@ static ColumnBinding PropagateMultiplicityThroughPath(unique_ptr<LogicalOperator
 
 vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput input, ClientContext &context,
                                                            Binder &binder, const vector<JoinLeafInfo> &leaves,
-                                                           bool has_left_join, bool flattened_leaves) {
+                                                           bool has_left_join, bool flattened_leaves,
+                                                           const vector<vector<DeltaJoinKeyProbe>> &key_probes) {
 	size_t N = leaves.size();
 	vector<unique_ptr<LogicalOperator>> terms;
 
@@ -306,19 +226,6 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		}
 	}
 
-	vector<vector<DeltaJoinKeyProbe>> key_probes(N);
-	if (skip_empty_enabled && !has_left_join) {
-		column_binding_map_t<DuckLakeJoinColumnRef> column_refs;
-		for (size_t i = 0; i < N; i++) {
-			auto *get = leaves[i].get ? leaves[i].get : FindGetInSubtree(leaves[i].node);
-			if (!get) {
-				continue;
-			}
-			AddDuckLakeLeafColumnRefs(input.plan.get(), leaves[i], i, column_refs);
-		}
-		CollectDeltaJoinKeyProbes(input.plan.get(), column_refs, key_probes);
-	}
-
 	OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Building N-term telescoping delta terms (%zu leaves, flattened=%s)\n", N,
 	                    flattened_leaves ? "true" : "false");
 
@@ -332,7 +239,7 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(DeltaOperatorInput in
 		}
 		bool key_domain_empty = false;
 		// Snapshot zero is valid; excluding it only disables this optional key-domain pruning.
-		if (skip_empty_enabled && current_snapshots[i] >= 0 && // mull-ignore: cxx_ge_to_gt
+		if (skip_empty_enabled && !has_left_join && current_snapshots[i] >= 0 && // mull-ignore: cxx_ge_to_gt
 		    !key_probes[i].empty()) {
 			for (auto &probe : key_probes[i]) {
 				size_t other = probe.other_leaf;
