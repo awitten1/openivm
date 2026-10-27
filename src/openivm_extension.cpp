@@ -284,77 +284,25 @@ static void LoadInternal(ExtensionLoader &loader) {
 		OPENIVM_DEBUG_PRINT("[METADATA] Keeping the default schema for load-time upgrades: %s\n", ex.what());
 	}
 
-	// Migration: add new columns to existing openivm_views tables
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS refresh_interval BIGINT DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS refresh_in_progress BOOLEAN DEFAULT false");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS pending_after_hook BOOLEAN DEFAULT NULL");
-
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS published_query VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS internal_schema VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS delta_schema VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS delta_table_name VARCHAR DEFAULT NULL");
-
 	// Use the complete definitions at LOAD as well as CREATE MV. Creating history
 	// without strategy and then ALTERing it leaves a timestamp-default rebind in
 	// the WAL, which cannot run before DuckDB initializes its default database.
-	con.Query(CreateMetadataTableSQL(openivm::HISTORY_TABLE));
-	con.Query(CreateMetadataTableSQL(openivm::PROFILE_TABLE));
-
-	// View-matching CREATEs first (always succeed), ALTERs after. ALTERs that
-	// hit not-yet-existing tables on a fresh DB fail silently — the parser's
-	// CREATE TABLE includes these columns directly, so fresh DBs are fine.
-	// ALTERs are backward-compat for legacy DBs.
-	con.Query(CreateMetadataTableSQL(openivm::MATCH_LOG_TABLE));
-	con.Query(CreateMVDependenciesSQL());
-	con.Query(CreateMetadataTableSQL(openivm::CONSTRAINTS_CACHE_TABLE));
-
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS signature_hash UBIGINT DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS canonical_plan_blob BLOB DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS output_columns_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS predicate_summary_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS fd_summary_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS source_tables_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS aggregate_decomposition_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS nullified_columns_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS distinct_aux_meta_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS count_distinct_aux_meta_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS semi_anti_aux_meta_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS leftjoin_secondary_meta_json VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::VIEWS_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS lineage_json VARCHAR DEFAULT NULL");
-
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS pending_row_estimate BIGINT DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS pending_estimate_ts TIMESTAMP DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS source_catalog VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS source_schema VARCHAR DEFAULT NULL");
-	con.Query("ALTER TABLE " + string(openivm::DELTA_TABLES_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS source_table_id BIGINT DEFAULT NULL");
-
-	con.Query("ALTER TABLE " + string(openivm::HISTORY_TABLE) +
-	          " ADD COLUMN IF NOT EXISTS strategy VARCHAR DEFAULT 'incremental'");
+	for (auto &table : {openivm::HISTORY_TABLE, openivm::PROFILE_TABLE, openivm::MATCH_LOG_TABLE,
+	                    openivm::MV_DEPS_TABLE, openivm::CONSTRAINTS_CACHE_TABLE}) {
+		con.Query(CreateMetadataTableSQL(table));
+	}
+	// Upgrade view and source metadata created by older releases; fresh databases have none yet, so these
+	// fail harmlessly. CREATE MV runs the same migration for every other metadata location.
+	vector<string> migrations;
+	for (auto &table : {openivm::VIEWS_TABLE, openivm::DELTA_TABLES_TABLE, openivm::HISTORY_TABLE}) {
+		AppendMetadataMigrationSQL(migrations, table);
+	}
+	for (auto &sql : HasJoinBackfillSQL()) {
+		migrations.push_back(sql);
+	}
+	for (auto &sql : migrations) {
+		con.Query(sql);
+	}
 
 	auto materialized_view_parser = duckdb::MaterializedViewParserExtension();
 
