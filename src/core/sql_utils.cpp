@@ -612,16 +612,14 @@ string SqlUtils::JsonQuote(const string &value) {
 	return result;
 }
 
+// Map each column through fn and join the results with sep.
+template <class FUNC>
+static string JoinEach(const vector<string> &columns, const string &sep, FUNC fn) {
+	return StringUtil::Join(columns, columns.size(), sep, fn);
+}
+
 string SqlUtils::JsonArray(const vector<string> &values) {
-	string result = "[";
-	for (idx_t i = 0; i < values.size(); i++) {
-		if (i > 0) {
-			result += ",";
-		}
-		result += JsonQuote(values[i]);
-	}
-	result += "]";
-	return result;
+	return "[" + JoinEach(values, ",", JsonQuote) + "]";
 }
 
 string SqlUtils::DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
@@ -645,48 +643,37 @@ bool SqlUtils::IsDelta(const string &name) {
 	return name.size() >= prefix.size() && name.rfind(prefix, 0) == 0;
 }
 
-string SqlUtils::JoinQuotedColumns(const vector<string> &columns) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += ", ";
+vector<string> SqlUtils::WithoutMultiplicity(const vector<string> &columns) {
+	vector<string> result;
+	for (auto &column : columns) {
+		if (column != openivm::MULTIPLICITY_COL) {
+			result.push_back(column);
 		}
-		result += QuoteIdentifier(columns[i]);
 	}
 	return result;
+}
+
+string SqlUtils::JoinQuotedColumns(const vector<string> &columns) {
+	return JoinEach(columns, ", ", QuoteIdentifier);
 }
 
 string SqlUtils::JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += ", ";
-		}
-		result += alias + "." + QuoteIdentifier(columns[i]);
-	}
-	return result;
+	return JoinEach(columns, ", ", [&](const string &c) { return alias + "." + QuoteIdentifier(c); });
+}
+
+string SqlUtils::JoinQualifiedAliasedColumns(const vector<string> &columns, const string &alias) {
+	return JoinEach(columns, ", ", [&](const string &c) {
+		auto column = QuoteIdentifier(c);
+		return alias + "." + column + " AS " + column;
+	});
 }
 
 string SqlUtils::BuildAllNullPredicate(const vector<string> &columns) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += " AND ";
-		}
-		result += QuoteIdentifier(columns[i]) + " IS NULL";
-	}
-	return result;
+	return JoinEach(columns, " AND ", [](const string &c) { return QuoteIdentifier(c) + " IS NULL"; });
 }
 
 string SqlUtils::BuildAnyNullPredicate(const vector<string> &columns, const string &prefix) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += " OR ";
-		}
-		result += prefix + QuoteIdentifier(columns[i]) + " IS NULL";
-	}
-	return result;
+	return JoinEach(columns, " OR ", [&](const string &c) { return prefix + QuoteIdentifier(c) + " IS NULL"; });
 }
 
 string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias) {
@@ -695,15 +682,10 @@ string SqlUtils::BuildNullSafeMatch(const vector<string> &columns, const string 
 
 string SqlUtils::BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
                                            const string &right_prefix) {
-	string result;
-	for (idx_t i = 0; i < columns.size(); i++) {
-		if (i > 0) {
-			result += " AND ";
-		}
-		auto column = QuoteIdentifier(columns[i]);
-		result += left_prefix + column + " IS NOT DISTINCT FROM " + right_prefix + column;
-	}
-	return result;
+	return JoinEach(columns, " AND ", [&](const string &c) {
+		auto column = QuoteIdentifier(c);
+		return left_prefix + column + " IS NOT DISTINCT FROM " + right_prefix + column;
+	});
 }
 
 string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &view_query_sql,

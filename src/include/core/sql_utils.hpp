@@ -61,8 +61,12 @@ public:
 	/// `DELETE FROM <table> WHERE <column> = '<view_name>'` for per-view metadata rows.
 	static string DeleteViewRowsSQL(const string &table, const string &view_name, const string &column = "view_name");
 	static bool IsDelta(const string &name);
+	/// The columns other than the multiplicity column, in their original order.
+	static vector<string> WithoutMultiplicity(const vector<string> &columns);
 	static string JoinQuotedColumns(const vector<string> &columns);
 	static string JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias);
+	/// `alias.col AS col, ...`: qualified columns that keep their unqualified output names.
+	static string JoinQualifiedAliasedColumns(const vector<string> &columns, const string &alias);
 	static string BuildAllNullPredicate(const vector<string> &columns);
 	static string BuildAnyNullPredicate(const vector<string> &columns, const string &prefix = "");
 	static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias);
