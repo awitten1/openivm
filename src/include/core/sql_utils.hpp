@@ -15,6 +15,11 @@ namespace duckdb {
 
 class BaseTableRef;
 
+struct SessionLocation {
+	string catalog;
+	string schema;
+};
+
 class SqlUtils {
 public:
 	// Visit real relation references, excluding CTE names in their lexical scope.
@@ -22,14 +27,9 @@ public:
 	static void RewriteSourceReferences(SQLStatement &statement,
 	                                    const std::function<void(unique_ptr<TableRef> &)> &callback);
 	static void WriteFile(const string &filename, bool append, const string &compiled_query);
-	static string ExtractTableName(const string &sql);
 	static string EscapeSingleQuotes(const string &input);
-	static void ReplaceMaterializedView(string &query);
-	static string ExtractViewQuery(string &query);
 	static string SQLToLowercase(const string &sql);
 	static void RemoveRedundantWhitespaces(string &query);
-	/// Trim whitespace without stripping non-ASCII identifier bytes on signed-char builds.
-	static string TrimSQLFragment(const string &input);
 	static vector<string> SplitSQLStatements(const string &sql);
 	static string SQLStatementPreview(const string &statement);
 	static string DeltaName(const string &name);
@@ -56,6 +56,10 @@ public:
 		}
 		return default_value;
 	}
+	/// The caller's default catalog and schema; an unset session catalog is the default database.
+	static SessionLocation SessionDefaultLocation(ClientContext &context);
+	/// `DELETE FROM <table> WHERE <column> = '<view_name>'` for per-view metadata rows.
+	static string DeleteViewRowsSQL(const string &table, const string &view_name, const string &column = "view_name");
 	static bool IsDelta(const string &name);
 	static string JoinQuotedColumns(const vector<string> &columns);
 	static string JoinQualifiedQuotedColumns(const vector<string> &columns, const string &alias);
@@ -86,7 +90,6 @@ public:
 	                                    const unordered_set<string> &qualifiers, bool allow_unqualified);
 	static string FindTableReference(const string &sql, const string &table_name);
 	static string FindTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence);
-	static idx_t CountTableReferences(const string &sql, const string &table_name);
 
 	/// Parse a REFRESH EVERY interval string (e.g. "5 minutes", "2 hours") into seconds.
 	/// Returns -1 if no interval clause found. Throws on invalid format or < 60 seconds.

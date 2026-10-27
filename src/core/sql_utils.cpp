@@ -2,6 +2,9 @@
 
 #include "core/openivm_constants.hpp"
 #include "duckdb.hpp"
+#include "duckdb/catalog/catalog_search_path.hpp"
+#include "duckdb/main/client_data.hpp"
+#include "duckdb/main/database_manager.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/parser/query_node/cte_node.hpp"
@@ -18,6 +21,7 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
+#include "lpts_sql_scanner.hpp"
 
 #include <cctype>
 #include <cstring>
@@ -229,24 +233,8 @@ static bool IsIdentifierChar(char c) {
 	return static_cast<unsigned char>(c) >= 128 || std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
 }
 
-template <class INDEX>
-static void SkipWhitespace(const string &sql, INDEX &pos) {
-	while (pos < sql.size() && std::isspace(static_cast<unsigned char>(sql[pos]))) {
-		pos++;
-	}
-}
-
-static bool StartsWithKeyword(const string &sql, size_t pos, const string &keyword) {
-	if (pos + keyword.size() > sql.size()) {
-		return false;
-	}
-	if (!StringUtil::CIEquals(sql.substr(pos, keyword.size()), keyword)) {
-		return false;
-	}
-	return pos + keyword.size() == sql.size() || !IsIdentifierChar(sql[pos + keyword.size()]);
-}
-
-string SqlUtils::TrimSQLFragment(const string &input) {
+// Trim whitespace without stripping non-ASCII identifier bytes on signed-char builds.
+static string TrimSQLFragment(const string &input) {
 	idx_t start = 0;
 	while (start < input.size() && std::isspace(static_cast<unsigned char>(input[start]))) {
 		start++;
@@ -302,100 +290,6 @@ string SqlUtils::ComposeCastSpecs(const string &outer_cast_spec, const string &i
 	return string(CAST_EXPRESSION_PREFIX) + ApplyCastSpec(inner_expression, outer_cast_spec);
 }
 
-static bool ReadCreateTargetName(const string &sql, const string &object_keyword, string &out) {
-	string lower = StringUtil::Lower(sql);
-	size_t pos = lower.find("create");
-	if (pos == string::npos) {
-		return false;
-	}
-	pos += strlen("create");
-	SkipWhitespace(sql, pos);
-	if (StartsWithKeyword(lower, pos, "or")) {
-		pos += strlen("or");
-		SkipWhitespace(sql, pos);
-		if (!StartsWithKeyword(lower, pos, "replace")) {
-			return false;
-		}
-		pos += strlen("replace");
-		SkipWhitespace(sql, pos);
-	}
-	if (object_keyword == "table") {
-		if (!StartsWithKeyword(lower, pos, "table")) {
-			return false;
-		}
-		pos += strlen("table");
-	} else {
-		if (StartsWithKeyword(lower, pos, "materialized")) {
-			pos += strlen("materialized");
-			SkipWhitespace(sql, pos);
-		}
-		if (!StartsWithKeyword(lower, pos, "view")) {
-			return false;
-		}
-		pos += strlen("view");
-	}
-	SkipWhitespace(sql, pos);
-	if (StartsWithKeyword(lower, pos, "if")) {
-		pos += strlen("if");
-		SkipWhitespace(sql, pos);
-		if (!StartsWithKeyword(lower, pos, "not")) {
-			return false;
-		}
-		pos += strlen("not");
-		SkipWhitespace(sql, pos);
-		if (!StartsWithKeyword(lower, pos, "exists")) {
-			return false;
-		}
-		pos += strlen("exists");
-		SkipWhitespace(sql, pos);
-	}
-
-	vector<string> parts;
-	while (pos < sql.size()) {
-		SkipWhitespace(sql, pos);
-		string part;
-		if (pos < sql.size() && sql[pos] == '"') {
-			pos++;
-			while (pos < sql.size()) {
-				if (sql[pos] == '"') {
-					if (pos + 1 < sql.size() && sql[pos + 1] == '"') {
-						part += '"';
-						pos += 2;
-						continue;
-					}
-					pos++;
-					break;
-				}
-				part += sql[pos++];
-			}
-		} else {
-			while (pos < sql.size() && (IsIdentifierChar(sql[pos]) || sql[pos] == '-')) {
-				part += sql[pos++];
-			}
-		}
-		if (part.empty()) {
-			break;
-		}
-		parts.push_back(part);
-		SkipWhitespace(sql, pos);
-		if (pos >= sql.size() || sql[pos] != '.') {
-			break;
-		}
-		pos++;
-	}
-	if (parts.empty()) {
-		return false;
-	}
-	out.clear();
-	for (idx_t i = 0; i < parts.size(); i++) {
-		if (i > 0) {
-			out += ".";
-		}
-		out += SqlUtils::QuoteIdentifier(parts[i]);
-	}
-	return true;
-}
-
 struct IdentifierSegmentSpan {
 	idx_t start;
 	idx_t end;
@@ -449,13 +343,13 @@ vector<string> SqlUtils::ParseQualifiedIdentifier(const string &name) {
 	vector<string> parts;
 	idx_t pos = 0;
 	while (true) {
-		SkipWhitespace(name, pos);
+		pos = SkipWhitespace(name, pos);
 		string part;
 		if (!ReadIdentifierSegment(name, pos, part)) {
 			throw ParserException("Invalid qualified identifier '%s'", name);
 		}
 		parts.push_back(std::move(part));
-		SkipWhitespace(name, pos);
+		pos = SkipWhitespace(name, pos);
 		if (pos == name.size()) {
 			return parts;
 		}
@@ -509,47 +403,6 @@ static bool QualifierMatches(const vector<IdentifierSegmentSpan> &segments, cons
 	return false;
 }
 
-static idx_t CopySingleQuotedLiteral(const string &sql, idx_t start, string &out) {
-	idx_t i = start + 1;
-	while (i < sql.size()) {
-		if (sql[i] == '\'' && i + 1 < sql.size() && sql[i + 1] == '\'') {
-			i += 2;
-			continue;
-		}
-		if (sql[i++] == '\'') {
-			break;
-		}
-	}
-	out += sql.substr(start, i - start);
-	return i;
-}
-
-static idx_t CopyLineComment(const string &sql, idx_t start, string &out) {
-	idx_t i = start + 2;
-	while (i < sql.size() && sql[i] != '\n') {
-		i++;
-	}
-	if (i < sql.size()) {
-		i++;
-	}
-	out += sql.substr(start, i - start);
-	return i;
-}
-
-static idx_t CopyBlockComment(const string &sql, idx_t start, string &out) {
-	idx_t i = start + 2;
-	while (i + 1 < sql.size()) {
-		if (sql[i] == '*' && sql[i + 1] == '/') {
-			i += 2;
-			out += sql.substr(start, i - start);
-			return i;
-		}
-		i++;
-	}
-	out += sql.substr(start);
-	return sql.size();
-}
-
 void SqlUtils::WriteFile(const string &filename, bool append, const string &compiled_query) {
 	std::ofstream file;
 	if (append) {
@@ -571,124 +424,8 @@ void SqlUtils::WriteFile(const string &filename, bool append, const string &comp
 	}
 }
 
-string SqlUtils::ExtractTableName(const string &sql) {
-	string name;
-	if (ReadCreateTargetName(sql, "table", name)) {
-		return name;
-	}
-	// Matches: CREATE TABLE [IF NOT EXISTS] name|"quoted name" (AS ...|(...))
-	std::regex table_name_regex(
-	    R"re(create\s+table\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)(?:\s*\([^)]*\)|\s+as\s+(.*)))re");
-	std::smatch match;
-	if (std::regex_search(sql, match, table_name_regex)) {
-		auto name = match[1].str();
-		if (name.size() >= 2 && name.front() == '"' && name.back() == '"') {
-			name = StringUtil::Replace(name.substr(1, name.size() - 2), "\"\"", "\"");
-		}
-		return name;
-	}
-	return "";
-}
-
 string SqlUtils::EscapeSingleQuotes(const string &input) {
-	std::stringstream escaped_stream;
-	for (char c : input) {
-		if (c == '\'') {
-			escaped_stream << "''";
-		} else {
-			escaped_stream << c;
-		}
-	}
-	return escaped_stream.str();
-}
-
-void SqlUtils::ReplaceMaterializedView(string &query) {
-	query = std::regex_replace(query, std::regex("^create\\s+materialized\\s+view\\b"), "create table if not exists");
-	query = regex_replace(query, std::regex("\\s*;$"), "");
-}
-
-string SqlUtils::ExtractViewQuery(string &query) {
-	string lower = StringUtil::Lower(query);
-	size_t pos = lower.find("create");
-	if (pos != string::npos) {
-		pos += strlen("create");
-		SkipWhitespace(query, pos);
-		if (StartsWithKeyword(lower, pos, "or")) {
-			pos += strlen("or");
-			SkipWhitespace(query, pos);
-			if (StartsWithKeyword(lower, pos, "replace")) {
-				pos += strlen("replace");
-				SkipWhitespace(query, pos);
-			}
-		}
-		bool found_object = false;
-		if (StartsWithKeyword(lower, pos, "table")) {
-			pos += strlen("table");
-			found_object = true;
-		} else if (StartsWithKeyword(lower, pos, "materialized")) {
-			pos += strlen("materialized");
-			SkipWhitespace(query, pos);
-			if (StartsWithKeyword(lower, pos, "view")) {
-				pos += strlen("view");
-				found_object = true;
-			}
-		}
-		if (found_object) {
-			SkipWhitespace(query, pos);
-			if (StartsWithKeyword(lower, pos, "if")) {
-				pos += strlen("if");
-				SkipWhitespace(query, pos);
-				if (StartsWithKeyword(lower, pos, "not")) {
-					pos += strlen("not");
-					SkipWhitespace(query, pos);
-				}
-				if (StartsWithKeyword(lower, pos, "exists")) {
-					pos += strlen("exists");
-					SkipWhitespace(query, pos);
-				}
-			}
-			while (pos < query.size()) {
-				SkipWhitespace(query, pos);
-				if (pos < query.size() && query[pos] == '"') {
-					pos++;
-					while (pos < query.size()) {
-						if (query[pos] == '"') {
-							pos++;
-							if (pos < query.size() && query[pos] == '"') {
-								pos++;
-								continue;
-							}
-							break;
-						}
-						pos++;
-					}
-				} else {
-					while (pos < query.size() && (IsIdentifierChar(query[pos]) || query[pos] == '-')) {
-						pos++;
-					}
-				}
-				SkipWhitespace(query, pos);
-				if (pos >= query.size() || query[pos] != '.') {
-					break;
-				}
-				pos++;
-			}
-			SkipWhitespace(query, pos);
-			if (StartsWithKeyword(lower, pos, "as")) {
-				pos += strlen("as");
-				return query.substr(pos);
-			}
-		}
-	}
-	// Match only up through "AS " — then return everything after as a raw substr so
-	// multi-line CTE bodies (which contain '\n') are not truncated by regex '.' semantics.
-	std::regex rgx_create_view(
-	    R"re(create\s+(table|materialized view)\s+(?:if\s+not\s+exists\s+)?("(?:[^"]+)"|[a-zA-Z0-9_.]+)\s+as\s+)re");
-	std::smatch match;
-	if (std::regex_search(query, match, rgx_create_view)) {
-		return query.substr(static_cast<size_t>(match.position()) + static_cast<size_t>(match.length()));
-	}
-	return "";
+	return StringUtil::Replace(input, "'", "''");
 }
 
 string SqlUtils::SQLToLowercase(const string &sql) {
@@ -893,6 +630,16 @@ string SqlUtils::DuckLakeTableFunction(const string &function_name, const string
 	       "', " + to_string(last_snapshot_id) + ", " + to_string(current_snapshot_id) + ")";
 }
 
+SessionLocation SqlUtils::SessionDefaultLocation(ClientContext &context) {
+	auto &entry = ClientData::Get(context).catalog_search_path->GetDefault();
+	return {entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : entry.catalog,
+	        entry.schema.empty() ? string(DEFAULT_SCHEMA) : entry.schema};
+}
+
+string SqlUtils::DeleteViewRowsSQL(const string &table, const string &view_name, const string &column) {
+	return "DELETE FROM " + table + " WHERE " + column + " = '" + EscapeValue(view_name) + "'";
+}
+
 bool SqlUtils::IsDelta(const string &name) {
 	static const string prefix(openivm::DELTA_PREFIX);
 	return name.size() >= prefix.size() && name.rfind(prefix, 0) == 0;
@@ -981,15 +728,7 @@ string SqlUtils::BuildFullRecomputeSQL(const string &data_table, const string &v
 }
 
 string SqlUtils::ReplaceAllOccurrences(string haystack, const string &needle, const string &replacement) {
-	if (needle.empty()) {
-		return haystack;
-	}
-	size_t pos = 0;
-	while ((pos = haystack.find(needle, pos)) != string::npos) {
-		haystack.replace(pos, needle.size(), replacement);
-		pos += replacement.size();
-	}
-	return haystack;
+	return needle.empty() ? haystack : StringUtil::Replace(std::move(haystack), needle, replacement);
 }
 
 vector<string> SqlUtils::ReplaceEachPlainOccurrence(const string &haystack, const string &needle,
@@ -1014,16 +753,11 @@ bool SqlUtils::RewriteColumnReferences(string &sql, const string &old_name, cons
 	rewritten.reserve(sql.size());
 	bool changed = false;
 	for (idx_t i = 0; i < sql.size();) {
-		if (sql[i] == '\'') {
-			i = CopySingleQuotedLiteral(sql, i, rewritten);
-			continue;
-		}
-		if (sql[i] == '-' && i + 1 < sql.size() && sql[i + 1] == '-') {
-			i = CopyLineComment(sql, i, rewritten);
-			continue;
-		}
-		if (sql[i] == '/' && i + 1 < sql.size() && sql[i + 1] == '*') {
-			i = CopyBlockComment(sql, i, rewritten);
+		// Literals and comments are copied; quoted identifiers are column references.
+		idx_t skipped_end;
+		if (sql[i] != '"' && TryReadSkippableSqlSpan(sql, i, skipped_end)) {
+			rewritten.append(sql, i, skipped_end - i);
+			i = skipped_end;
 			continue;
 		}
 		if (sql[i] != '"' && !(std::isalpha(static_cast<unsigned char>(sql[i])) || sql[i] == '_')) {
@@ -1171,12 +905,7 @@ string SqlUtils::RewriteTableReferences(const string &sql,
 }
 
 string SqlUtils::FindTableReference(const string &sql, const string &table_name) {
-	auto matches = CollectTableReferenceMatches(sql, table_name, false);
-	if (matches.empty()) {
-		return "";
-	}
-	auto &match = matches[0];
-	return sql.substr(match.start, match.end - match.start);
+	return FindTableReferenceOccurrence(sql, table_name, 0);
 }
 
 string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence) {
@@ -1188,42 +917,27 @@ string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &t
 	return sql.substr(match.start, match.end - match.start);
 }
 
-idx_t SqlUtils::CountTableReferences(const string &sql, const string &table_name) {
-	return CollectTableReferenceMatches(sql, table_name, false).size();
-}
-
-string SqlUtils::ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {
-	auto matches = CollectTableReferenceMatches(sql, table_name, true);
-	if (matches.empty()) {
-		return sql;
-	}
+static string ReplaceMatches(const string &sql, const vector<TableReferenceMatch> &matches,
+                             const string &replacement) {
 	string result;
-	result.reserve(sql.size());
 	idx_t last = 0;
 	for (auto &match : matches) {
-		result += sql.substr(last, match.start - last);
+		result.append(sql, last, match.start - last);
 		result += replacement;
 		last = match.end;
 	}
-	result += sql.substr(last);
-	return result;
+	return result.append(sql, last, string::npos);
+}
+
+string SqlUtils::ReplaceTableReferences(const string &sql, const string &table_name, const string &replacement) {
+	return ReplaceMatches(sql, CollectTableReferenceMatches(sql, table_name, true), replacement);
 }
 
 string SqlUtils::ReplaceTableReferenceOccurrence(const string &sql, const string &table_name, idx_t occurrence,
                                                  const string &replacement, bool &replaced) {
-	replaced = false;
 	auto matches = CollectTableReferenceMatches(sql, table_name, true);
-	if (occurrence >= matches.size()) {
-		return sql;
-	}
-	auto &match = matches[occurrence];
-	string result;
-	result.reserve(sql.size());
-	result += sql.substr(0, match.start);
-	result += replacement;
-	result += sql.substr(match.end);
-	replaced = true;
-	return result;
+	replaced = occurrence < matches.size();
+	return replaced ? ReplaceMatches(sql, {matches[occurrence]}, replacement) : sql;
 }
 
 vector<string> SqlUtils::ReplaceEachTableReference(const string &sql, const string &table_name,

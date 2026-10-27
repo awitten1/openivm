@@ -5,9 +5,6 @@
 #include "core/refresh_locks.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
-#include "duckdb/catalog/catalog_search_path.hpp"
-#include "duckdb/main/client_data.hpp"
-#include "duckdb/main/database_manager.hpp"
 #include <algorithm>
 
 namespace duckdb {
@@ -33,11 +30,9 @@ void MVProfiler::SetViewName(const string &view_name_p, Connection &con) {
 	refresh_id = view_name + "_" + refresh_id;
 	// The executor has selected CREATE's metadata location before its first marker.
 	// Keep that owner: a fresh connection cannot discover a data catalog's marker.
-	auto &entry = ClientData::Get(*con.context).catalog_search_path->GetDefault();
-	auto catalog = entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(*con.context) : entry.catalog;
 	if (profile_table.empty()) {
-		profile_table =
-		    SqlUtils::FullName(catalog, entry.schema.empty() ? DEFAULT_SCHEMA : entry.schema, openivm::PROFILE_TABLE);
+		auto session = SqlUtils::SessionDefaultLocation(*con.context);
+		profile_table = SqlUtils::FullName(session.catalog, session.schema, openivm::PROFILE_TABLE);
 	}
 }
 

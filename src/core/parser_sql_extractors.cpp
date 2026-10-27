@@ -56,7 +56,8 @@ static bool ReadSource(TableRef &ref, string &table, string &alias) {
 	return true;
 }
 
-static bool ReadOutputs(SelectNode &select, vector<string> &names, vector<string> &expressions) {
+static bool ReadOutputs(SelectNode &select, vector<string> &names, vector<string> &expressions,
+                        vector<vector<string>> &column_refs) {
 	for (auto &expression : select.select_list) {
 		if (expression->GetExpressionClass() == ExpressionClass::STAR) {
 			auto &star = expression->Cast<StarExpression>();
@@ -66,6 +67,9 @@ static bool ReadOutputs(SelectNode &select, vector<string> &names, vector<string
 		}
 		names.push_back(expression->GetName());
 		expressions.push_back(expression->ToString());
+		column_refs.push_back(expression->GetExpressionClass() == ExpressionClass::COLUMN_REF
+		                          ? expression->Cast<ColumnRefExpression>().column_names
+		                          : vector<string>());
 	}
 	return !names.empty();
 }
@@ -276,33 +280,34 @@ bool ExtractFilteredGroupCount(const string &sql, const vector<string> &output_n
 }
 
 bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
+	auto &meta = out.meta;
 	auto statement = ParseSelect(sql);
 	auto select = statement ? AsSelect(*statement->node) : nullptr;
-	if (!select || !ReadOutputs(*select, out.output_cols, out.output_exprs)) {
+	if (!select || !ReadOutputs(*select, meta.output_cols, out.output_exprs, out.output_refs)) {
 		return false;
 	}
 	if (select->from_table->type == TableReferenceType::JOIN) {
 		auto &join = select->from_table->Cast<JoinRef>();
 		if (join.type == JoinType::SEMI || join.type == JoinType::ANTI) {
 			if ((!join.condition && join.using_columns.empty()) ||
-			    !ReadSource(*join.left, out.left_table, out.left_alias) ||
-			    !ReadSource(*join.right, out.right_table, out.right_alias)) {
+			    !ReadSource(*join.left, meta.left_table, meta.left_alias) ||
+			    !ReadSource(*join.right, meta.right_table, meta.right_alias)) {
 				return false;
 			}
-			out.join_type = join.type == JoinType::SEMI ? SemiAntiJoinType::SEMI : SemiAntiJoinType::ANTI;
+			meta.join_type = join.type == JoinType::SEMI ? SemiAntiJoinType::SEMI : SemiAntiJoinType::ANTI;
 			if (join.condition) {
-				out.predicate = join.condition->ToString();
+				meta.predicate = join.condition->ToString();
 			} else {
 				vector<string> equalities;
 				for (const auto &column : join.using_columns) {
 					auto quoted = SqlUtils::QuoteIdentifier(column);
-					equalities.push_back(SqlUtils::QuoteIdentifier(out.left_alias) + "." + quoted + " = " +
-					                     SqlUtils::QuoteIdentifier(out.right_alias) + "." + quoted);
+					equalities.push_back(SqlUtils::QuoteIdentifier(meta.left_alias) + "." + quoted + " = " +
+					                     SqlUtils::QuoteIdentifier(meta.right_alias) + "." + quoted);
 				}
-				out.predicate = StringUtil::Join(equalities, " AND ");
-				OPENIVM_DEBUG_PRINT("[SEMI/ANTI] Expanded USING predicate: %s\n", out.predicate.c_str());
+				meta.predicate = StringUtil::Join(equalities, " AND ");
+				OPENIVM_DEBUG_PRINT("[SEMI/ANTI] Expanded USING predicate: %s\n", meta.predicate.c_str());
 			}
-			out.post_filter = ExprSQL(select->where_clause);
+			meta.post_filter = ExprSQL(select->where_clause);
 			return true;
 		}
 	}
@@ -333,17 +338,17 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 		return false;
 	}
 	auto right = AsSelect(*subquery->subquery->node);
-	if (!right || !ReadSource(*right->from_table, out.right_table, out.right_alias)) {
+	if (!right || !ReadSource(*right->from_table, meta.right_table, meta.right_alias)) {
 		return false;
 	}
-	out.join_type = anti ? SemiAntiJoinType::ANTI : SemiAntiJoinType::SEMI;
-	out.post_filter = StringUtil::Join(filters, " AND ");
-	bool simple_left = ReadSource(*select->from_table, out.left_table, out.left_alias);
+	meta.join_type = anti ? SemiAntiJoinType::ANTI : SemiAntiJoinType::SEMI;
+	meta.post_filter = StringUtil::Join(filters, " AND ");
+	bool simple_left = ReadSource(*select->from_table, meta.left_table, meta.left_alias);
 	if (subquery->subquery_type == SubqueryType::EXISTS) {
 		if (!simple_left) {
 			return false;
 		}
-		out.predicate = right->where_clause ? right->where_clause->ToString() : "true";
+		meta.predicate = right->where_clause ? right->where_clause->ToString() : "true";
 		return true;
 	}
 	if (!subquery->child || right->select_list.size() != 1) {
@@ -353,30 +358,31 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 		auto left = select->Copy();
 		left->Cast<SelectNode>().where_clause.reset();
 		left->modifiers.clear();
-		out.left_table = "(" + left->ToString() + ")";
-		out.left_alias = "openivm_left";
+		meta.left_table = "(" + left->ToString() + ")";
+		meta.left_alias = "openivm_left";
+		out.left_is_subquery = true;
 	}
-	auto original_right_alias = out.right_alias;
-	out.right_alias = "openivm_right";
+	auto original_right_alias = meta.right_alias;
+	meta.right_alias = "openivm_right";
 	out.left_key_col = "openivm_saj_key";
-	out.left_key_expr = simple_left ? RenameQualifier(*subquery->child, out.left_table, out.left_alias, out.left_alias)
-	                                : SqlUtils::QuoteIdentifier(out.left_alias) + "." +
+	out.left_key_expr = simple_left ? RenameQualifier(*subquery->child, meta.left_table, meta.left_alias, meta.left_alias)
+	                                : SqlUtils::QuoteIdentifier(meta.left_alias) + "." +
 	                                      SqlUtils::QuoteIdentifier(subquery->child->GetName());
 	out.right_key_expr =
-	    RenameQualifier(*right->select_list[0], out.right_table, original_right_alias, out.right_alias);
-	out.predicate = out.left_key_expr + " = " + out.right_key_expr;
+	    RenameQualifier(*right->select_list[0], meta.right_table, original_right_alias, meta.right_alias);
+	meta.predicate = out.left_key_expr + " = " + out.right_key_expr;
 	if (right->where_clause) {
-		out.right_filter =
-		    RenameQualifier(*right->where_clause, out.right_table, original_right_alias, out.right_alias);
+		meta.right_filter =
+		    RenameQualifier(*right->where_clause, meta.right_table, original_right_alias, meta.right_alias);
 	}
 	if (anti) {
-		out.null_aware = true;
-		out.null_aware_left_col = "openivm_not_in_lhs_is_null";
+		meta.null_aware = true;
+		meta.null_aware_left_col = "openivm_not_in_lhs_is_null";
 		out.null_aware_left_expr = "(" + out.left_key_expr + " IS NULL)";
-		out.null_aware_right_expr = out.right_key_expr;
+		meta.null_aware_right_expr = out.right_key_expr;
 	}
 	OPENIVM_DEBUG_PRINT("[EXTRACT] Parsed %s membership query\n",
-	                    SEMI_ANTI_JOIN_TYPE_NAMES[static_cast<idx_t>(out.join_type)]);
+	                    SEMI_ANTI_JOIN_TYPE_NAMES[static_cast<idx_t>(meta.join_type)]);
 	return true;
 }
 

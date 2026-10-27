@@ -61,10 +61,9 @@ static MaterializedViewTarget ResolveMaterializedViewTarget(ClientContext &conte
 	if (components.empty() || components.size() > 3) {
 		throw ParserException("Invalid materialized-view target '%s'", target_name);
 	}
-	auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-	string default_catalog =
-	    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
-	string default_schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
+	auto session = SqlUtils::SessionDefaultLocation(context);
+	auto &default_catalog = session.catalog;
+	auto &default_schema = session.schema;
 	if (components.size() == 1) {
 		return {default_catalog, default_schema, components[0], false};
 	}
@@ -135,27 +134,6 @@ static string UniqueInternalColumnName(const vector<string> &existing_cols, cons
 	return candidate;
 }
 
-static bool IsSameBaseColumnExpr(string expr, const string &left_alias, const string &left_table,
-                                 const string &col_name) {
-	StringUtil::Trim(expr);
-	string table_name = SqlUtils::LastIdentifierPart(left_table);
-	vector<string> candidates = {
-	    col_name,
-	    KeywordHelper::WriteOptionallyQuoted(col_name),
-	    SqlUtils::QuoteIdentifier(col_name),
-	    left_alias + "." + KeywordHelper::WriteOptionallyQuoted(col_name),
-	    left_alias + "." + SqlUtils::QuoteIdentifier(col_name),
-	    table_name + "." + KeywordHelper::WriteOptionallyQuoted(col_name),
-	    table_name + "." + SqlUtils::QuoteIdentifier(col_name),
-	};
-	for (auto &candidate : candidates) {
-		if (StringUtil::CIEquals(expr, candidate)) {
-			return true;
-		}
-	}
-	return false;
-}
-
 static bool RelationExists(ClientContext &context, const string &catalog_name, const string &schema_name,
                            const string &relation_name) {
 	QueryErrorContext error_context;
@@ -168,6 +146,46 @@ static bool RelationExists(ClientContext &context, const string &catalog_name, c
 		}
 	}
 	return false;
+}
+
+static void DebugPrintDeltaViewModel(const DeltaViewModel &view_model, const PlanAnalysis &analysis,
+                                     idx_t group_column_count) {
+#if OPENIVM_DEBUG
+	OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, "
+	                    "projection=%d, group_cols=%zu)\n",
+	                    RefreshTypeName(view_model.type), (int)analysis.found_aggregation, (int)analysis.found_projection,
+	                    group_column_count);
+	for (auto reason : view_model.strategy_reasons) {
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Strategy reason: %s\n", DeltaStrategyReasonName(reason));
+	}
+	for (auto feature : view_model.features) {
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta model feature: %s\n", DeltaModelFeatureName(feature));
+	}
+	for (auto reason : view_model.unsupported_reasons) {
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta unsupported reason: %s\n", DeltaUnsupportedReasonName(reason));
+	}
+	for (auto semantics : view_model.update_semantics) {
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta update semantics: %s\n", DeltaUpdateSemanticsName(semantics));
+	}
+	for (auto &domain : view_model.affected_domains) {
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Affected domain: %s keys=%zu sources=%zu delta_local=%d "
+		                    "needs_lookup=%d\n",
+		                    DeltaAffectedDomainKindName(domain.kind), domain.key_columns.size(),
+		                    domain.source_tables.size(), (int)domain.delta_local, (int)domain.needs_base_lookup);
+	}
+	for (auto &node : view_model.nodes) {
+		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta node %llu: %s rule=%s children=%zu sources=%zu "
+		                    "keys=%zu "
+		                    "occurrence=%llu domains=%zu lineage=%zu semantics=%zu unsupported=%zu "
+		                    "maintenance=%s state=%s\n",
+		                    static_cast<unsigned long long>(node.id), DeltaModelNodeKindName(node.kind),
+		                    DeltaRuleKindName(node.rule), node.children.size(), node.source_tables.size(),
+		                    node.affected_key_columns.size(), static_cast<unsigned long long>(node.source_occurrence),
+		                    node.affected_domains.size(), node.lineage_facts.size(), node.update_semantics.size(),
+		                    node.unsupported_reasons.size(), DeltaMaintenanceModeName(node.maintenance.mode),
+		                    DeltaMaintenanceStateKindName(node.maintenance.state));
+	}
+#endif
 }
 
 static void AppendUnusedSourceDropProgram(ClientContext &context, Connection &con,
@@ -194,28 +212,25 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 
 	ParserExtensionPlanResult result;
 
-	auto metadata_catalog_name = ResolveMaterializedViewTarget(context, parse_data_ref.target_name).catalog_name;
+	auto target = ResolveMaterializedViewTarget(context, parse_data_ref.target_name);
 	// Apply a newly configured metadata schema before reading metadata: move existing
 	// metadata there, or create it for a catalog's first materialized view.
-	RefreshMetadata::PrepareMetadataSchema(context, metadata_catalog_name, parse_data_ref.alter_sql.empty());
+	RefreshMetadata::PrepareMetadataSchema(context, target.catalog_name, parse_data_ref.alter_sql.empty());
 	Connection con(*context.db.get());
-	auto lifecycle_target = ResolveMaterializedViewTarget(context, parse_data_ref.target_name);
-	auto metadata_location = MetadataLocator::Resolve(context, con, lifecycle_target.catalog_name);
+	auto metadata_location = MetadataLocator::Resolve(context, con, target.catalog_name);
 	if (parse_data_ref.alter_sql.empty()) {
 		// Metadata outside the view's database is committed separately from its data. The
 		// staged executor cannot join a caller transaction, so refuse rather than split it.
 		// Refuse before selecting the location, which may create the metadata schema.
-		MetadataLocator::RejectExplicitTransaction(context, metadata_location, lifecycle_target.catalog_name,
+		MetadataLocator::RejectExplicitTransaction(context, metadata_location, target.catalog_name,
 		                                           "CREATE MATERIALIZED VIEW");
 	}
-	metadata_location = RefreshMetadata::UseCatalog(context, con, lifecycle_target.catalog_name);
+	metadata_location = RefreshMetadata::UseCatalog(context, con, target.catalog_name);
 	bool remote_metadata = metadata_location.explicit_placement && !metadata_location.IsNative();
 	TransactionalMVLockState::Get(*con.context)
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
 	vector<MVProfileStep> create_profile_steps;
-	Value create_profile_val;
-	bool create_profile_enabled = context.TryGetCurrentSetting("openivm_profile_refresh", create_profile_val) &&
-	                              !create_profile_val.IsNull() && create_profile_val.GetValue<bool>();
+	bool create_profile_enabled = SqlUtils::GetBoolSetting(context, "openivm_profile_refresh", false);
 	auto create_profile_now = []() {
 		return std::chrono::steady_clock::now();
 	};
@@ -229,22 +244,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// Keep source-name resolution in the caller's catalog/schema. Native metadata
 	// belongs to the target catalog's metadata schema; DuckLake metadata remains native.
 	auto context_start = create_profile_now();
-	string current_catalog;
-	string current_schema;
-	{
-		auto &sp = ClientData::Get(context).catalog_search_path;
-		auto def = sp->GetDefault();
-		// A search path set by schema alone leaves the catalog implicit. Name it so MV
-		// objects are qualified whenever the metadata schema differs from the caller's.
-		current_catalog = def.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : def.catalog;
-		current_schema = def.schema.empty() ? "main" : def.schema;
-	}
-	// Without USE the session's catalog is unset, meaning the default database. The helper
-	// connection runs in the explicitly placed metadata location instead, so the view's data
-	// objects and sources must name that catalog rather than resolve next to the metadata.
-	if (current_catalog.empty() && metadata_location.explicit_placement) {
-		current_catalog = DatabaseManager::GetDefaultDatabase(context);
-	}
+	// A search path set by schema alone leaves the catalog implicit. Name it so MV
+	// objects are qualified whenever the metadata schema differs from the caller's.
+	auto session = SqlUtils::SessionDefaultLocation(context);
+	const string &current_catalog = session.catalog;
+	const string &current_schema = session.schema;
 	add_create_profile_step("create_compile_session_context", context_start);
 	// The helper has already selected the catalog and schema that own this view metadata.
 	// In an explicit transaction a newly configured schema may not exist yet; the
@@ -263,6 +267,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	    KeywordHelper::WriteOptionallyQuoted(default_db) + "." + KeywordHelper::WriteOptionallyQuoted(default_schema);
 	string current_catalog_schema = KeywordHelper::WriteOptionallyQuoted(current_catalog) + "." +
 	                                KeywordHelper::WriteOptionallyQuoted(current_schema);
+	// Whether the caller's catalog/schema differs from the metadata location the helper uses.
+	const bool caller_location_differs = current_catalog != default_db || current_schema != default_schema;
 
 	if (parse_data_ref.alter_sql.empty()) {
 		// Shared metadata migrations execute before the staged lifecycle program.
@@ -283,7 +289,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	if (!parse_data_ref.alter_sql.empty()) {
 		// Only the metadata catalog is written, so explicit transactions stay atomic.
 		MetadataLocator::RequireWritable(metadata_location, "alter materialized view");
-		auto target = ResolveMaterializedViewTarget(context, parse_data_ref.target_name);
 		auto metadata_table = SqlUtils::FullName(default_db, default_schema, openivm::VIEWS_TABLE);
 		auto target_key = RefreshMetadata(con).FindViewKey(target.catalog_name, target.schema_name, target.view_name);
 		view_key = target_key;
@@ -314,7 +319,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// metadata and skip the split protocol; that execution model is not validated.
 	if (metadata_location.explicit_placement && !metadata_location.catalog_type.empty() &&
 	    !metadata_location.IsNative() &&
-	    StringUtil::CIEquals(metadata_location.catalog, lifecycle_target.catalog_name)) {
+	    StringUtil::CIEquals(metadata_location.catalog, target.catalog_name)) {
 		throw NotImplementedException("Cannot create materialized view in '%s': it is the remote OpenIVM metadata "
 		                              "catalog. Create the view in a native DuckDB or DuckLake catalog; only its "
 		                              "metadata is stored in %s.",
@@ -327,8 +332,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	ForwardPacSettingsIfLoaded(context, con);
 
 	auto name_resolution_start = create_profile_now();
-	auto full_view_name = parse_data_ref.target_name;
-	auto target = ResolveMaterializedViewTarget(context, full_view_name);
 	string view_catalog_prefix;
 	string sql_view_name = target.view_name;
 	string view_name = RefreshMetadata(con).AllocateViewKey(target.catalog_name, target.schema_name, sql_view_name);
@@ -350,7 +353,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		view_catalog_prefix = SqlUtils::QualifiedPrefix(view_target_catalog, view_target_schema);
 	} else {
 		// Qualify the data objects when their location differs from the metadata schema.
-		if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
+		if (caller_location_differs) {
 			view_catalog_prefix = SqlUtils::QualifiedPrefix(current_catalog, current_schema);
 		}
 	}
@@ -407,7 +410,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// incomplete CTE/query internals. LPTS remains the normalized serializer below
 	// for supported logical plans; this string is only the safe fallback input.
 	auto original_view_query =
-	    openivm::TimeTravelPins::QualifySources(context, SqlUtils::ExtractViewQuery(statement->query));
+	    openivm::TimeTravelPins::QualifySources(context, parse_data_ref.view_query);
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Internal objects for %s use %s.%s\n", view_name.c_str(),
 	                    internal_target_catalog.c_str(), internal_target_schema.c_str());
 	string data_table = IncrementalTableNames::DataTableName(view_name);
@@ -438,7 +441,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// default. Without this, `CREATE MATERIALIZED VIEW mv AS SELECT * FROM WAREHOUSE`
 	// issued under `USE dl.main` fails during planning with "Table WAREHOUSE does not
 	// exist" because the fresh connection resolves against the physical-default catalog.
-	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
+	if (caller_location_differs) {
 		auto use_start = create_profile_now();
 		con.Query("USE " + current_catalog_schema);
 		add_create_profile_step("create_compile_use_context", use_start, current_catalog_schema);
@@ -460,13 +463,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// transaction are visible. The helper connection remains for committed
 	// metadata probes and cross-catalog DDL preparation only.
 	con.BeginTransaction();
-	// GetTableNames binds the query internally. For MV queries that DuckDB's binder
-	// can't evaluate out-of-context (e.g. multi-column `(a, b) IN (SELECT x, y FROM t)`
-	// triggers an ARRAY-sublink path that rejects the 2-column subquery), the call
-	// throws. Catch and use an empty table_names — the later ExtractViewQuery path
-	// re-derives what it needs from the plan.
-	unordered_set<string> table_names;
-	auto table_names_start = create_profile_now();
 	// Peel time-travel pins the catalog cannot bind before anything plans this statement, keeping
 	// each pin keyed by its relation so it can be re-attached to the generated SQL below.
 	auto time_travel_pins = openivm::TimeTravelPins::Peel(context, *statement);
@@ -475,31 +471,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// rendering for a foreign dialect.
 	auto &select_statement = *statement->Cast<CreateStatement>().info->Cast<CreateTableInfo>().query;
 	auto local_view_query = time_travel_pins.Empty() ? original_view_query : select_statement.ToString();
-	try {
-		table_names = con.GetTableNames(statement->query);
-	} catch (const std::exception &e) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] GetTableNames failed: %s — continuing\n", e.what());
-	}
-	add_create_profile_step("create_compile_get_table_names", table_names_start,
-	                        "tables=" + to_string(table_names.size()));
-	if (remote_metadata && !table_names.empty()) {
-		vector<string> candidates;
-		for (auto &table : table_names) {
-			candidates.push_back(Value(PublishedSourceViewName(SqlUtils::LastIdentifierPart(table))).ToSQLString());
-		}
-		Connection dependency_con(*context.db);
-		auto parents = dependency_con.Query("SELECT view_name FROM " + metadata_location.Table(openivm::VIEWS_TABLE) +
-		                                    " WHERE view_name IN (" + StringUtil::Join(candidates, ", ") + ")");
-		if (parents->HasError()) {
-			throw CatalogException("Cannot resolve CREATE lifecycle dependencies: %s", parents->GetError());
-		}
-		vector<string> parent_keys;
-		for (idx_t row = 0; row < parents->RowCount(); row++) {
-			parent_keys.push_back(parents->GetValue(0, row).ToString());
-		}
-		LifecycleLeaseState::Get(context).Acquire(context, metadata_location, std::move(parent_keys));
-	}
-
 	// Plan the full CREATE TABLE AS SELECT statement (for plan walking)
 	auto full_plan_start = create_profile_now();
 	Planner planner(context);
@@ -580,16 +551,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			}
 			StringUtil::Trim(view_query);
 			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS view query: %s\n", view_query.c_str());
-		} catch (const std::exception &e) {
-			view_query = original_view_query;
-			lpts_fallback = true;
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (%s) to original query: %s\n", e.what(), view_query.c_str());
 		} catch (...) {
 			view_query = original_view_query;
 			lpts_fallback = true;
-			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback (unknown exception) to "
-			                    "original query: %s\n",
-			                    view_query.c_str());
+			OPENIVM_DEBUG_PRINT("[CREATE MV] LPTS fallback to original query: %s\n", view_query.c_str());
 		}
 		if (PlanNeedsOriginalSqlForLpts(post_rewrite_facts)) {
 			view_query = original_view_query;
@@ -631,13 +596,32 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		StripPublicationModifiers(analysis_query, analysis_names, analysis_suffix, analysis_order);
 	}
 	auto facts = BuildCreateMVPlanFacts(plan.get(), current_catalog);
-	if (!facts.source_table_info.empty()) {
-		table_names.clear();
-		for (const auto &entry : facts.source_table_info) {
-			table_names.insert(entry.second.table_name);
+	unordered_set<string> table_names;
+	for (const auto &entry : facts.source_table_info) {
+		table_names.insert(entry.second.table_name);
+	}
+	if (remote_metadata && !table_names.empty()) {
+		vector<string> candidates;
+		for (auto &table : table_names) {
+			candidates.push_back(Value(PublishedSourceViewName(table)).ToSQLString());
 		}
+		Connection dependency_con(*context.db);
+		auto parents = dependency_con.Query("SELECT view_name FROM " + metadata_location.Table(openivm::VIEWS_TABLE) +
+		                                    " WHERE view_name IN (" + StringUtil::Join(candidates, ", ") + ")");
+		if (parents->HasError()) {
+			throw CatalogException("Cannot resolve CREATE lifecycle dependencies: %s", parents->GetError());
+		}
+		vector<string> parent_keys;
+		for (idx_t row = 0; row < parents->RowCount(); row++) {
+			parent_keys.push_back(parents->GetValue(0, row).ToString());
+		}
+		LifecycleLeaseState::Get(context).Acquire(context, metadata_location, std::move(parent_keys));
 	}
 	auto analysis = facts.analysis;
+	auto qualify_source = [&](const string &table_name) {
+		return QualifyCreateSourceTable(context, table_name, facts, current_catalog, current_schema, default_db,
+		                                default_schema);
+	};
 	add_create_profile_step("create_compile_analyze_plan", analysis_start,
 	                        "sources=" + to_string(table_names.size()) +
 	                            "; ducklake_sources=" + to_string(facts.ducklake_table_info.size()));
@@ -718,9 +702,6 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	string distinct_sum_arg;
 	string distinct_sum_out;
 	SemiAntiExtract semi_anti_extract;
-	vector<string> semi_anti_left_cols;
-	vector<pair<string, string>> semi_anti_left_expr_overrides;
-	vector<pair<string, string>> semi_anti_left_col_rewrites;
 	FilteredGroupCountExtract filtered_group_count_extract;
 	FilteredGroupCountAuxRequirement filtered_group_count_aux_candidate;
 	if (analysis.found_nested_aggregate &&
@@ -730,8 +711,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);
 		filtered_group_count_aux_candidate = {
 		    {aux_table,
-		     QualifyCreateSourceTable(context, filtered_group_count_extract.source, facts, current_catalog,
-		                              current_schema, default_db, default_schema),
+		     qualify_source(filtered_group_count_extract.source),
 		     filtered_group_count_extract.group_col, filtered_group_count_extract.sum_col, group_q, sum_q,
 		     filtered_group_count_extract.output_col, filtered_group_count_extract.comparison_op,
 		     filtered_group_count_extract.threshold_sql},
@@ -739,112 +719,94 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		model_input.filtered_group_count_aux_candidate = &filtered_group_count_aux_candidate;
 	}
 
-	if (analysis.found_semi_anti_join && !analysis.found_aggregation) {
-		if (ExtractSemiAntiQuery(local_view_query, semi_anti_extract)) {
-			auto col_result = con.Query("DESCRIBE SELECT * FROM " + semi_anti_extract.left_table);
-			if (semi_anti_extract.output_cols.empty() && !col_result->HasError()) {
-				for (idx_t i = 0; i < col_result->RowCount(); i++) {
-					auto name = col_result->GetValue(0, i).ToString();
-					semi_anti_extract.output_cols.push_back(name);
-					semi_anti_extract.output_exprs.push_back(SqlUtils::QuoteIdentifier(semi_anti_extract.left_alias) +
-					                                         "." + SqlUtils::QuoteIdentifier(name));
+	auto &semi_anti = semi_anti_extract.meta;
+	if (analysis.found_semi_anti_join && !analysis.found_aggregation &&
+	    ExtractSemiAntiQuery(local_view_query, semi_anti_extract)) {
+		auto col_result = con.Query("DESCRIBE SELECT * FROM " + semi_anti.left_table);
+		vector<string> base_cols;
+		for (idx_t i = 0; !col_result->HasError() && i < col_result->RowCount(); i++) {
+			base_cols.push_back(col_result->GetValue(0, i).ToString());
+		}
+		if (semi_anti.output_cols.empty()) {
+			for (auto &name : base_cols) {
+				semi_anti.output_cols.push_back(name);
+				semi_anti_extract.output_exprs.push_back(SqlUtils::QuoteIdentifier(semi_anti.left_alias) + "." +
+				                                         SqlUtils::QuoteIdentifier(name));
+				semi_anti_extract.output_refs.push_back({semi_anti.left_alias, name});
+			}
+		}
+		// Each aux-state column with the left-side expression it stores.
+		vector<pair<string, string>> left_cols;
+		vector<pair<string, string>> left_col_rewrites;
+		auto find_left_col = [&](const string &col_name) {
+			return std::find_if(left_cols.begin(), left_cols.end(), [&](const pair<string, string> &entry) {
+				return StringUtil::CIEquals(entry.first, col_name);
+			});
+		};
+		auto add_unique_left_col = [&](const string &base_name, const string &source_expr) {
+			auto col_name = base_name;
+			for (idx_t suffix = 1; find_left_col(col_name) != left_cols.end(); suffix++) {
+				col_name = base_name + "_" + std::to_string(suffix);
+			}
+			left_cols.emplace_back(col_name, source_expr);
+			return col_name;
+		};
+		// An output that is a plain reference to the left relation's column of the same name.
+		auto output_alias_is_base_col = [&](const string &col_name) {
+			auto table_name = SqlUtils::LastIdentifierPart(semi_anti.left_table);
+			for (idx_t i = 0; i < semi_anti.output_cols.size(); i++) {
+				auto &ref = semi_anti_extract.output_refs[i];
+				if (StringUtil::CIEquals(semi_anti.output_cols[i], col_name) && !ref.empty() && ref.size() <= 2 &&
+				    StringUtil::CIEquals(ref.back(), col_name) &&
+				    (ref.size() == 1 || StringUtil::CIEquals(ref[0], semi_anti.left_alias) ||
+				     StringUtil::CIEquals(ref[0], table_name))) {
+					return true;
 				}
 			}
-			auto add_semi_anti_left_col = [&](const string &col_name) {
-				if (!ContainsColumnCI(semi_anti_left_cols, col_name)) {
-					semi_anti_left_cols.push_back(col_name);
-				}
-			};
-			auto add_semi_anti_expr_override = [&](const string &col_name, const string &source_expr) {
-				for (auto &entry : semi_anti_left_expr_overrides) {
-					if (StringUtil::CIEquals(entry.first, col_name)) {
-						entry.second = source_expr;
-						return;
-					}
-				}
-				semi_anti_left_expr_overrides.emplace_back(col_name, source_expr);
-			};
-			auto output_alias_is_base_col = [&](const string &col_name) {
-				for (size_t i = 0; i < semi_anti_extract.output_cols.size(); i++) {
-					if (StringUtil::CIEquals(semi_anti_extract.output_cols[i], col_name) &&
-					    i < semi_anti_extract.output_exprs.size() &&
-					    IsSameBaseColumnExpr(semi_anti_extract.output_exprs[i], semi_anti_extract.left_alias,
-					                         semi_anti_extract.left_table, col_name)) {
-						return true;
-					}
-				}
-				return false;
-			};
-			auto left_col_already_maps_to_expr = [&](const string &col_name, const string &source_expr) {
-				for (auto &entry : semi_anti_left_expr_overrides) {
-					if (StringUtil::CIEquals(entry.first, col_name) &&
-					    StringUtil::CIEquals(entry.second, source_expr)) {
-						return true;
-					}
-				}
-				return false;
-			};
-			auto add_semi_anti_base_col = [&](const string &col_name) {
-				string source_expr =
-				    semi_anti_extract.left_alias + "." + KeywordHelper::WriteOptionallyQuoted(col_name);
-				if (!ContainsColumnCI(semi_anti_left_cols, col_name)) {
-					add_semi_anti_left_col(col_name);
-					add_semi_anti_expr_override(col_name, source_expr);
-					return;
-				}
-				if (left_col_already_maps_to_expr(col_name, source_expr)) {
-					return;
-				}
-				if (output_alias_is_base_col(col_name)) {
-					return;
-				}
-				string hidden_col = UniqueInternalColumnName(semi_anti_left_cols, "openivm_saj_" + col_name);
-				add_semi_anti_left_col(hidden_col);
-				add_semi_anti_expr_override(hidden_col, source_expr);
-				semi_anti_left_col_rewrites.emplace_back(col_name, hidden_col);
-			};
-			if (!semi_anti_extract.output_cols.empty()) {
-				for (auto &col : semi_anti_extract.output_cols) {
-					add_semi_anti_left_col(col);
-				}
-				// The aux state must evaluate the semi/anti predicate on refresh. If the
-				// MV projects only a subset of the left table, keep the base columns as
-				// hidden aux-state key columns as well (e.g. output C_ID/C_LAST, predicate
-				// uses C_W_ID). The user-facing MV still emits only output_cols.
-				if (semi_anti_extract.left_table.find('(') == string::npos && !col_result->HasError() &&
-				    col_result->RowCount() > 0) {
-					for (idx_t i = 0; i < col_result->RowCount(); i++) {
-						add_semi_anti_base_col(col_result->GetValue(0, i).ToString());
-					}
-				}
-			} else if (!col_result->HasError() && col_result->RowCount() > 0) {
-				for (idx_t i = 0; i < col_result->RowCount(); i++) {
-					add_semi_anti_base_col(col_result->GetValue(0, i).ToString());
-				}
+			return false;
+		};
+		for (idx_t i = 0; i < semi_anti.output_cols.size(); i++) {
+			if (find_left_col(semi_anti.output_cols[i]) == left_cols.end()) {
+				left_cols.emplace_back(semi_anti.output_cols[i], semi_anti_extract.output_exprs[i]);
 			}
-			if (!semi_anti_extract.left_key_col.empty() && !semi_anti_extract.left_key_expr.empty()) {
-				semi_anti_extract.left_key_col =
-				    UniqueInternalColumnName(semi_anti_left_cols, semi_anti_extract.left_key_col);
-				add_semi_anti_left_col(semi_anti_extract.left_key_col);
-				add_semi_anti_expr_override(semi_anti_extract.left_key_col, semi_anti_extract.left_key_expr);
-				semi_anti_extract.predicate = semi_anti_extract.left_alias + "." +
-				                              SqlUtils::QuoteIdentifier(semi_anti_extract.left_key_col) + " = " +
-				                              semi_anti_extract.right_key_expr;
+		}
+		// The aux state must evaluate the semi/anti predicate on refresh. If the
+		// MV projects only a subset of the left table, keep the base columns as
+		// hidden aux-state key columns as well (e.g. output C_ID/C_LAST, predicate
+		// uses C_W_ID). The user-facing MV still emits only output_cols.
+		for (auto &col_name : semi_anti_extract.left_is_subquery ? vector<string>() : base_cols) {
+			string source_expr = semi_anti.left_alias + "." + KeywordHelper::WriteOptionallyQuoted(col_name);
+			auto existing = find_left_col(col_name);
+			if (existing == left_cols.end()) {
+				left_cols.emplace_back(col_name, source_expr);
+			} else if (!StringUtil::CIEquals(existing->second, source_expr) && !output_alias_is_base_col(col_name)) {
+				left_col_rewrites.emplace_back(col_name, add_unique_left_col("openivm_saj_" + col_name, source_expr));
 			}
-			if (semi_anti_extract.null_aware && !semi_anti_extract.null_aware_left_col.empty()) {
-				semi_anti_extract.null_aware_left_col =
-				    UniqueInternalColumnName(semi_anti_left_cols, semi_anti_extract.null_aware_left_col);
-				add_semi_anti_left_col(semi_anti_extract.null_aware_left_col);
-				add_semi_anti_expr_override(semi_anti_extract.null_aware_left_col,
-				                            semi_anti_extract.null_aware_left_expr);
+		}
+		if (!semi_anti_extract.left_key_col.empty() && !semi_anti_extract.left_key_expr.empty()) {
+			semi_anti_extract.left_key_col =
+			    add_unique_left_col(semi_anti_extract.left_key_col, semi_anti_extract.left_key_expr);
+			semi_anti.predicate = semi_anti.left_alias + "." +
+			                      SqlUtils::QuoteIdentifier(semi_anti_extract.left_key_col) + " = " +
+			                      semi_anti_extract.right_key_expr;
+		}
+		if (semi_anti.null_aware && !semi_anti.null_aware_left_col.empty()) {
+			semi_anti.null_aware_left_col =
+			    add_unique_left_col(semi_anti.null_aware_left_col, semi_anti_extract.null_aware_left_expr);
+		}
+		for (auto &rewrite : left_col_rewrites) {
+			for (auto *expression : {&semi_anti.predicate, &semi_anti.post_filter, &semi_anti.right_filter}) {
+				SqlUtils::RewriteColumnReferences(*expression, rewrite.first, rewrite.second,
+				                                  {StringUtil::Lower(semi_anti.left_alias)}, false);
 			}
-			for (auto &rewrite : semi_anti_left_col_rewrites) {
-				for (auto *expression :
-				     {&semi_anti_extract.predicate, &semi_anti_extract.post_filter, &semi_anti_extract.right_filter}) {
-					SqlUtils::RewriteColumnReferences(*expression, rewrite.first, rewrite.second,
-					                                  {StringUtil::Lower(semi_anti_extract.left_alias)}, false);
-				}
-			}
+		}
+		for (auto &entry : left_cols) {
+			semi_anti.left_cols.push_back(entry.first);
+			semi_anti.left_exprs.push_back(entry.second);
+		}
+		if (!left_cols.empty()) {
+			semi_anti.aux_table = "openivm_semi_anti_state_" + view_name;
+			model_input.semi_anti_aux_candidate = &semi_anti;
 		}
 	}
 
@@ -860,13 +822,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Read the flag from the user's ClientContext (`context`), not the local
 		// `con` — the local connection is a fresh one and doesn't inherit the
 		// caller's session settings.
-		Value aux_val;
-		bool aux_enabled = false;
-		if (context.TryGetCurrentSetting("openivm_distinct_aux_state", aux_val) && !aux_val.IsNull()) {
-			aux_enabled = aux_val.GetValue<bool>();
-		}
-		bool single_source = facts.source_table_info.size() == 1;
-		if (aux_enabled && single_source) {
+		if (SqlUtils::GetBoolSetting(context, "openivm_distinct_aux_state", false) &&
+		    facts.source_table_info.size() == 1) {
 			vector<string> dcols;
 			string d_input_sql, d_source, d_filter;
 			if (!ExtractInnerDistinct(local_view_query, dcols, d_input_sql, d_source, d_filter)) {
@@ -874,8 +831,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 				                    "GROUP_RECOMPUTE\n");
 			} else {
 				distinct_extracted_cols = std::move(dcols);
-				distinct_extracted_source = QualifyCreateSourceTable(context, d_source, facts, current_catalog,
-				                                                     current_schema, default_db, default_schema);
+				distinct_extracted_source = qualify_source(d_source);
 				distinct_extracted_input_sql =
 				    SqlUtils::ReplaceTableReferences(d_input_sql, d_source, distinct_extracted_source);
 				distinct_extracted_filter = std::move(d_filter);
@@ -948,12 +904,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	RefreshMetadata::CountDistinctAuxMeta count_distinct_aux_candidate;
 	if (analysis.found_count_distinct && facts.source_table_info.size() == 1 && analysis.group_count > 0 &&
 	    analysis.group_count < output_names.size()) {
-		Value aux_val;
-		bool aux_enabled = false;
-		if (context.TryGetCurrentSetting("openivm_stateful_auxstate", aux_val) && !aux_val.IsNull()) {
-			aux_enabled = aux_val.GetValue<bool>();
-		}
-		if (aux_enabled) {
+		if (SqlUtils::GetBoolSetting(context, "openivm_stateful_auxstate", false)) {
 			vector<string> candidate_group_columns;
 			for (idx_t i = 0; i < analysis.group_count && i < output_names.size(); i++) {
 				candidate_group_columns.push_back(output_names[i]);
@@ -965,9 +916,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 				aux_columns.push_back("_count");
 				cd_extract.distinct_col = UniqueInternalColumnName(aux_columns, cd_extract.distinct_col);
 				count_distinct_aux_candidate = {"openivm_aux_" + view_name,
-				                                QualifyCreateSourceTable(context, cd_extract.source, facts,
-				                                                         current_catalog, current_schema, default_db,
-				                                                         default_schema),
+				                                qualify_source(cd_extract.source),
 				                                candidate_group_columns,
 				                                cd_extract.group_exprs,
 				                                cd_extract.distinct_col,
@@ -981,58 +930,12 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			}
 		}
 	}
-	RefreshMetadata::SemiAntiAuxMeta semi_anti_aux_candidate;
-	if (!semi_anti_left_cols.empty()) {
-		vector<string> semi_anti_left_exprs;
-		for (size_t i = 0; i < semi_anti_left_cols.size(); i++) {
-			string qcol = KeywordHelper::WriteOptionallyQuoted(semi_anti_left_cols[i]);
-			string source_expr = semi_anti_extract.left_alias + "." + qcol;
-			bool has_override = false;
-			for (auto &entry : semi_anti_left_expr_overrides) {
-				if (StringUtil::CIEquals(entry.first, semi_anti_left_cols[i])) {
-					source_expr = entry.second;
-					has_override = true;
-					break;
-				}
-			}
-			if (!has_override) {
-				for (size_t j = 0; j < semi_anti_extract.output_cols.size(); j++) {
-					if (StringUtil::CIEquals(semi_anti_extract.output_cols[j], semi_anti_left_cols[i]) &&
-					    j < semi_anti_extract.output_exprs.size()) {
-						source_expr = semi_anti_extract.output_exprs[j];
-						break;
-					}
-				}
-			}
-			semi_anti_left_exprs.push_back(source_expr);
-		}
-		string aux_table = "openivm_semi_anti_state_" + view_name;
-		semi_anti_aux_candidate.aux_table = aux_table;
-		semi_anti_aux_candidate.join_type = semi_anti_extract.join_type;
-		semi_anti_aux_candidate.left_table = semi_anti_extract.left_table;
-		semi_anti_aux_candidate.left_alias = semi_anti_extract.left_alias;
-		semi_anti_aux_candidate.right_table = semi_anti_extract.right_table;
-		semi_anti_aux_candidate.right_alias = semi_anti_extract.right_alias;
-		semi_anti_aux_candidate.predicate = semi_anti_extract.predicate;
-		semi_anti_aux_candidate.post_filter = semi_anti_extract.post_filter;
-		semi_anti_aux_candidate.right_filter = semi_anti_extract.right_filter;
-		semi_anti_aux_candidate.null_aware = semi_anti_extract.null_aware;
-		semi_anti_aux_candidate.null_aware_left_col = semi_anti_extract.null_aware_left_col;
-		semi_anti_aux_candidate.null_aware_right_expr = semi_anti_extract.null_aware_right_expr;
-		semi_anti_aux_candidate.left_cols = semi_anti_left_cols;
-		semi_anti_aux_candidate.left_exprs = semi_anti_left_exprs;
-		semi_anti_aux_candidate.output_cols = semi_anti_extract.output_cols;
-		model_input.semi_anti_aux_candidate = &semi_anti_aux_candidate;
-	}
 	auto view_model = BuildDeltaViewModel(model_input);
-	string leftjoin_secondary_sql;
-	vector<string> leftjoin_preserved_cols;
-	vector<string> leftjoin_inner_tables, leftjoin_inner_keys, leftjoin_pres_tables, leftjoin_pres_keys;
+	RefreshMetadata::LeftJoinSecondaryMeta leftjoin_secondary;
 	if (view_model.type == RefreshType::AGGREGATE_GROUP && facts.analysis.found_left_join) {
-		leftjoin_secondary_sql = BuildLeftJoinSecondaryDeltaSQL(
-		    context, facts, output_names, view_name, leftjoin_preserved_cols, internal_catalog_prefix,
-		    leftjoin_inner_tables, leftjoin_inner_keys, leftjoin_pres_tables, leftjoin_pres_keys);
-		if (leftjoin_secondary_sql.empty()) {
+		leftjoin_secondary =
+		    BuildLeftJoinSecondaryDeltaSQL(context, facts, output_names, view_name, internal_catalog_prefix);
+		if (leftjoin_secondary.sql.empty()) {
 			// The aggregate MERGE requires the Larson & Zhou correction for null-padded row
 			// transitions. An incomplete correction is not optional: recompute only the groups
 			// reached from source deltas instead of silently applying incorrect arithmetic.
@@ -1079,40 +982,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 	add_create_profile_step("create_compile_classification", classification_start, model_profile_detail);
 
-	OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, "
-	                    "projection=%d, group_cols=%zu)\n",
-	                    RefreshTypeName(refresh_type), (int)analysis.found_aggregation, (int)analysis.found_projection,
-	                    aggregate_columns.size());
-	for (auto reason : view_model.strategy_reasons) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Strategy reason: %s\n", DeltaStrategyReasonName(reason));
-	}
-	for (auto feature : view_model.features) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta model feature: %s\n", DeltaModelFeatureName(feature));
-	}
-	for (auto reason : view_model.unsupported_reasons) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta unsupported reason: %s\n", DeltaUnsupportedReasonName(reason));
-	}
-	for (auto semantics : view_model.update_semantics) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta update semantics: %s\n", DeltaUpdateSemanticsName(semantics));
-	}
-	for (auto &domain : view_model.affected_domains) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Affected domain: %s keys=%zu sources=%zu delta_local=%d "
-		                    "needs_lookup=%d\n",
-		                    DeltaAffectedDomainKindName(domain.kind), domain.key_columns.size(),
-		                    domain.source_tables.size(), (int)domain.delta_local, (int)domain.needs_base_lookup);
-	}
-	for (auto &node : view_model.nodes) {
-		OPENIVM_DEBUG_PRINT("[CREATE MV] Delta node %llu: %s rule=%s children=%zu sources=%zu "
-		                    "keys=%zu "
-		                    "occurrence=%llu domains=%zu lineage=%zu semantics=%zu unsupported=%zu "
-		                    "maintenance=%s state=%s\n",
-		                    static_cast<unsigned long long>(node.id), DeltaModelNodeKindName(node.kind),
-		                    DeltaRuleKindName(node.rule), node.children.size(), node.source_tables.size(),
-		                    node.affected_key_columns.size(), static_cast<unsigned long long>(node.source_occurrence),
-		                    node.affected_domains.size(), node.lineage_facts.size(), node.update_semantics.size(),
-		                    node.unsupported_reasons.size(), DeltaMaintenanceModeName(node.maintenance.mode),
-		                    DeltaMaintenanceStateKindName(node.maintenance.state));
-	}
+	DebugPrintDeltaViewModel(view_model, analysis, aggregate_columns.size());
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Source tables:");
 	for (const auto &t : table_names) {
 		OPENIVM_DEBUG_PRINT(" %s", t.c_str());
@@ -1146,11 +1016,11 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		cleanup_ddl.push_back(string(OPENIVM_DDL_CLEANUP_PREFIX) + query);
 	};
 	auto add_profile_marker = [&](const string &step_name, const string &detail = string()) {
-		ddl.push_back(string(OPENIVM_DDL_PROFILE_PREFIX) + view_name + "\t" + step_name + "\t" + detail);
+		ddl.push_back(EncodeDDLOperation(OPENIVM_DDL_PROFILE_PREFIX, {view_name, step_name, detail}));
 	};
 	auto add_profile_record = [&](const string &step_name, int64_t duration_ms, const string &detail = string()) {
-		ddl.push_back(string(OPENIVM_DDL_PROFILE_RECORD_PREFIX) + view_name + "\t" + step_name + "\t" +
-		              to_string(duration_ms) + "\t" + detail);
+		ddl.push_back(
+		    EncodeDDLOperation(OPENIVM_DDL_PROFILE_RECORD_PREFIX, {view_name, step_name, to_string(duration_ms), detail}));
 	};
 	auto get_aux_state_target = [&](const string &aux_table) {
 		auto existing = aux_state_targets.find(aux_table);
@@ -1313,10 +1183,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		for (auto &aux_table : replaced_auxiliary_tables) {
 			ddl.push_back("DROP TABLE IF EXISTS " + internal_catalog_prefix + SqlUtils::QuoteIdentifier(aux_table));
 		}
-		ddl.push_back("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-		              SqlUtils::EscapeSingleQuotes(view_name) + "'");
-		ddl.push_back("DELETE FROM " + string(openivm::HISTORY_TABLE) + " WHERE view_name = '" +
-		              SqlUtils::EscapeSingleQuotes(view_name) + "'");
+		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::DELTA_TABLES_TABLE, view_name));
+		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::HISTORY_TABLE, view_name));
 	}
 
 	string refresh_val = parse_data_ref.refresh_interval > 0 ? to_string(parse_data_ref.refresh_interval) : "null";
@@ -1372,10 +1240,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	                           RefreshMetadata::DerivedAggregateOutputsToJson(derived_aggregate_outputs), view_name));
 	add_profile_record("create_compile_lineage", lineage_duration_ms, "entries=" + to_string(lineage_entry_count));
 
-	Value match_flag_val;
-	bool view_matching_enabled = context.TryGetCurrentSetting("openivm_enable_view_matching", match_flag_val) &&
-	                             !match_flag_val.IsNull() && BooleanValue::Get(match_flag_val);
-	if (view_matching_enabled) {
+	if (SqlUtils::GetBoolSetting(context, "openivm_enable_view_matching", false)) {
 		// table_names may include openivm_data_<x> when this MV reads from
 		// another MV (DuckDB binds the user-facing view to its data table).
 		// Strip the prefix so source_tables_json reflects user-facing names
@@ -1391,8 +1256,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// Replace any prior edges for this child, then re-emit. INSERTs are
 		// conditional on the source being a registered MV (the SELECT
 		// returns zero rows for non-MV sources).
-		metadata_ddl.push_back("DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE child_view = '" +
-		                       SqlUtils::EscapeSingleQuotes(view_name) + "'");
+		metadata_ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::MV_DEPS_TABLE, view_name, "child_view"));
 		for (const auto &t : sorted_tables) {
 			metadata_ddl.push_back("INSERT INTO " + string(openivm::MV_DEPS_TABLE) +
 			                       " (parent_view, child_view, edge_kind) SELECT view_name, '" +
@@ -1406,87 +1270,60 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// metadata so refresh-time can find the source SQL, the column list, and the aux
 	// table name. The aux table is populated from the (DISTINCT-stripped) input SQL
 	// at CREATE time; refresh-time MERGE keeps it in sync with delta multiplicities.
+	const bool replace_aux = parse_data_ref.is_replace && !staged_cross_catalog_replace;
+	auto emit_aux = [&](const string &step, const string &aux_table, const string &json_column, const string &json,
+	                    const std::function<string(const string &aux_target)> &build_create) {
+		add_profile_marker(step);
+		ddl.push_back(build_create(get_aux_state_target(aux_table)));
+		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
+		            KeywordHelper::WriteOptionallyQuoted(aux_table));
+		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(json_column, json, view_name));
+	};
 	if (view_model.HasDistinctAux()) {
-		add_profile_marker("create_mv_distinct_aux");
 		const auto &meta = view_model.distinct_aux;
-		string aux_target = get_aux_state_target(meta.aux_table);
-		string aux_create =
-		    BuildDistinctAuxStateCreateSQL(aux_target, meta.cols, meta.source_exprs, "(" + meta.input_sql + ")", "",
-		                                   /*replace=*/parse_data_ref.is_replace && !staged_cross_catalog_replace);
-		ddl.push_back(aux_create);
-		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
-		aux_metadata_ddl.push_back(
-		    BuildUpdateViewJsonSQL("distinct_aux_meta_json", RefreshMetadata::DistinctAuxMetaToJson(meta), view_name));
+		emit_aux("create_mv_distinct_aux", meta.aux_table, "distinct_aux_meta_json",
+		         RefreshMetadata::DistinctAuxMetaToJson(meta), [&](const string &aux_target) {
+			         return BuildDistinctAuxStateCreateSQL(aux_target, meta.cols, meta.source_exprs,
+			                                               "(" + meta.input_sql + ")", "", replace_aux);
+		         });
 	}
-
 	if (view_model.HasCountDistinctAux()) {
-		add_profile_marker("create_mv_count_distinct_aux");
 		const auto &meta = view_model.count_distinct_aux;
-		string source_table = QualifyCreateSourceTable(context, meta.source, facts, current_catalog, current_schema,
-		                                               default_db, default_schema);
-		string aux_target = get_aux_state_target(meta.aux_table);
-		string aux_create =
-		    BuildCountDistinctAuxStateCreateSQL(aux_target, source_table, meta.group_cols, meta.group_source_exprs,
-		                                        meta.distinct_col, meta.distinct_expr, meta.filter,
-		                                        /*replace=*/parse_data_ref.is_replace && !staged_cross_catalog_replace);
-		ddl.push_back(aux_create);
-		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
-		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
-		    "count_distinct_aux_meta_json", RefreshMetadata::CountDistinctAuxMetaToJson(meta), view_name));
+		emit_aux("create_mv_count_distinct_aux", meta.aux_table, "count_distinct_aux_meta_json",
+		         RefreshMetadata::CountDistinctAuxMetaToJson(meta), [&](const string &aux_target) {
+			         return BuildCountDistinctAuxStateCreateSQL(
+			             aux_target, qualify_source(meta.source), meta.group_cols, meta.group_source_exprs,
+			             meta.distinct_col, meta.distinct_expr, meta.filter, replace_aux);
+		         });
 	}
-
 	if (view_model.HasFilteredGroupCountAux()) {
-		add_profile_marker("create_mv_filtered_group_count_aux");
 		const auto &req = view_model.filtered_group_count_aux;
 		const auto &meta = req.meta;
-		string source_table = QualifyCreateSourceTable(context, req.create_source, facts, current_catalog,
-		                                               current_schema, default_db, default_schema);
-		string aux_target = get_aux_state_target(meta.aux_table);
-		string aux_create = BuildFilteredGroupCountAuxStateCreateSQL(
-		    aux_target, source_table, meta.group_col, meta.sum_col, meta.source_group_expr, meta.source_sum_expr,
-		    /*replace=*/parse_data_ref.is_replace && !staged_cross_catalog_replace);
-		ddl.push_back(aux_create);
-		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
-		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
-		    "aggregate_decomposition_json", RefreshMetadata::FilteredGroupCountAuxMetaToJson(meta), view_name));
+		emit_aux("create_mv_filtered_group_count_aux", meta.aux_table, "aggregate_decomposition_json",
+		         RefreshMetadata::FilteredGroupCountAuxMetaToJson(meta), [&](const string &aux_target) {
+			         return BuildFilteredGroupCountAuxStateCreateSQL(aux_target, qualify_source(req.create_source),
+			                                                         meta.group_col, meta.sum_col, meta.source_group_expr,
+			                                                         meta.source_sum_expr, replace_aux);
+		         });
 	}
-
 	if (view_model.HasSemiAntiAux()) {
-		add_profile_marker("create_mv_semi_anti_aux");
 		const auto &meta = view_model.semi_anti_aux;
-		string left_source_table = QualifyCreateSourceTable(context, meta.left_table, facts, current_catalog,
-		                                                    current_schema, default_db, default_schema);
-		string right_source_table = QualifyCreateSourceTable(context, meta.right_table, facts, current_catalog,
-		                                                     current_schema, default_db, default_schema);
-		string aux_target = get_aux_state_target(meta.aux_table);
-		string aux_create = BuildSemiAntiAuxStateCreateSQL(
-		    aux_target, left_source_table, meta.left_alias, right_source_table, meta.right_alias, meta.predicate,
-		    meta.post_filter, meta.right_filter, meta.left_cols, meta.left_exprs,
-		    /*replace=*/parse_data_ref.is_replace && !staged_cross_catalog_replace, meta.null_aware,
-		    meta.null_aware_right_expr);
-		ddl.push_back(aux_create);
-		add_cleanup("DROP TABLE IF EXISTS " + internal_catalog_prefix +
-		            KeywordHelper::WriteOptionallyQuoted(meta.aux_table));
-		aux_metadata_ddl.push_back(
-		    BuildUpdateViewJsonSQL("semi_anti_aux_meta_json", RefreshMetadata::SemiAntiAuxMetaToJson(meta), view_name));
+		emit_aux("create_mv_semi_anti_aux", meta.aux_table, "semi_anti_aux_meta_json",
+		         RefreshMetadata::SemiAntiAuxMetaToJson(meta), [&](const string &aux_target) {
+			         return BuildSemiAntiAuxStateCreateSQL(aux_target, qualify_source(meta.left_table), meta.left_alias,
+			                                               qualify_source(meta.right_table), meta.right_alias,
+			                                               meta.predicate, meta.post_filter, meta.right_filter,
+			                                               meta.left_cols, meta.left_exprs, replace_aux,
+			                                               meta.null_aware, meta.null_aware_right_expr);
+		         });
 	}
 
 	// LEFT JOIN pipeline secondary-delta (Larson & Zhou): generate the secondary-delta INSERT once at CREATE
 	// time and store it; refresh appends it between the primary-delta INSERT and the MERGE.
-	if (!leftjoin_secondary_sql.empty()) {
+	if (!leftjoin_secondary.sql.empty()) {
 		add_profile_marker("create_mv_leftjoin_secondary");
-		RefreshMetadata::LeftJoinSecondaryMeta sm;
-		sm.sql = leftjoin_secondary_sql;
-		sm.preserved_cols = leftjoin_preserved_cols;
-		sm.inner_tables = leftjoin_inner_tables;
-		sm.inner_keys = leftjoin_inner_keys;
-		sm.pres_tables = leftjoin_pres_tables;
-		sm.pres_keys = leftjoin_pres_keys;
-		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL("leftjoin_secondary_meta_json",
-		                                                  RefreshMetadata::LeftJoinSecondaryMetaToJson(sm), view_name));
+		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
+		    "leftjoin_secondary_meta_json", RefreshMetadata::LeftJoinSecondaryMetaToJson(leftjoin_secondary), view_name));
 	}
 
 	const auto &source_table_info = facts.source_table_info;
@@ -1638,6 +1475,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		    "view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'");
 	}
 
+	Value files_path_val;
+	const bool has_files_path =
+	    context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull();
+	const string files_path = has_files_path ? files_path_val.ToString() : string();
 	// --- Compiled DDL (MV creation, delta tables, delta view) ---
 	// Physical data table stores all columns (including openivm_* internal cols).
 	// DuckLake-targeted MVs store the data/delta tables in DuckLake and keep only
@@ -1648,7 +1489,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// This diagnostic intentionally reports the exact first heavy statement that
 		// CREATE MV will run. DuckLake-targeted MVs should now write openivm_data_*
 		// directly; if staging reappears, this output makes the extra copy visible.
-		if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
+		if (caller_location_differs) {
 			con.Query("USE " + current_catalog_schema);
 		}
 		string local_initial_load_query = time_travel_pins.StripFrom(context, view_query);
@@ -1667,10 +1508,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		diagnostic += ExplainInitialLoadQuery(con, "EXPLAIN initial_load_statement:", initial_load_statement);
 		Printer::Print(diagnostic);
 
-		Value files_path_val;
-		if (context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull()) {
-			SqlUtils::WriteFile(files_path_val.ToString() + "/openivm_initial_load_explain_" + view_name + ".txt",
-			                    false, diagnostic);
+		if (has_files_path) {
+			SqlUtils::WriteFile(files_path + "/openivm_initial_load_explain_" + view_name + ".txt", false, diagnostic);
 		}
 		if (SqlUtils::GetBoolSetting(context, "openivm_explain_initial_load_only", false)) {
 			ConfigureDDLExecutorResult(result, DDLExecutionMode::CALLER_TRANSACTION);
@@ -1689,7 +1528,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		// metadata remains outside this transaction, as required across catalogs.
 		ddl.push_back("BEGIN TRANSACTION");
 	}
-	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
+	if (caller_location_differs) {
 		ddl.push_back("use " + current_catalog_schema);
 	}
 	if (staged_cross_catalog_replace) {
@@ -1807,8 +1646,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			// objects.
 			ddl.push_back("COMMIT");
 			ddl.push_back("BEGIN TRANSACTION");
-			ddl.push_back(string(OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX) + view_target_catalog + "\t" + published +
-			              "\t" + qdt + "\t" + published_query);
+			ddl.push_back(EncodeDDLOperation(OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX,
+			                                 {view_target_catalog, published, qdt, published_query}));
 		} else {
 			ddl.push_back(string(staged_cross_catalog_replace && !has_downstream_views
 			                         ? "CREATE OR REPLACE TABLE "
@@ -1949,7 +1788,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// system tables (openivm_delta_tables, etc.) resolve correctly. The USE
 	// inserted before `create table qdt as view_query` routed unqualified base
 	// tables through the user's catalog; flip back for the metadata UPDATE below.
-	if (!current_catalog.empty() && (current_catalog != default_db || current_schema != default_schema)) {
+	if (caller_location_differs) {
 		add_profile_marker("create_mv_restore_catalog");
 		ddl.push_back("use " + default_catalog_schema);
 	}
@@ -1963,16 +1802,13 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		ddl.push_back("BEGIN TRANSACTION");
 	}
 	if (staged_cross_catalog_replace) {
-		ddl.push_back("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-		              SqlUtils::EscapeSingleQuotes(view_name) + "'");
-		ddl.push_back("DELETE FROM " + string(openivm::HISTORY_TABLE) + " WHERE view_name = '" +
-		              SqlUtils::EscapeSingleQuotes(view_name) + "'");
+		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::DELTA_TABLES_TABLE, view_name));
+		ddl.push_back(SqlUtils::DeleteViewRowsSQL(openivm::HISTORY_TABLE, view_name));
 	}
 	ddl.insert(ddl.end(), source_metadata_ddl.begin(), source_metadata_ddl.end());
 	ddl.insert(ddl.end(), native_watermark_ddl.begin(), native_watermark_ddl.end());
 
-	add_cleanup("DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	            SqlUtils::EscapeSingleQuotes(view_name) + "'");
+	add_cleanup(SqlUtils::DeleteViewRowsSQL(openivm::DELTA_TABLES_TABLE, view_name));
 
 	// After all tables are created and populated, update DuckLake snapshot IDs
 	// to the current snapshot. This ensures the first refresh only sees changes
@@ -2048,10 +1884,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		add_profile_marker("create_mv_metadata_commit");
 		ddl.push_back("COMMIT");
 	}
-	add_cleanup("DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE child_view = '" +
-	            SqlUtils::EscapeSingleQuotes(view_name) + "'");
-	add_cleanup("DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	            SqlUtils::EscapeSingleQuotes(view_name) + "'");
+	add_cleanup(SqlUtils::DeleteViewRowsSQL(openivm::MV_DEPS_TABLE, view_name, "child_view"));
+	add_cleanup(SqlUtils::DeleteViewRowsSQL(openivm::VIEWS_TABLE, view_name));
 
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Compiled %lu DDL queries for bind phase\n", (unsigned long)ddl.size());
 
@@ -2097,11 +1931,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	}
 
 	// Write reference SQL files if openivm_files_path is set
-	Value files_path_val;
-	if (context.TryGetCurrentSetting("openivm_files_path", files_path_val) && !files_path_val.IsNull()) {
-		string base_path = files_path_val.ToString();
-		SqlUtils::WriteFile(base_path + "/openivm_system_tables.sql", false, system_tables_sql);
-		SqlUtils::WriteFile(base_path + "/openivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
+	if (has_files_path) {
+		SqlUtils::WriteFile(files_path + "/openivm_system_tables.sql", false, system_tables_sql);
+		SqlUtils::WriteFile(files_path + "/openivm_compiled_queries_" + view_name + ".sql", false, compiled_sql);
 	}
 
 	if (archive_enabled) {
@@ -2131,8 +1963,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			archive_ddl = BuildArchiveProgramOperation(archived, mode, default_db, default_schema);
 		}
 		archive_ddl.insert(archive_ddl.begin(),
-		                   string(OPENIVM_DDL_PROFILE_PREFIX) + view_name +
-		                       "\tcreate_mv_archive_compiled_sql\tstatements=" + to_string(archived.statements.size()));
+		                   EncodeDDLOperation(OPENIVM_DDL_PROFILE_PREFIX,
+		                                      {view_name, "create_mv_archive_compiled_sql",
+		                                       "statements=" + to_string(archived.statements.size())}));
 		if (batch_ducklake_creation) {
 			D_ASSERT(ddl.back() == "COMMIT");
 			ddl.insert(ddl.end() - 1, archive_ddl.begin(), archive_ddl.end());
@@ -2186,10 +2019,8 @@ static void AdmitAutocommitCreateSources(ClientContext &context, MaterializedVie
 		Planner planner(context);
 		planner.CreatePlan(select.Copy());
 		InlineCtesIfPresent(context, *planner.binder, planner.plan);
-		const auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-		auto current_catalog =
-		    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
-		auto facts = BuildCreateMVPlanFacts(planner.plan.get(), current_catalog);
+		auto facts =
+		    BuildCreateMVPlanFacts(planner.plan.get(), SqlUtils::SessionDefaultLocation(context).catalog);
 		for (const auto &entry : facts.source_table_info) {
 			if (!facts.ducklake_table_info.count(entry.first)) {
 				const auto &source = entry.second;
@@ -2278,14 +2109,11 @@ static void AppendTrackedViewDropProgram(ClientContext &context, RefreshMetadata
 	for (auto &aux_table : metadata.GetAuxiliaryTables(view_name)) {
 		program += "DROP TABLE IF EXISTS " + internal_prefix + SqlUtils::QuoteIdentifier(aux_table) + ";\n";
 	}
-	program += "DELETE FROM " + string(openivm::REFRESH_HOOKS_TABLE) + " WHERE view_name = '" +
-	           SqlUtils::EscapeValue(view_name) + "';\n";
+	program += SqlUtils::DeleteViewRowsSQL(openivm::REFRESH_HOOKS_TABLE, view_name) + ";\n";
 	program += "DELETE FROM " + string(openivm::MV_DEPS_TABLE) + " WHERE parent_view = '" +
 	           SqlUtils::EscapeValue(view_name) + "' OR child_view = '" + SqlUtils::EscapeValue(view_name) + "';\n";
-	program += "DELETE FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	           SqlUtils::EscapeValue(view_name) + "';\n";
-	program += "DELETE FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	           SqlUtils::EscapeValue(view_name) + "';\n";
+	program += SqlUtils::DeleteViewRowsSQL(openivm::DELTA_TABLES_TABLE, view_name) + ";\n";
+	program += SqlUtils::DeleteViewRowsSQL(openivm::VIEWS_TABLE, view_name) + ";\n";
 	auto view_sources = metadata.GetDeltaSources(view_name, location.catalog_name, location.schema_name);
 	sources.insert(sources.end(), view_sources.begin(), view_sources.end());
 }
@@ -2325,24 +2153,6 @@ static void AppendUnusedSourceDropProgram(ClientContext &context, Connection &co
 			           ";\n";
 		}
 	}
-}
-
-static string ExecuteAutocommitDropProgram(Connection &con, const string &program) {
-	con.BeginTransaction();
-	try {
-		auto result = con.Query(program);
-		if (result->HasError()) {
-			throw CatalogException("OpenIVM DROP cleanup failed: %s", result->GetError());
-		}
-		con.Commit();
-	} catch (std::exception &) {
-		try {
-			con.Rollback();
-		} catch (std::exception &) {
-		}
-		throw;
-	}
-	return "SELECT true AS Success";
 }
 
 using TrackedDropView = pair<MetadataLocation, string>;
@@ -2469,13 +2279,8 @@ struct TrackedDropProgram {
 // TABLE CASCADE and SCHEMA CASCADE remove the same ownership closure. Build one
 // cleanup program before any physical drop, so shared source deltas are tested
 // against the complete set of removed consumers across metadata catalogs.
-static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info, bool defer_native_execution) {
-	unique_ptr<MutationLockGuard> autocommit_guard;
-	if (context.transaction.IsAutoCommit() && !defer_native_execution) {
-		autocommit_guard = make_uniq<MutationLockGuard>(context);
-	} else {
-		TransactionalMVLockState::Get(context).AcquireMutationLock();
-	}
+static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info) {
+	TransactionalMVLockState::Get(context).AcquireMutationLock();
 
 	const bool schema_drop = drop_info.type == CatalogType::SCHEMA_ENTRY;
 	auto drop_statement = [&]() {
@@ -2507,14 +2312,6 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		drop_info.name = table_entry->name;
 		drop_info.catalog = table_entry->ParentCatalog().GetName();
 		drop_info.schema = table_entry->ParentSchema().name;
-		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-		if (drop_info.catalog.empty()) {
-			drop_info.catalog =
-			    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
-		}
-		if (drop_info.schema.empty()) {
-			drop_info.schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
-		}
 
 		// Lifecycle/refresh programs own their internal state cleanup. They are not
 		// source-table deletions and must not produce a second set of retractions.
@@ -2589,10 +2386,7 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		if (!drop_info.cascade) {
 			// Retained MVs must observe removal before a same-named replacement.
 			auto source = SqlUtils::FullName(drop_info.catalog, drop_info.schema, drop_info.name);
-			auto retract = "DELETE FROM " + source + ";\n" + BuildDropTableStatement(drop_info) + ";\n";
-			return context.transaction.IsAutoCommit() && !defer_native_execution
-			           ? ExecuteAutocommitDropProgram(con, retract)
-			           : retract;
+			return "DELETE FROM " + source + ";\n" + BuildDropTableStatement(drop_info) + ";\n";
 		}
 		for (idx_t row = 0; row < dependent_rows->RowCount(); row++) {
 			roots.emplace_back(registry, dependent_rows->GetValue(0, row).ToString());
@@ -2617,14 +2411,9 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 	OPENIVM_DEBUG_PRINT("[DROP] Compiled %s cleanup for '%s', views=%zu, staged=%d\n",
 	                    schema_drop ? "schema" : "source", drop_info.name.c_str(), dependent_views.size(),
 	                    program.staged);
-	if (context.transaction.IsAutoCommit()) {
-		if (program.staged) {
-			ExecuteStagedDDL(context, {Value(program.sql)});
-			return "SELECT true AS Success";
-		}
-		if (!defer_native_execution) {
-			return ExecuteAutocommitDropProgram(con, program.sql);
-		}
+	if (context.transaction.IsAutoCommit() && program.staged) {
+		ExecuteStagedDDL(context, {Value(program.sql)});
+		return "SELECT true AS Success";
 	}
 	auto &state = TransactionalMVMetadataState::Get(context);
 	state.RegisterSQL(program.sql, dependent_views.front());
@@ -2634,14 +2423,13 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 	return program.sql;
 }
 
-static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo &drop_info,
-                                               bool defer_native_execution) {
+static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo &drop_info) {
 	if (drop_info.type == CatalogType::SCHEMA_ENTRY) {
-		return BuildSourceDropProgram(context, drop_info, defer_native_execution);
+		return BuildSourceDropProgram(context, drop_info);
 	}
 	Binder::BindSchemaOrCatalog(context, drop_info.catalog, drop_info.schema);
 	if (drop_info.type == CatalogType::TABLE_ENTRY) {
-		return BuildSourceDropProgram(context, drop_info, defer_native_execution);
+		return BuildSourceDropProgram(context, drop_info);
 	}
 	if (drop_info.type != CatalogType::VIEW_ENTRY) {
 		throw InternalException("OpenIVM DROP rewrite expected DROP VIEW");
@@ -2660,25 +2448,14 @@ static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo 
 		catalog_name = view_entry->ParentCatalog().GetName();
 		schema_name = view_entry->ParentSchema().name;
 	}
-	// INVALID_CATALOG and INVALID_SCHEMA are both "", so these are emptiness checks; spell them that way
-	// (clang-tidy readability-container-size-empty).
-	if (catalog_name.empty() || schema_name.empty()) {
-		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-		if (catalog_name.empty()) {
-			// An unset session catalog is the default database, where CREATE registered the
-			// view; DROP VIEW IF EXISTS must find leftover metadata of an interrupted DROP there.
-			catalog_name =
-			    default_entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : default_entry.catalog;
-		}
-		if (schema_name.empty()) {
-			schema_name = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
-		}
-	}
+	// An unset session catalog is the default database, where CREATE registered the
+	// view; DROP VIEW IF EXISTS must find leftover metadata of an interrupted DROP there.
+	auto session = SqlUtils::SessionDefaultLocation(context);
 	if (catalog_name.empty()) {
-		catalog_name = Catalog::GetSystemCatalog(context).GetName();
+		catalog_name = session.catalog;
 	}
 	if (schema_name.empty()) {
-		schema_name = DEFAULT_SCHEMA;
+		schema_name = session.schema;
 	}
 	drop_info.catalog = catalog_name;
 	drop_info.schema = schema_name;
@@ -2723,9 +2500,8 @@ static string BuildMaterializedViewDropProgram(ClientContext &context, DropInfo 
 		// through the default search-path location. A qualified same-named view
 		// elsewhere is not sufficient proof of ownership.
 		auto &default_entry = ClientData::Get(context).catalog_search_path->GetDefault();
-		string default_schema = default_entry.schema.empty() ? DEFAULT_SCHEMA : default_entry.schema;
 		if (!StringUtil::CIEquals(default_entry.catalog, catalog_name) ||
-		    !StringUtil::CIEquals(default_schema, schema_name)) {
+		    !StringUtil::CIEquals(default_entry.schema, schema_name)) {
 			return program;
 		}
 	}
@@ -2790,7 +2566,7 @@ void BindMaterializedViewLifecycle(PlannerExtensionInput &input, BoundStatement 
 	    drop.type != CatalogType::SCHEMA_ENTRY) {
 		return;
 	}
-	auto program = BuildMaterializedViewDropProgram(input.context, drop, true);
+	auto program = BuildMaterializedViewDropProgram(input.context, drop);
 	OPENIVM_DEBUG_PRINT("[DROP] Binding common lifecycle for native DROP '%s'\n", drop.name.c_str());
 	statement.plan = BindLifecycleProgram(input.context, input.binder, program);
 }

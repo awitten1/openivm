@@ -110,29 +110,6 @@ SnapshotResolver TimeTravelPins::Resolver() const {
 	};
 }
 
-// Copy the quoted run starting at `sql[start]` (whose delimiter is `sql[start]`) into `result`,
-// returning the index just past the closing delimiter. Doubled delimiters escape.
-static idx_t CopyQuotedRun(const string &sql, idx_t start, string &result) {
-	char quote = sql[start];
-	result += quote;
-	idx_t i = start + 1;
-	while (i < sql.size()) {
-		if (sql[i] == quote) {
-			if (i + 1 < sql.size() && sql[i + 1] == quote) {
-				result += quote;
-				result += quote;
-				i += 2;
-				continue;
-			}
-			result += quote;
-			return i + 1;
-		}
-		result += sql[i];
-		i++;
-	}
-	return i;
-}
-
 string TimeTravelPins::StripFrom(ClientContext &context, const string &sql) const {
 	if (pins.empty()) {
 		return sql;
@@ -156,40 +133,6 @@ string TimeTravelPins::StripFrom(ClientContext &context, const string &sql) cons
 	};
 	SqlUtils::VisitSourceReferences(*parser.statements[0], callback);
 	return parser.statements[0]->ToString();
-}
-
-// Copy the `[catalog.][schema.]relation` chain starting at `sql[start]` into `result`, honouring
-// quoted components. Reports the unquoted final component — the relation name pins are keyed by —
-// and whether the chain carried a catalog/schema prefix, which a CTE reference never does.
-static idx_t CopyQualifiedIdentifierChain(const string &sql, idx_t start, string &result, string &final_component,
-                                          bool &qualified) {
-	idx_t i = start;
-	qualified = false;
-	while (true) {
-		if (i < sql.size() && (sql[i] == '"' || sql[i] == '`')) {
-			idx_t quoted_start = result.size();
-			i = CopyQuotedRun(sql, i, result);
-			final_component = result.substr(quoted_start + 1, result.size() - quoted_start - 2);
-		} else if (i < sql.size() && IsIdentStart(sql[i])) {
-			idx_t end = i;
-			while (end < sql.size() && (IsIdentPart(sql[end]) || sql[end] == '$')) {
-				end++;
-			}
-			final_component = sql.substr(i, end - i);
-			result.append(sql, i, end - i);
-			i = end;
-		} else {
-			break;
-		}
-		if (i < sql.size() && sql[i] == '.') {
-			result += '.';
-			i++;
-			qualified = true;
-			continue;
-		}
-		break;
-	}
-	return i;
 }
 
 // Whether `sql` already carries `qualifier` at `pos` (ignoring how its whitespace is spelled), so an
@@ -258,9 +201,9 @@ string TimeTravelPins::QualifySources(ClientContext &context, const string &sql)
 		idx_t components = 1 + !ref.schema_name.empty() + !ref.catalog_name.empty();
 		for (idx_t i = 0; i < components; i++) {
 			end = SkipIgnorableSpan(sql, end);
+			idx_t quoted_end;
 			if (end < sql.size() && sql[end] == '"') {
-				string ignored;
-				end = CopyQuotedRun(sql, end, ignored);
+				end = TryReadSkippableSqlSpan(sql, end, quoted_end) ? quoted_end : sql.size();
 			} else {
 				while (end < sql.size() && !std::isspace(static_cast<unsigned char>(sql[end])) && sql[end] != '.' &&
 				       sql[end] != ',' && sql[end] != ')' && sql[end] != ';' && sql[end] != '/' && sql[end] != '-') {
@@ -347,9 +290,19 @@ string TimeTravelPins::RestoreIntoSql(const string &sql, SqlDialect dialect) con
 			continue;
 		}
 		if (IsIdentStart(c) || c == '"' || c == '`') {
-			string final_component;
-			bool qualified;
-			i = CopyQualifiedIdentifierChain(sql, i, result, final_component, qualified);
+			// The relation name pins are keyed by, and whether a catalog/schema prefix (which a
+			// CTE reference never carries) qualifies it.
+			idx_t chain_end;
+			auto parts = SqlUtils::ReadQualifiedIdentifier(sql, i, chain_end);
+			if (parts.empty()) {
+				// An unterminated quoted identifier runs to the end.
+				result.append(sql, i, string::npos);
+				break;
+			}
+			result.append(sql, i, chain_end - i);
+			i = chain_end;
+			const auto &final_component = parts.back();
+			bool qualified = parts.size() > 1;
 			if (expect_relation) {
 				expect_relation = false;
 				auto entry = pins.find(final_component);
