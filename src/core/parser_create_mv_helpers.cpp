@@ -23,15 +23,7 @@ string SqlCsvLiteralOrNull(const vector<string> &values) {
 	if (values.empty()) {
 		return "null";
 	}
-	string result = "'";
-	for (size_t i = 0; i < values.size(); i++) {
-		if (i > 0) {
-			result += ",";
-		}
-		result += SqlUtils::EscapeSingleQuotes(values[i]);
-	}
-	result += "'";
-	return result;
+	return "'" + StringUtil::Join(values, values.size(), ",", SqlUtils::EscapeSingleQuotes) + "'";
 }
 
 // Read the caller's snapshot, including metadata inserted earlier in this

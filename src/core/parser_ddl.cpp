@@ -953,15 +953,11 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	}
 	OPENIVM_DEBUG_PRINT("[TRANSACTIONAL METADATA] Seed views=%zu, dependency edges=%zu, closure views=%zu\n",
 	                    registered_views.size(), dependency_edge_count, included_views.size());
-	string view_filter;
 	vector<string> sorted_included_views(included_views.begin(), included_views.end());
 	std::sort(sorted_included_views.begin(), sorted_included_views.end());
-	for (auto &view_name : sorted_included_views) {
-		if (!view_filter.empty()) {
-			view_filter += ", ";
-		}
-		view_filter += "'" + SqlUtils::EscapeValue(view_name) + "'";
-	}
+	string view_filter =
+	    StringUtil::Join(sorted_included_views, sorted_included_views.size(), ", ",
+	                     [](const string &view_name) { return "'" + SqlUtils::EscapeValue(view_name) + "'"; });
 	// Keep the complete replayed ownership relations. Independent committed views
 	// can share a source delta without belonging to this dependency closure. DROP
 	// must see those consumers as well as ownership added or removed by this

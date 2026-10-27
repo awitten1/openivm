@@ -107,38 +107,25 @@ static string BuildRestoreRowsSQL(MaterializedQueryResult &rows, const string &t
 	if (key_indexes.size() != key_columns.size()) {
 		throw CatalogException("OpenIVM metadata snapshot of %s lacks its key columns", table_name);
 	}
-	string columns;
-	for (auto &name : rows.names) {
-		if (!columns.empty()) {
-			columns += ", ";
-		}
-		columns += SqlUtils::QuoteIdentifier(name);
-	}
-	string values;
-	string keys;
+	string columns = SqlUtils::JoinQuotedColumns(rows.names);
+	vector<string> row_values;
+	vector<string> row_keys;
 	for (idx_t row = 0; row < rows.RowCount(); row++) {
-		if (!values.empty()) {
-			values += ", ";
-			keys += " OR ";
-		}
-		values += "(";
+		vector<string> cells;
 		for (idx_t col = 0; col < rows.ColumnCount(); col++) {
-			if (col > 0) {
-				values += ", ";
-			}
-			values += rows.GetValue(col, row).ToSQLString();
+			cells.push_back(rows.GetValue(col, row).ToSQLString());
 		}
-		values += ")";
-		keys += "(";
-		for (idx_t key = 0; key < key_indexes.size(); key++) {
-			if (key > 0) {
-				keys += " AND ";
-			}
-			keys += SqlUtils::QuoteIdentifier(rows.names[key_indexes[key]]) + " IS NOT DISTINCT FROM " +
-			        rows.GetValue(key_indexes[key], row).ToSQLString();
-		}
-		keys += ")";
+		row_values.push_back("(" + StringUtil::Join(cells, ", ") + ")");
+		row_keys.push_back("(" +
+		                   StringUtil::Join(key_indexes, key_indexes.size(), " AND ",
+		                                    [&](idx_t col) {
+			                                    return SqlUtils::QuoteIdentifier(rows.names[col]) +
+			                                           " IS NOT DISTINCT FROM " + rows.GetValue(col, row).ToSQLString();
+		                                    }) +
+		                   ")");
 	}
+	string values = StringUtil::Join(row_values, ", ");
+	string keys = StringUtil::Join(row_keys, " OR ");
 	if (native) {
 		return "INSERT OR REPLACE INTO " + table_name + " (" + columns + ") VALUES " + values;
 	}

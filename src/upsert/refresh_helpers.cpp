@@ -697,7 +697,7 @@ bool TryBuildDuckLakeProjectionKeyRefresh(RefreshMetadata &metadata, Connection 
 		return false;
 	}
 
-	string union_sql = StringUtil::Join(arms, arms.size(), " UNION ALL ", [](const string &arm) { return arm; });
+	string union_sql = StringUtil::Join(arms, " UNION ALL ");
 	string qkey = SqlUtils::QuoteIdentifier(lineage.output_col);
 	string affected_sql = "SELECT DISTINCT " + qkey + " FROM (" + union_sql + ") openivm_projection_keys";
 	string temp_affected = SqlUtils::QuoteIdentifier(string(openivm::TEMP_TABLE_PREFIX) + "affected_" + view_name);
@@ -839,12 +839,7 @@ string BuildEmptyDeltaInsert(const string &insert_target, const vector<string> &
 
 string BuildCompactDeltaViewSQL(const string &view_name, const string &delta_view_name,
                                 const vector<string> &column_names, const string &delta_ts_filter) {
-	vector<string> data_columns;
-	for (auto &col : column_names) {
-		if (col != string(openivm::MULTIPLICITY_COL)) {
-			data_columns.push_back(col);
-		}
-	}
+	auto data_columns = SqlUtils::WithoutMultiplicity(column_names);
 	if (data_columns.empty()) {
 		return "";
 	}
@@ -1117,29 +1112,14 @@ static string BuildLeftJoinHybridProjectionRefresh(RefreshMetadata &metadata, co
 	}
 	delta_source += ")";
 
-	string select_columns;
-	string delta_columns;
-	string delete_candidate_columns;
-	string match_conditions;
-	for (auto &raw_col : column_names) {
-		if (raw_col == openivm::MULTIPLICITY_COL) {
-			continue;
-		}
-		string col = KeywordHelper::WriteOptionallyQuoted(raw_col);
-		if (!select_columns.empty()) {
-			select_columns += ", ";
-			delta_columns += ", ";
-			delete_candidate_columns += ", ";
-			match_conditions += " AND ";
-		}
-		select_columns += col;
-		delta_columns += "openivm_delta." + col;
-		delete_candidate_columns += "openivm_target." + col + " AS " + col;
-		match_conditions += "openivm_target." + col + " IS NOT DISTINCT FROM openivm_net." + col;
-	}
-	if (select_columns.empty()) {
+	auto data_columns = SqlUtils::WithoutMultiplicity(column_names);
+	if (data_columns.empty()) {
 		return "";
 	}
+	string select_columns = SqlUtils::JoinQuotedColumns(data_columns);
+	string delta_columns = SqlUtils::JoinQualifiedQuotedColumns(data_columns, "openivm_delta");
+	string delete_candidate_columns = SqlUtils::JoinQualifiedAliasedColumns(data_columns, "openivm_target");
+	string match_conditions = SqlUtils::BuildNullSafeMatch(data_columns, "openivm_target", "openivm_net");
 
 	string transition_query;
 	if (!nullable_side_quiet) {
@@ -1297,16 +1277,7 @@ static string BuildLeftJoinProjectionRefresh(RefreshMetadata &metadata, const st
 		return pushed_refresh;
 	}
 
-	string select_columns;
-	for (auto &raw_col : column_names) {
-		if (raw_col == openivm::MULTIPLICITY_COL) {
-			continue;
-		}
-		if (!select_columns.empty()) {
-			select_columns += ", ";
-		}
-		select_columns += KeywordHelper::WriteOptionallyQuoted(raw_col);
-	}
+	string select_columns = SqlUtils::JoinQuotedColumns(SqlUtils::WithoutMultiplicity(column_names));
 	string append_where = delta_ts_filter.empty() ? " WHERE " : " WHERE " + delta_ts_filter + " AND ";
 	append_where += mul + " > 0 AND NOT (" + negative_delta_guard + ")";
 	string append_sql = "INSERT INTO " + data_table + " SELECT " + select_columns + "\nFROM " + qdv +
@@ -1402,16 +1373,10 @@ void AppendSimpleAggregateEmptySourceNulling(RefreshMetadata &metadata, string &
 		}
 		string source = SqlUtils::QuoteIdentifier(catalog_name) + "." + SqlUtils::QuoteIdentifier(schema_name) + "." +
 		                SqlUtils::QuoteIdentifier(base_name);
-		string null_cols;
-		for (auto &col : column_names) {
-			if (col == string(openivm::MULTIPLICITY_COL)) {
-				continue;
-			}
-			if (!null_cols.empty()) {
-				null_cols += ", ";
-			}
-			null_cols += KeywordHelper::WriteOptionallyQuoted(col) + " = NULL";
-		}
+		auto data_columns = SqlUtils::WithoutMultiplicity(column_names);
+		string null_cols = StringUtil::Join(data_columns, data_columns.size(), ", ", [](const string &col) {
+			return SqlUtils::QuoteIdentifier(col) + " = NULL";
+		});
 		upsert_query += "UPDATE " + data_table + " SET " + null_cols + " WHERE NOT EXISTS (SELECT 1 FROM " + source +
 		                " LIMIT 1);\n";
 	}

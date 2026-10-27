@@ -1155,14 +1155,9 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	case RefreshType::FULL_REFRESH: {
 		string full_recompute_query = view_query_sql;
 		if (active_facts.target_dialect == SqlDialect::SPARK) {
-			vector<string> output_names;
-			for (auto &column_name : column_names) {
-				if (column_name != string(openivm::MULTIPLICITY_COL)) {
-					output_names.push_back(column_name);
-				}
-			}
-			full_recompute_query = RenderStoredViewQueryForDialect(con, view_query_sql, output_names,
-			                                                       active_facts.target_dialect, view_time_travel_pins);
+			full_recompute_query =
+			    RenderStoredViewQueryForDialect(con, view_query_sql, SqlUtils::WithoutMultiplicity(column_names),
+			                                    active_facts.target_dialect, view_time_travel_pins);
 		}
 		// Invariant: like the non-cascade recompute path in BuildRecomputeQuery, this path passes the
 		// data table's unique keys so the recompute upserts instead of deleting and re-inserting them.
@@ -1232,13 +1227,7 @@ string GenerateRefreshSQL(ClientContext &context, const string &view_catalog_nam
 	auto build_snapshot_companion = [&]() {
 		auto rows = BuildSignedRowLists(column_names);
 		string snapshot = KeywordHelper::WriteOptionallyQuoted(string(openivm::TEMP_TABLE_PREFIX) + view_name);
-		vector<string> user_columns;
-		for (auto &col : column_names) {
-			if (col != openivm::MULTIPLICITY_COL) {
-				user_columns.push_back(col);
-			}
-		}
-		string user_cols = SqlUtils::JoinQuotedColumns(user_columns);
+		string user_cols = SqlUtils::JoinQuotedColumns(SqlUtils::WithoutMultiplicity(column_names));
 		pre_companion = "CREATE OR REPLACE TEMP TABLE " + snapshot + " AS SELECT * FROM " + data_table + ";\n";
 		post_companion = BuildDeltaResetSQL(delta_view_name, delta_ts_filter) + "INSERT INTO " + delta_view_name +
 		                 " (" + rows.columns + ") SELECT " + rows.old_rows + " FROM (SELECT " + user_cols + " FROM " +
