@@ -39,16 +39,6 @@ void PopulateDuckLakeChangeScanParameters(LogicalGet &get) {
 	                  Value::BIGINT(static_cast<int64_t>(info.snapshot.snapshot_id))};
 }
 
-static bool CompactDeltasEnabled(ClientContext &context) {
-	Value compact_val;
-	// A present NULL setting is treated like absence; negating this guard only attempts to cast NULL to bool.
-	if (context.TryGetCurrentSetting("openivm_compact_deltas", compact_val) &&
-	    !compact_val.IsNull()) { // mull-ignore: cxx_remove_negation
-		return compact_val.GetValue<bool>();
-	}
-	return true;
-}
-
 static DeltaGetResult RemapDeltaNode(ClientContext &context, unique_ptr<LogicalOperator> delta_node,
                                      idx_t output_table_index, ColumnBinding mul_binding) {
 	auto input_bindings = delta_node->GetColumnBindings();
@@ -270,7 +260,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Connection
 	union_op->types = union_types;
 
 	ColumnBinding mul_binding(union_op->GetColumnBindings().back());
-	if (!CompactDeltasEnabled(context)) {
+	if (!SqlUtils::GetBoolSetting(context, "openivm_compact_deltas", true)) {
 		OPENIVM_DEBUG_PRINT("[DuckLake] Delta compaction disabled\n");
 		return RemapDeltaNode(context, std::move(union_op), old_get->table_index, mul_binding);
 	}
@@ -421,7 +411,7 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Connection &con, Binde
 	OPENIVM_DEBUG_PRINT("[CreateDeltaGet] Delta table: %s, mul_binding: table=%lu col=%lu, columns: %zu\n",
 	                    table_name.c_str(), (unsigned long)new_mul_binding.table_index,
 	                    (unsigned long)new_mul_binding.column_index, delta_get_node->GetColumnIds().size());
-	if (CompactDeltasEnabled(context)) {
+	if (SqlUtils::GetBoolSetting(context, "openivm_compact_deltas", true)) {
 		return CompactDeltaNode(context, binder, std::move(delta_get_node), old_get->table_index, new_mul_binding);
 	}
 	return {std::move(delta_get_node), new_mul_binding};
