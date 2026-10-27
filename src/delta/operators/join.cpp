@@ -549,17 +549,9 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 		throw InternalException("DeltaJoin: affected-key position %llu is outside %llu bindings", key_pos,
 		                        affected_bindings.size());
 	}
-	auto affected_group_index = binder.GenerateTableIndex();
-	auto affected_aggregate_index = binder.GenerateTableIndex();
-	auto affected_keys =
-	    make_uniq<LogicalAggregate>(affected_group_index, affected_aggregate_index, vector<unique_ptr<Expression>>());
-	affected_keys->groups.push_back(make_uniq<BoundColumnRefExpression>(key_type, affected_bindings[key_pos]));
-	affected_keys->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(key_type)));
-	GroupingSet affected_grouping_set;
-	affected_grouping_set.insert(0);
-	affected_keys->grouping_sets.push_back(std::move(affected_grouping_set));
-	affected_keys->children.push_back(std::move(affected_delta.op));
-	affected_keys->ResolveOperatorTypes();
+	vector<unique_ptr<Expression>> affected_groups;
+	affected_groups.push_back(make_uniq<BoundColumnRefExpression>(key_type, affected_bindings[key_pos]));
+	auto affected_keys = MakeGroupedAggregate(binder, std::move(affected_groups), {}, std::move(affected_delta.op));
 	ColumnBinding affected_key_binding = affected_keys->GetColumnBindings()[0];
 
 	// Fresh scan of the SAME base table (current/post-delta state), filtered to
@@ -581,22 +573,12 @@ static unique_ptr<TransitioningKeySet> BuildTransitioningKeySetImpl(ClientContex
 	                                      std::move(affected_keys), std::move(affected_condition));
 	affected_base->ResolveOperatorTypes();
 
-	auto group_index = binder.GenerateTableIndex();
-	auto aggregate_index = binder.GenerateTableIndex();
-	auto count_func = BindAggregateByName(context, "count_star", {});
-	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), vector<unique_ptr<Expression>>(),
-	                                                      nullptr, nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = "current_count";
+	vector<unique_ptr<Expression>> base_groups;
+	base_groups.push_back(make_uniq<BoundColumnRefExpression>(key_type, base_key_source_binding));
 	vector<unique_ptr<Expression>> aggregates;
-	aggregates.push_back(std::move(count_expr));
-	auto base_agg = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
-	base_agg->groups.push_back(make_uniq<BoundColumnRefExpression>(key_type, base_key_source_binding));
-	base_agg->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(key_type)));
-	GroupingSet base_grouping_set;
-	base_grouping_set.insert(0);
-	base_agg->grouping_sets.push_back(std::move(base_grouping_set));
-	base_agg->children.push_back(std::move(affected_base));
-	base_agg->ResolveOperatorTypes();
+	aggregates.push_back(MakeCountStar("current_count"));
+	auto base_agg =
+	    MakeGroupedAggregate(binder, std::move(base_groups), std::move(aggregates), std::move(affected_base));
 	auto base_agg_bindings = base_agg->GetColumnBindings();
 	ColumnBinding base_key_binding = base_agg_bindings[0];
 	ColumnBinding base_count_binding = base_agg_bindings[1];

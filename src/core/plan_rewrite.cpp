@@ -84,23 +84,11 @@ static bool RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
 
 	vector<unique_ptr<Expression>> aggregates;
 	aggregates.push_back(MakeCountStar(openivm::DISTINCT_COUNT_COL));
-
-	idx_t group_index = binder.GenerateTableIndex();
-	idx_t aggregate_index = binder.GenerateTableIndex();
-
-	auto agg_node = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
-
-	GroupingSet grouping_set;
+	vector<unique_ptr<Expression>> groups;
 	for (idx_t i = 0; i < child_bindings.size(); i++) {
-		auto group_expr = make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]);
-		grouping_set.insert(agg_node->groups.size());
-		agg_node->groups.push_back(std::move(group_expr));
-		agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(child_types[i])));
+		groups.push_back(make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]));
 	}
-	agg_node->grouping_sets.push_back(std::move(grouping_set));
-
-	agg_node->children.push_back(std::move(child));
-	agg_node->ResolveOperatorTypes();
+	auto agg_node = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(child));
 
 	OPENIVM_DEBUG_PRINT("[PlanRewrite] DISTINCT → AGGREGATE + COUNT(*), %zu groups\n", agg_node->groups.size());
 	node = std::move(agg_node);

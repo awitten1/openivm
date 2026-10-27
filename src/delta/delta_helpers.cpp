@@ -107,29 +107,16 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
 	}
 	idx_t base_col_count = input_bindings.size() - 1;
 
-	auto group_index = binder.GenerateTableIndex();
-	auto aggregate_index = binder.GenerateTableIndex();
-
-	vector<unique_ptr<Expression>> sum_args;
-	sum_args.push_back(make_uniq<BoundColumnRefExpression>(input_types[base_col_count], mul_binding));
-	auto sum_func = BindAggregateByName(context, "sum", {input_types[base_col_count]});
-	auto sum_expr = make_uniq<BoundAggregateExpression>(std::move(sum_func), std::move(sum_args), nullptr, nullptr,
-	                                                    AggregateType::NON_DISTINCT);
-	sum_expr->alias = openivm::MULTIPLICITY_COL;
-
 	vector<unique_ptr<Expression>> aggregates;
-	aggregates.push_back(std::move(sum_expr));
-	auto aggregate = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
-	GroupingSet grouping_set;
+	aggregates.push_back(MakeAggregate(context, "sum",
+	                                   make_uniq<BoundColumnRefExpression>(input_types[base_col_count], mul_binding),
+	                                   openivm::MULTIPLICITY_COL));
+	vector<unique_ptr<Expression>> groups;
 	// The <= mutant includes the multiplicity aggregate itself as a grouping key.
 	for (idx_t i = 0; i < base_col_count; i++) { // mull-ignore: cxx_lt_to_le
-		aggregate->groups.push_back(make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
-		aggregate->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(input_types[i])));
-		grouping_set.insert(i);
+		groups.push_back(make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
 	}
-	aggregate->grouping_sets.push_back(std::move(grouping_set));
-	aggregate->children.push_back(std::move(delta_node));
-	aggregate->ResolveOperatorTypes();
+	auto aggregate = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(delta_node));
 
 	auto agg_bindings = aggregate->GetColumnBindings();
 	auto agg_types = aggregate->types;

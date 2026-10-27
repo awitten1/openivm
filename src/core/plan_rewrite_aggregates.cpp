@@ -8,6 +8,7 @@
 #include "duckdb/function/function_binder.hpp"
 #include "duckdb/function/aggregate/distributive_functions.hpp"
 #include "duckdb/optimizer/optimizer.hpp"
+#include "duckdb/planner/binder.hpp"
 #include "duckdb/planner/column_binding_map.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_case_expression.hpp"
@@ -53,6 +54,24 @@ unique_ptr<BoundAggregateExpression> MakeCountStar(const string &alias) {
 	auto result = make_uniq<BoundAggregateExpression>(CountStarFun::GetFunction(), vector<unique_ptr<Expression>>(),
 	                                                  nullptr, nullptr, AggregateType::NON_DISTINCT);
 	result->alias = alias;
+	return result;
+}
+
+unique_ptr<LogicalAggregate> MakeGroupedAggregate(Binder &binder, vector<unique_ptr<Expression>> groups,
+                                                  vector<unique_ptr<Expression>> aggregates,
+                                                  unique_ptr<LogicalOperator> child) {
+	auto group_index = binder.GenerateTableIndex();
+	auto aggregate_index = binder.GenerateTableIndex();
+	auto result = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
+	GroupingSet grouping_set;
+	for (auto &group : groups) {
+		grouping_set.insert(result->groups.size());
+		result->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(group->return_type)));
+		result->groups.push_back(std::move(group));
+	}
+	result->grouping_sets.push_back(std::move(grouping_set));
+	result->children.push_back(std::move(child));
+	result->ResolveOperatorTypes();
 	return result;
 }
 
