@@ -7,7 +7,7 @@
 
 namespace duckdb {
 
-#define OPENIVM_DELTA_STRATEGY_REASONS(X)                                                                             \
+#define OPENIVM_DELTA_STRATEGY_REASONS(X)                                                                              \
 	X(UNION_OVER_AGGREGATE)                                                                                            \
 	X(UNION_DISTINCT_GROUP_RECOMPUTE)                                                                                  \
 	X(JOIN_KEY_GROUP_FALLBACK)                                                                                         \

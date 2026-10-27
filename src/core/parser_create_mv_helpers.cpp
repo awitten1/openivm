@@ -213,8 +213,8 @@ string CreateMetadataTableSQL(const string &table, const string &target, bool re
 			columns.push_back(column.definition);
 		}
 	}
-	return "create table if not exists " + (target.empty() ? table : target) + " (" +
-	       StringUtil::Join(columns, ", ") + ")";
+	return "create table if not exists " + (target.empty() ? table : target) + " (" + StringUtil::Join(columns, ", ") +
+	       ")";
 }
 
 string CreateMVDependenciesSQL() {
@@ -245,8 +245,8 @@ vector<string> HasJoinBackfillSQL() {
 static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalog, const string &schema,
                                     vector<string> &ddl, bool remote) {
 	OPENIVM_DEBUG_PRINT("[CREATE] Checking metadata schema in %s.%s\n", catalog.c_str(), schema.c_str());
-	vector<string> tables = {openivm::MV_DEPS_TABLE,       openivm::VIEWS_TABLE,   openivm::REFRESH_HOOKS_TABLE,
-	                         openivm::DELTA_TABLES_TABLE,  openivm::HISTORY_TABLE, openivm::PROFILE_TABLE};
+	vector<string> tables = {openivm::MV_DEPS_TABLE,      openivm::VIEWS_TABLE,   openivm::REFRESH_HOOKS_TABLE,
+	                         openivm::DELTA_TABLES_TABLE, openivm::HISTORY_TABLE, openivm::PROFILE_TABLE};
 	if (remote) {
 		// Clients sharing remote metadata serialize refreshes per view through a lease.
 		tables.push_back(openivm::REFRESH_LEASE_TABLE);

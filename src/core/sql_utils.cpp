@@ -917,8 +917,7 @@ string SqlUtils::FindTableReferenceOccurrence(const string &sql, const string &t
 	return sql.substr(match.start, match.end - match.start);
 }
 
-static string ReplaceMatches(const string &sql, const vector<TableReferenceMatch> &matches,
-                             const string &replacement) {
+static string ReplaceMatches(const string &sql, const vector<TableReferenceMatch> &matches, const string &replacement) {
 	string result;
 	idx_t last = 0;
 	for (auto &match : matches) {

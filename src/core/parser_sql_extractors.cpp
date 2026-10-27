@@ -365,9 +365,10 @@ bool ExtractSemiAntiQuery(const string &sql, SemiAntiExtract &out) {
 	auto original_right_alias = meta.right_alias;
 	meta.right_alias = "openivm_right";
 	out.left_key_col = "openivm_saj_key";
-	out.left_key_expr = simple_left ? RenameQualifier(*subquery->child, meta.left_table, meta.left_alias, meta.left_alias)
-	                                : SqlUtils::QuoteIdentifier(meta.left_alias) + "." +
-	                                      SqlUtils::QuoteIdentifier(subquery->child->GetName());
+	out.left_key_expr =
+	    simple_left
+	        ? RenameQualifier(*subquery->child, meta.left_table, meta.left_alias, meta.left_alias)
+	        : SqlUtils::QuoteIdentifier(meta.left_alias) + "." + SqlUtils::QuoteIdentifier(subquery->child->GetName());
 	out.right_key_expr =
 	    RenameQualifier(*right->select_list[0], meta.right_table, original_right_alias, meta.right_alias);
 	meta.predicate = out.left_key_expr + " = " + out.right_key_expr;

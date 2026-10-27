@@ -624,9 +624,10 @@ bool RefreshMetadata::ReadViewBool(const string &view_name, const string &column
 }
 
 Value RefreshMetadata::ReadDeltaValue(const string &view_name, const string &table_name, const string &column) {
-	auto result = con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " +
-	                        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = " +
-	                        Value(view_name).ToSQLString() + " AND table_name = " + Value(table_name).ToSQLString());
+	auto result =
+	    con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::DELTA_TABLES_TABLE) +
+	              " WHERE view_name = " + Value(view_name).ToSQLString() +
+	              " AND table_name = " + Value(table_name).ToSQLString());
 	return result->HasError() || result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
 }
 

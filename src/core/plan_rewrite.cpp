@@ -1216,8 +1216,8 @@ static void PropagateBindingThroughOperatorPath(unique_ptr<LogicalOperator> &pla
 	for (auto &entry : path) {
 		if (entry.op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
 			bool appended = false;
-			current = ExposeBindingInProjection(entry.op->Cast<LogicalProjection>(), current, type, string(), true,
-			                                    appended);
+			current =
+			    ExposeBindingInProjection(entry.op->Cast<LogicalProjection>(), current, type, string(), true, appended);
 		} else if (entry.op->type == LogicalOperatorType::LOGICAL_FILTER) {
 			auto &filter = entry.op->Cast<LogicalFilter>();
 			if (!filter.projection_map.empty()) {
@@ -1486,7 +1486,8 @@ static void RunRewritePipeline(PlanRewriteContext &rewrite_context) {
 	const PlanRewritePassEntry passes[] = {
 	    {"inline_cte_refs", [](PlanRewriteContext &c) { InlineCteRefs(c.context, c.binder, c.plan); },
 	     &PlanRewriteNeeds::inline_cte_refs},
-	    {"fold_constant_scalar_subqueries", [](PlanRewriteContext &c) { FoldConstantScalarSubqueries(c.context, c.plan); },
+	    {"fold_constant_scalar_subqueries",
+	     [](PlanRewriteContext &c) { FoldConstantScalarSubqueries(c.context, c.plan); },
 	     &PlanRewriteNeeds::fold_constant_scalar_subqueries},
 	    {"aggregate_filters", [](PlanRewriteContext &c) { RewriteAggregateFilters(c.context, c.plan); },
 	     &PlanRewriteNeeds::aggregate_filters},
@@ -1725,7 +1726,8 @@ struct OutputExpressionRenderer {
 			if (!Render(*cast.child, child_sql)) {
 				return false;
 			}
-			sql = string(cast.try_cast ? "TRY_CAST(" : "CAST(") + child_sql + " AS " + cast.return_type.ToString() + ")";
+			sql =
+			    string(cast.try_cast ? "TRY_CAST(" : "CAST(") + child_sql + " AS " + cast.return_type.ToString() + ")";
 			return true;
 		}
 		case ExpressionClass::BOUND_AGGREGATE: {

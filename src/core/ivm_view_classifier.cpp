@@ -529,18 +529,14 @@ static void AttachAuxRequirements(DeltaViewModel &model, const DeltaViewModelInp
 
 const char *DeltaStrategyReasonName(DeltaStrategyReason reason) {
 #define OPENIVM_STRATEGY_REASON_CASE(name) OPENIVM_ENUM_NAME_CASE(DeltaStrategyReason, name)
-	switch (reason) {
-		OPENIVM_DELTA_STRATEGY_REASONS(OPENIVM_STRATEGY_REASON_CASE)
-	}
+	switch (reason) { OPENIVM_DELTA_STRATEGY_REASONS(OPENIVM_STRATEGY_REASON_CASE) }
 #undef OPENIVM_STRATEGY_REASON_CASE
 	return "UNKNOWN";
 }
 
 const char *DeltaModelNodeKindName(DeltaModelNodeKind kind) {
 #define OPENIVM_NODE_KIND_CASE(name) OPENIVM_ENUM_NAME_CASE(DeltaModelNodeKind, name)
-	switch (kind) {
-		OPENIVM_DELTA_MODEL_NODE_KINDS(OPENIVM_NODE_KIND_CASE)
-	}
+	switch (kind) { OPENIVM_DELTA_MODEL_NODE_KINDS(OPENIVM_NODE_KIND_CASE) }
 #undef OPENIVM_NODE_KIND_CASE
 	return "OTHER";
 }
@@ -629,7 +625,8 @@ DeltaViewModel BuildDeltaViewModel(const DeltaViewModelInput &input) {
 	const bool has_unsupported_construct = HasUnsupportedConstruct(model, facts, input);
 	const bool has_nonredundant_distinct =
 	    analysis.found_distinct && (!input.has_top_level_redundant_distinct || facts.has_descendant_distinct);
-	const bool distinct_stateful = !has_unsupported_construct && input.distinct_aux_candidate && has_nonredundant_distinct;
+	const bool distinct_stateful =
+	    !has_unsupported_construct && input.distinct_aux_candidate && has_nonredundant_distinct;
 	const bool semi_anti_stateful = !has_unsupported_construct && input.semi_anti_aux_candidate;
 	SelectRefreshType(model, analysis, input, has_nonredundant_distinct, distinct_stateful, semi_anti_stateful);
 	SelectGroupRecomputeAffectedMode(model, input);

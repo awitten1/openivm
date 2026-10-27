@@ -14,8 +14,8 @@ namespace MetadataJson {
 // stored metadata may contain raw control characters that a strict parser rejects.
 
 inline void SkipSpace(const string &json, size_t &pos, bool skip_commas = false) {
-	while (pos < json.size() && (std::isspace(static_cast<unsigned char>(json[pos])) ||
-	                             (skip_commas && json[pos] == ','))) {
+	while (pos < json.size() &&
+	       (std::isspace(static_cast<unsigned char>(json[pos])) || (skip_commas && json[pos] == ','))) {
 		pos++;
 	}
 }

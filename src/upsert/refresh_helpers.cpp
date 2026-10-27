@@ -1431,9 +1431,9 @@ ResolvedViewCatalog ResolveViewCatalogFromContext(ClientContext &context, Connec
 	if (parts.empty() || parts.size() > 3) {
 		throw InvalidInputException("Invalid materialized view name '%s'; use [catalog.][schema.]view", view_name);
 	}
-	auto &entry = ClientData::Get(context).catalog_search_path->GetDefault();
-	resolved.view_catalog_name = entry.catalog.empty() ? DatabaseManager::GetDefaultDatabase(context) : entry.catalog;
-	resolved.view_schema_name = entry.schema.empty() ? DEFAULT_SCHEMA : entry.schema;
+	auto session = SqlUtils::SessionDefaultLocation(context);
+	resolved.view_catalog_name = session.catalog;
+	resolved.view_schema_name = session.schema;
 	auto name = parts.back();
 	if (parts.size() == 3) {
 		resolved.view_catalog_name = parts[0];

@@ -586,8 +586,8 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			auto ddl_start = std::chrono::steady_clock::now();
 			DeltaSchemaDDL derived;
 			try {
-				derived = BuildCreateDeltaFromDataSQL(*conn, operation.delta_table, operation.data_table,
-				                                      operation.replace);
+				derived =
+				    BuildCreateDeltaFromDataSQL(*conn, operation.delta_table, operation.data_table, operation.replace);
 			} catch (std::exception &ex) {
 				profiler.AddStep(current_profile_step, ddl_start,
 				                 current_profile_detail + "; delta_schema_derivation_failed=true");
@@ -1486,9 +1486,8 @@ vector<string> RenderTransactionalStatement(const string &input, const string &m
 		if (!ParseCreateDeltaOperation(statement, operation)) {
 			throw InternalException("Malformed OpenIVM delta-schema operation");
 		}
-		return {"SELECT true FROM openivm_create_delta_from_data(" + Value(operation.delta_table).ToSQLString() +
-		        ", " + Value(operation.data_table).ToSQLString() + ", " + (operation.replace ? "true" : "false") +
-		        ")"};
+		return {"SELECT true FROM openivm_create_delta_from_data(" + Value(operation.delta_table).ToSQLString() + ", " +
+		        Value(operation.data_table).ToSQLString() + ", " + (operation.replace ? "true" : "false") + ")"};
 	}
 	try {
 		Parser parser;
@@ -1618,7 +1617,8 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 				profile_rows.push_back(std::move(profile_op));
 			} else if (profile_enabled) {
 				finish_profile_marker();
-				pending_profile = make_uniq<pair<ProfileOperation, idx_t>>(std::move(profile_op), logical_statement_count);
+				pending_profile =
+				    make_uniq<pair<ProfileOperation, idx_t>>(std::move(profile_op), logical_statement_count);
 			}
 			continue;
 		}

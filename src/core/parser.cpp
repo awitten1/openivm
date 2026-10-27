@@ -153,8 +153,8 @@ static void DebugPrintDeltaViewModel(const DeltaViewModel &view_model, const Pla
 #if OPENIVM_DEBUG
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Detected IVM type: %s (aggregation=%d, "
 	                    "projection=%d, group_cols=%zu)\n",
-	                    RefreshTypeName(view_model.type), (int)analysis.found_aggregation, (int)analysis.found_projection,
-	                    group_column_count);
+	                    RefreshTypeName(view_model.type), (int)analysis.found_aggregation,
+	                    (int)analysis.found_projection, group_column_count);
 	for (auto reason : view_model.strategy_reasons) {
 		OPENIVM_DEBUG_PRINT("[CREATE MV] Strategy reason: %s\n", DeltaStrategyReasonName(reason));
 	}
@@ -291,8 +291,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// A view inside the remote metadata catalog would share its database with the
 	// metadata and skip the split protocol; that execution model is not validated.
 	if (metadata_location.explicit_placement && !metadata_location.catalog_type.empty() &&
-	    !metadata_location.IsNative() &&
-	    StringUtil::CIEquals(metadata_location.catalog, target.catalog_name)) {
+	    !metadata_location.IsNative() && StringUtil::CIEquals(metadata_location.catalog, target.catalog_name)) {
 		throw NotImplementedException("Cannot create materialized view in '%s': it is the remote OpenIVM metadata "
 		                              "catalog. Create the view in a native DuckDB or DuckLake catalog; only its "
 		                              "metadata is stored in %s.",
@@ -382,8 +381,7 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// best-effort pretty-printer and has segfaulted on set-operation query nodes with
 	// incomplete CTE/query internals. LPTS remains the normalized serializer below
 	// for supported logical plans; this string is only the safe fallback input.
-	auto original_view_query =
-	    openivm::TimeTravelPins::QualifySources(context, parse_data_ref.view_query);
+	auto original_view_query = openivm::TimeTravelPins::QualifySources(context, parse_data_ref.view_query);
 	OPENIVM_DEBUG_PRINT("[CREATE MV] Internal objects for %s use %s.%s\n", view_name.c_str(),
 	                    internal_target_catalog.c_str(), internal_target_schema.c_str());
 	string data_table = IncrementalTableNames::DataTableName(view_name);
@@ -678,11 +676,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		string group_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.group_col);
 		string sum_q = KeywordHelper::WriteOptionallyQuoted(filtered_group_count_extract.sum_col);
 		filtered_group_count_aux_candidate = {
-		    {aux_table,
-		     qualify_source(filtered_group_count_extract.source),
-		     filtered_group_count_extract.group_col, filtered_group_count_extract.sum_col, group_q, sum_q,
-		     filtered_group_count_extract.output_col, filtered_group_count_extract.comparison_op,
-		     filtered_group_count_extract.threshold_sql},
+		    {aux_table, qualify_source(filtered_group_count_extract.source), filtered_group_count_extract.group_col,
+		     filtered_group_count_extract.sum_col, group_q, sum_q, filtered_group_count_extract.output_col,
+		     filtered_group_count_extract.comparison_op, filtered_group_count_extract.threshold_sql},
 		    filtered_group_count_extract.source};
 		model_input.filtered_group_count_aux_candidate = &filtered_group_count_aux_candidate;
 	}
@@ -883,14 +879,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 				auto aux_columns = candidate_group_columns;
 				aux_columns.push_back("_count");
 				cd_extract.distinct_col = UniqueInternalColumnName(aux_columns, cd_extract.distinct_col);
-				count_distinct_aux_candidate = {"openivm_aux_" + view_name,
-				                                qualify_source(cd_extract.source),
-				                                candidate_group_columns,
-				                                cd_extract.group_exprs,
-				                                cd_extract.distinct_col,
-				                                cd_extract.distinct_expr,
-				                                cd_extract.output_col,
-				                                cd_extract.filter};
+				count_distinct_aux_candidate = {"openivm_aux_" + view_name, qualify_source(cd_extract.source),
+				                                candidate_group_columns,    cd_extract.group_exprs,
+				                                cd_extract.distinct_col,    cd_extract.distinct_expr,
+				                                cd_extract.output_col,      cd_extract.filter};
 				model_input.count_distinct_aux_candidate = &count_distinct_aux_candidate;
 			} else {
 				OPENIVM_DEBUG_PRINT("[CREATE MV] COUNT_DISTINCT_INCREMENTAL extractor failed — demoting to "
@@ -987,8 +979,8 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		ddl.push_back(EncodeDDLOperation(OPENIVM_DDL_PROFILE_PREFIX, {view_name, step_name, detail}));
 	};
 	auto add_profile_record = [&](const string &step_name, int64_t duration_ms, const string &detail = string()) {
-		ddl.push_back(
-		    EncodeDDLOperation(OPENIVM_DDL_PROFILE_RECORD_PREFIX, {view_name, step_name, to_string(duration_ms), detail}));
+		ddl.push_back(EncodeDDLOperation(OPENIVM_DDL_PROFILE_RECORD_PREFIX,
+		                                 {view_name, step_name, to_string(duration_ms), detail}));
 	};
 	auto get_aux_state_target = [&](const string &aux_table) {
 		auto existing = aux_state_targets.find(aux_table);
@@ -1269,20 +1261,19 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 		const auto &meta = req.meta;
 		emit_aux("create_mv_filtered_group_count_aux", meta.aux_table, "aggregate_decomposition_json",
 		         RefreshMetadata::FilteredGroupCountAuxMetaToJson(meta), [&](const string &aux_target) {
-			         return BuildFilteredGroupCountAuxStateCreateSQL(aux_target, qualify_source(req.create_source),
-			                                                         meta.group_col, meta.sum_col, meta.source_group_expr,
-			                                                         meta.source_sum_expr, replace_aux);
+			         return BuildFilteredGroupCountAuxStateCreateSQL(
+			             aux_target, qualify_source(req.create_source), meta.group_col, meta.sum_col,
+			             meta.source_group_expr, meta.source_sum_expr, replace_aux);
 		         });
 	}
 	if (view_model.HasSemiAntiAux()) {
 		const auto &meta = view_model.semi_anti_aux;
 		emit_aux("create_mv_semi_anti_aux", meta.aux_table, "semi_anti_aux_meta_json",
 		         RefreshMetadata::SemiAntiAuxMetaToJson(meta), [&](const string &aux_target) {
-			         return BuildSemiAntiAuxStateCreateSQL(aux_target, qualify_source(meta.left_table), meta.left_alias,
-			                                               qualify_source(meta.right_table), meta.right_alias,
-			                                               meta.predicate, meta.post_filter, meta.right_filter,
-			                                               meta.left_cols, meta.left_exprs, replace_aux,
-			                                               meta.null_aware, meta.null_aware_right_expr);
+			         return BuildSemiAntiAuxStateCreateSQL(
+			             aux_target, qualify_source(meta.left_table), meta.left_alias, qualify_source(meta.right_table),
+			             meta.right_alias, meta.predicate, meta.post_filter, meta.right_filter, meta.left_cols,
+			             meta.left_exprs, replace_aux, meta.null_aware, meta.null_aware_right_expr);
 		         });
 	}
 
@@ -1290,8 +1281,9 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 	// time and store it; refresh appends it between the primary-delta INSERT and the MERGE.
 	if (!leftjoin_secondary.sql.empty()) {
 		add_profile_marker("create_mv_leftjoin_secondary");
-		aux_metadata_ddl.push_back(BuildUpdateViewJsonSQL(
-		    "leftjoin_secondary_meta_json", RefreshMetadata::LeftJoinSecondaryMetaToJson(leftjoin_secondary), view_name));
+		aux_metadata_ddl.push_back(
+		    BuildUpdateViewJsonSQL("leftjoin_secondary_meta_json",
+		                           RefreshMetadata::LeftJoinSecondaryMetaToJson(leftjoin_secondary), view_name));
 	}
 
 	const auto &source_table_info = facts.source_table_info;
@@ -1930,10 +1922,10 @@ static ParserExtensionPlanResult PlanMaterializedView(ClientContext &context,
 			                                           : DDLArchiveMode::OWN_TRANSACTION;
 			archive_ddl = BuildArchiveProgramOperation(archived, mode, default_db, default_schema);
 		}
-		archive_ddl.insert(archive_ddl.begin(),
-		                   EncodeDDLOperation(OPENIVM_DDL_PROFILE_PREFIX,
-		                                      {view_name, "create_mv_archive_compiled_sql",
-		                                       "statements=" + to_string(archived.statements.size())}));
+		archive_ddl.insert(
+		    archive_ddl.begin(),
+		    EncodeDDLOperation(OPENIVM_DDL_PROFILE_PREFIX, {view_name, "create_mv_archive_compiled_sql",
+		                                                    "statements=" + to_string(archived.statements.size())}));
 		if (batch_ducklake_creation) {
 			D_ASSERT(ddl.back() == "COMMIT");
 			ddl.insert(ddl.end() - 1, archive_ddl.begin(), archive_ddl.end());
@@ -1987,8 +1979,7 @@ static void AdmitAutocommitCreateSources(ClientContext &context, MaterializedVie
 		Planner planner(context);
 		planner.CreatePlan(select.Copy());
 		InlineCtesIfPresent(context, *planner.binder, planner.plan);
-		auto facts =
-		    BuildCreateMVPlanFacts(planner.plan.get(), SqlUtils::SessionDefaultLocation(context).catalog);
+		auto facts = BuildCreateMVPlanFacts(planner.plan.get(), SqlUtils::SessionDefaultLocation(context).catalog);
 		for (const auto &entry : facts.source_table_info) {
 			if (!facts.ducklake_table_info.count(entry.first)) {
 				const auto &source = entry.second;

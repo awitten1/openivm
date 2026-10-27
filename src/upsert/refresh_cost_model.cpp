@@ -750,7 +750,7 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 			                      strategy_reg.w_intercept);
 			calibrated = true;
 			OPENIVM_DEBUG_PRINT("[COST MODEL] %s regression: w_compute=%.4f, w_upsert=%.4f, intercept=%.1f\n",
-			                    strategy_label, strategy_reg.w_compute, strategy_reg.w_upsert,
+			                    strategy_label.c_str(), strategy_reg.w_compute, strategy_reg.w_upsert,
 			                    strategy_reg.w_intercept);
 		}
 
@@ -776,16 +776,16 @@ static RefreshCostEstimate EstimateRefreshCost(ClientContext &context, LogicalOp
 	                    "%.0f\n",
 	                    (unsigned long)join_terms.active_sources, (unsigned long)join_terms.term_count, mv_card,
 	                    estimated_delta_result);
-	OPENIVM_DEBUG_PRINT("[COST MODEL] %s cost: %.0f (compute: %.0f, upsert: %.0f)\n", strategy_label, strategy_total,
-	                    strategy_compute, strategy_upsert);
+	OPENIVM_DEBUG_PRINT("[COST MODEL] %s cost: %.0f (compute: %.0f, upsert: %.0f)\n", strategy_label.c_str(),
+	                    strategy_total, strategy_compute, strategy_upsert);
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Recompute cost: %.0f (compute: %.0f, replace: %.0f)\n", recompute_total,
 	                    recompute_compute, recompute_replace);
 	if (calibrated) {
-		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: %s=%.0fms, Recompute=%.0fms\n", strategy_label,
+		OPENIVM_DEBUG_PRINT("[COST MODEL] Calibrated: %s=%.0fms, Recompute=%.0fms\n", strategy_label.c_str(),
 		                    strategy_predicted_ms, recompute_predicted_ms);
 	}
 	OPENIVM_DEBUG_PRINT("[COST MODEL] Decision: %s\n",
-	                    recompute_predicted_ms < strategy_predicted_ms ? "FULL_RECOMPUTE" : strategy_label);
+	                    recompute_predicted_ms < strategy_predicted_ms ? "FULL_RECOMPUTE" : strategy_label.c_str());
 
 	RefreshCostEstimate estimate;
 	estimate.incremental_compute = strategy_compute;
