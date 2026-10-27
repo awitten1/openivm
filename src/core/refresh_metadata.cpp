@@ -618,13 +618,20 @@ string RefreshMetadata::ReadViewString(const string &view_name, const string &co
 	return value.IsNull() ? "" : value.ToString();
 }
 
+bool RefreshMetadata::ReadViewBool(const string &view_name, const string &column) {
+	auto value = ReadViewValue(view_name, column);
+	return !value.IsNull() && value.GetValue<bool>();
+}
+
+Value RefreshMetadata::ReadDeltaValue(const string &view_name, const string &table_name, const string &column) {
+	auto result = con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " +
+	                        string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = " +
+	                        Value(view_name).ToSQLString() + " AND table_name = " + Value(table_name).ToSQLString());
+	return result->HasError() || result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
+}
+
 string RefreshMetadata::GetViewQuery(const string &view_name) {
-	auto result = con.Query("SELECT sql_string FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
-	                        SqlUtils::EscapeValue(view_name) + "'");
-	if (result->HasError() || result->RowCount() == 0) {
-		return "";
-	}
-	return result->GetValue(0, 0).ToString();
+	return ReadViewString(view_name, "sql_string");
 }
 
 RefreshType RefreshMetadata::GetViewType(const string &view_name) {
@@ -658,19 +665,11 @@ RefreshType RefreshMetadata::GetViewType(const string &view_name) {
 }
 
 bool RefreshMetadata::HasMinMax(const string &view_name) {
-	auto value = ReadViewValue(view_name, "has_minmax");
-	if (value.IsNull()) {
-		return false;
-	}
-	return value.GetValue<bool>();
+	return ReadViewBool(view_name, "has_minmax");
 }
 
 bool RefreshMetadata::HasLeftJoin(const string &view_name) {
-	auto value = ReadViewValue(view_name, "has_left_join");
-	if (value.IsNull()) {
-		return false;
-	}
-	return value.GetValue<bool>();
+	return ReadViewBool(view_name, "has_left_join");
 }
 
 bool RefreshMetadata::HasJoin(const string &view_name) {
@@ -682,11 +681,7 @@ bool RefreshMetadata::HasJoin(const string &view_name) {
 }
 
 bool RefreshMetadata::HasFullOuter(const string &view_name) {
-	auto value = ReadViewValue(view_name, "has_full_outer");
-	if (value.IsNull()) {
-		return false;
-	}
-	return value.GetValue<bool>();
+	return ReadViewBool(view_name, "has_full_outer");
 }
 
 string RefreshMetadata::GetFullOuterJoinCols(const string &view_name) {
@@ -706,27 +701,12 @@ vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
 }
 
 string RefreshMetadata::GetLastUpdate(const string &view_name, const string &table_name) {
-	auto result =
-	    con.Query("SELECT last_update FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
-	if (result->HasError() || result->RowCount() == 0) {
-		return "";
-	}
-	return result->GetValue(0, 0).ToString();
+	auto value = ReadDeltaValue(view_name, table_name, "last_update");
+	return value.IsNull() ? "" : value.ToString();
 }
 
 vector<MetadataLocation> RefreshMetadata::MetadataLocations(Connection &con) {
 	return MetadataLocator::All(con);
-}
-
-vector<string> RefreshMetadata::MetadataCatalogs(Connection &con) {
-	vector<string> catalogs;
-	for (auto &location : MetadataLocations(con)) {
-		catalogs.push_back(location.catalog);
-	}
-	std::sort(catalogs.begin(), catalogs.end());
-	catalogs.erase(std::unique(catalogs.begin(), catalogs.end()), catalogs.end());
-	return catalogs;
 }
 
 string RefreshMetadata::SourceTableName(const string &key, const string &catalog, const string &schema) {
@@ -1674,10 +1654,7 @@ GroupRecomputeAffectedMode RefreshMetadata::GetGroupRecomputeAffectedMode(const 
 
 int64_t RefreshMetadata::GetRefreshInterval(const string &view_name) {
 	auto value = ReadViewValue(view_name, "refresh_interval");
-	if (value.IsNull()) {
-		return -1;
-	}
-	return value.GetValue<int64_t>();
+	return value.IsNull() ? -1 : value.GetValue<int64_t>();
 }
 
 vector<RefreshMetadata::ScheduledView> RefreshMetadata::GetScheduledViews() {
@@ -1783,13 +1760,8 @@ string RefreshMetadata::BuildDeltaCleanupSQL(const string &target, const string 
 // --- DuckLake support ---
 
 string RefreshMetadata::GetCatalogType(const string &view_name, const string &table_name) {
-	auto result =
-	    con.Query("SELECT catalog_type FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return "duckdb";
-	}
-	return result->GetValue(0, 0).ToString();
+	auto value = ReadDeltaValue(view_name, table_name, "catalog_type");
+	return value.IsNull() ? "duckdb" : value.ToString();
 }
 
 bool RefreshMetadata::IsDuckLakeTable(const string &view_name, const string &table_name) {
@@ -1823,13 +1795,8 @@ int64_t RefreshMetadata::GetCurrentDuckLakeSnapshot(const string &catalog_name) 
 }
 
 int64_t RefreshMetadata::GetLastSnapshotId(const string &view_name, const string &table_name) {
-	auto result =
-	    con.Query("SELECT last_snapshot_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
-	              SqlUtils::EscapeValue(view_name) + "' AND table_name = '" + SqlUtils::EscapeValue(table_name) + "'");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
-		return -1;
-	}
-	return result->GetValue(0, 0).GetValue<int64_t>();
+	auto value = ReadDeltaValue(view_name, table_name, "last_snapshot_id");
+	return value.IsNull() ? -1 : value.GetValue<int64_t>();
 }
 
 RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceIdentity(const string &view_name,

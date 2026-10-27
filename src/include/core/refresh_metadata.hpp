@@ -19,6 +19,9 @@ class RefreshMetadata {
 	Connection &con;
 	Value ReadViewValue(const string &view_name, const string &column);
 	string ReadViewString(const string &view_name, const string &column);
+	bool ReadViewBool(const string &view_name, const string &column);
+	// One column of a view's openivm_delta_tables row for `table_name`; NULL when missing.
+	Value ReadDeltaValue(const string &view_name, const string &table_name, const string &column);
 	vector<string> ReadViewList(const string &view_name, const string &column);
 
 public:
@@ -92,7 +95,6 @@ public:
 
 	// Every metadata location that may consume delta tables (see MetadataLocator::All).
 	static vector<MetadataLocation> MetadataLocations(Connection &con);
-	static vector<string> MetadataCatalogs(Connection &con);
 	// Accept both legacy short keys and qualified keys for sources with colliding names.
 	static string SourceTableName(const string &key, const string &catalog, const string &schema);
 	static string SourcePredicate(const string &table, const string &catalog, const string &schema);
