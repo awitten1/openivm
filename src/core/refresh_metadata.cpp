@@ -527,7 +527,21 @@ void RefreshMetadata::SnapshotTransaction(ClientContext &context) {
 }
 
 string RefreshMetadata::GetViewSQLName(const string &view_key) {
-	auto name = ReadViewString(view_key, "view_sql_name");
+	// Metadata written before SQL names were stored separately has no view_sql_name column (see FindViewKey).
+	auto result = con.Query("SELECT view_sql_name FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
+	                        SqlUtils::EscapeValue(view_key) + "'");
+	if (result->HasError()) {
+		// Only the missing view_sql_name column (a binder error) is legacy metadata; anything else is a real failure.
+		if (result->GetErrorObject().Type() == ExceptionType::BINDER) {
+			return view_key;
+		}
+		throw InvalidInputException("Could not read IVM metadata column 'view_sql_name' for materialized view '%s': %s",
+		                            view_key, result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+		return view_key;
+	}
+	auto name = result->GetValue(0, 0).ToString();
 	return name.empty() ? view_key : name;
 }
 
@@ -604,13 +618,21 @@ string RefreshMetadata::ResolveViewName(const string &view_name, const string &c
 bool RefreshMetadata::IsBaseTable(const string &table_name) {
 	auto result = con.Query("SELECT 1 FROM " + string(openivm::VIEWS_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(table_name) + "'");
-	return !result->HasError() && result->RowCount() == 0;
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM metadata table '%s' for '%s': %s", openivm::VIEWS_TABLE,
+		                            table_name, result->GetError());
+	}
+	return result->RowCount() == 0;
 }
 
 Value RefreshMetadata::ReadViewValue(const string &view_name, const string &column) {
 	auto result = con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::VIEWS_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	return result->HasError() || result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM metadata column '%s' for materialized view '%s': %s", column,
+		                            view_name, result->GetError());
+	}
+	return result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
 }
 
 string RefreshMetadata::ReadViewString(const string &view_name, const string &column) {
@@ -628,7 +650,12 @@ Value RefreshMetadata::ReadDeltaValue(const string &view_name, const string &tab
 	    con.Query("SELECT " + SqlUtils::QuoteIdentifier(column) + " FROM " + string(openivm::DELTA_TABLES_TABLE) +
 	              " WHERE view_name = " + Value(view_name).ToSQLString() +
 	              " AND table_name = " + Value(table_name).ToSQLString());
-	return result->HasError() || result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
+	if (result->HasError()) {
+		throw InvalidInputException(
+		    "Could not read IVM metadata column '%s' for materialized view '%s' and table '%s': %s", column, view_name,
+		    table_name, result->GetError());
+	}
+	return result->RowCount() == 0 ? Value() : result->GetValue(0, 0);
 }
 
 string RefreshMetadata::GetViewQuery(const string &view_name) {
@@ -693,10 +720,12 @@ vector<string> RefreshMetadata::GetDeltaTables(const string &view_name) {
 	auto result = con.Query("SELECT table_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	                        SqlUtils::EscapeValue(view_name) + "'");
 	vector<string> tables;
-	if (!result->HasError()) {
-		for (size_t i = 0; i < result->RowCount(); i++) {
-			tables.push_back(result->GetValue(0, i).ToString());
-		}
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM delta table metadata for materialized view '%s': %s", view_name,
+		                            result->GetError());
+	}
+	for (size_t i = 0; i < result->RowCount(); i++) {
+		tables.push_back(result->GetValue(0, i).ToString());
 	}
 	return tables;
 }
@@ -747,19 +776,6 @@ string RefreshMetadata::SourceDeltaTableName(const string &source_schema, const 
 		return SqlUtils::DeltaName(table);
 	}
 	return InternalSourceDeltaName(source_schema, table);
-}
-
-// Text of `column` in a `SELECT *` result row; `fallback` when NULL or when the metadata
-// table predates the column (catalogs other than the default are migrated only at CREATE).
-static string ColumnText(MaterializedQueryResult &result, idx_t row, const string &column,
-                         const string &fallback = "") {
-	for (idx_t i = 0; i < result.ColumnCount(); i++) {
-		if (result.ColumnName(i) == column) {
-			auto value = result.GetValue(i, row);
-			return value.IsNull() ? fallback : value.ToString();
-		}
-	}
-	return fallback;
 }
 
 // Legacy rows derive the physical name; new rows store it because a colocated
@@ -1169,6 +1185,17 @@ optional_ptr<TableCatalogEntry> RefreshMetadata::FindSourceDeltaForMutation(Clie
 	return delta;
 }
 
+string RefreshMetadata::SourceOwnerPredicate(const string &table, const string &catalog, const string &schema,
+                                             bool ducklake) {
+	// The catalog type keeps a native `openivm_delta_<name>` key and a DuckLake source
+	// that happens to use that name from being mistaken for each other.
+	if (ducklake) {
+		return SourcePredicate(table, catalog, schema) + " AND catalog_type = 'ducklake'";
+	}
+	return SourcePredicate(SqlUtils::DeltaName(table), catalog, schema) +
+	       " AND COALESCE(catalog_type, 'duckdb') <> 'ducklake'";
+}
+
 RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string &view_name, const string &table_name,
                                                                    const string &fallback_catalog,
                                                                    const string &fallback_schema) {
@@ -1177,13 +1204,36 @@ RefreshMetadata::SourceLocation RefreshMetadata::GetSourceLocation(const string 
 	loc.schema_name = fallback_schema;
 	string delta_schema;
 	string delta_table_name;
-	auto result = con.Query("SELECT * FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = " +
-	                        Value(view_name).ToSQLString() + " AND table_name = " + Value(table_name).ToSQLString());
-	if (!result->HasError() && result->RowCount() > 0) {
-		loc.catalog_name = ColumnText(*result, 0, "source_catalog", loc.catalog_name);
-		loc.schema_name = ColumnText(*result, 0, "source_schema", loc.schema_name);
-		delta_schema = ColumnText(*result, 0, "delta_schema");
-		delta_table_name = ColumnText(*result, 0, "delta_table_name");
+	auto filter = " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "' AND table_name = '" +
+	              SqlUtils::EscapeValue(table_name) + "'";
+	auto result = con.Query("SELECT source_catalog, source_schema, delta_schema, delta_table_name FROM " +
+	                        string(openivm::DELTA_TABLES_TABLE) + filter);
+	if (result->HasError()) {
+		// Metadata written before physical delta names were stored.
+		result = con.Query("SELECT source_catalog, source_schema, delta_schema, NULL FROM " +
+		                   string(openivm::DELTA_TABLES_TABLE) + filter);
+	}
+	if (result->HasError()) {
+		result = con.Query("SELECT source_catalog, source_schema, NULL, NULL FROM " +
+		                   string(openivm::DELTA_TABLES_TABLE) + filter);
+	}
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM source location for materialized view '%s' and table '%s': %s",
+		                            view_name, table_name, result->GetError());
+	}
+	if (result->RowCount() > 0) {
+		if (!result->GetValue(0, 0).IsNull()) {
+			loc.catalog_name = result->GetValue(0, 0).ToString();
+		}
+		if (!result->GetValue(1, 0).IsNull()) {
+			loc.schema_name = result->GetValue(1, 0).ToString();
+		}
+		if (!result->GetValue(2, 0).IsNull()) {
+			delta_schema = result->GetValue(2, 0).ToString();
+		}
+		if (!result->GetValue(3, 0).IsNull()) {
+			delta_table_name = result->GetValue(3, 0).ToString();
+		}
 	}
 	loc.table_name = SourceTableName(table_name, loc.catalog_name, loc.schema_name);
 	SetSourceDelta(loc.table_name, loc.schema_name, delta_schema, delta_table_name, loc.delta_schema_name,
@@ -1212,7 +1262,11 @@ RefreshMetadata::StoredViewLocation RefreshMetadata::GetStoredViewLocation(const
 	StoredViewLocation loc {fallback_catalog, fallback_schema};
 	auto result = con.Query("SELECT view_catalog, view_schema FROM " + string(openivm::VIEWS_TABLE) +
 	                        " WHERE view_name = '" + SqlUtils::EscapeValue(view_name) + "'");
-	if (!result->HasError() && result->RowCount() > 0) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM stored location for materialized view '%s': %s", view_name,
+		                            result->GetError());
+	}
+	if (result->RowCount() > 0) {
 		if (!result->GetValue(0, 0).IsNull()) {
 			loc.catalog_name = result->GetValue(0, 0).ToString();
 		}
@@ -1268,17 +1322,32 @@ bool RefreshMetadata::IsMaterializedViewDelta(const DeltaSource &source,
 vector<RefreshMetadata::DeltaSource> RefreshMetadata::GetDeltaSources(const string &view_name,
                                                                       const string &fallback_catalog,
                                                                       const string &fallback_schema) {
-	auto result = con.Query("SELECT * FROM " + string(openivm::DELTA_TABLES_TABLE) +
-	                        " WHERE view_name = " + Value(view_name).ToSQLString());
+	auto filter = " FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
+	              SqlUtils::EscapeValue(view_name) + "'";
+	auto result = con.Query(
+	    "SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, delta_table_name" + filter);
+	if (result->HasError()) {
+		// Metadata written before physical delta names were stored.
+		result =
+		    con.Query("SELECT table_name, catalog_type, source_catalog, source_schema, delta_schema, NULL" + filter);
+	}
+	if (result->HasError()) {
+		result = con.Query("SELECT table_name, catalog_type, source_catalog, source_schema, NULL, NULL" + filter);
+	}
 	vector<DeltaSource> sources;
-	for (idx_t row = 0; !result->HasError() && row < result->RowCount(); row++) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read IVM delta source metadata for materialized view '%s': %s",
+		                            view_name, result->GetError());
+	}
+	for (idx_t row = 0; row < result->RowCount(); row++) {
 		DeltaSource source;
-		source.table_name = ColumnText(*result, row, "table_name");
-		source.catalog_type = ColumnText(*result, row, "catalog_type", "duckdb");
-		source.catalog_name = ColumnText(*result, row, "source_catalog", fallback_catalog);
-		source.schema_name = ColumnText(*result, row, "source_schema", fallback_schema);
-		auto delta_schema = ColumnText(*result, row, "delta_schema");
-		auto delta_name = ColumnText(*result, row, "delta_table_name");
+		source.table_name = result->GetValue(0, row).ToString();
+		source.catalog_type = result->GetValue(1, row).IsNull() ? "duckdb" : result->GetValue(1, row).ToString();
+		source.catalog_name =
+		    result->GetValue(2, row).IsNull() ? fallback_catalog : result->GetValue(2, row).ToString();
+		source.schema_name = result->GetValue(3, row).IsNull() ? fallback_schema : result->GetValue(3, row).ToString();
+		auto delta_schema = result->GetValue(4, row).IsNull() ? string() : result->GetValue(4, row).ToString();
+		auto delta_name = result->GetValue(5, row).IsNull() ? string() : result->GetValue(5, row).ToString();
 		SetSourceDelta(SourceTableName(source.table_name, source.catalog_name, source.schema_name), source.schema_name,
 		               delta_schema, delta_name, source.delta_schema_name, source.delta_table_name);
 		sources.push_back(std::move(source));
@@ -1329,6 +1398,8 @@ RefreshMetadata::DeltaChangeStats RefreshMetadata::GetStandardDeltaChangeStats(c
 	    con.Query("SELECT COUNT(*), SUM(CASE WHEN " + string(openivm::MULTIPLICITY_COL) +
 	              " < 0 THEN 1 ELSE 0 END) FROM " + delta_table_sql + " WHERE " + string(openivm::TIMESTAMP_COL) +
 	              " >= '" + SqlUtils::EscapeValue(last_update) + "'::TIMESTAMP");
+	// This reads delta data, not metadata. Callers treat !ok conservatively (pending changes and deletes),
+	// so an unreadable delta table never makes a refresh skip work.
 	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return stats;
 	}
@@ -1430,7 +1501,7 @@ static vector<string> GetDownstreamViewsInternal(Connection &con, const string &
 		    "' OR table_name = '" + SqlUtils::EscapeValue(PublishedViewName(vn)) + "' OR table_name = '" +
 		    SqlUtils::EscapeValue(SqlUtils::DeltaName(PublishedViewName(vn))) + "' ORDER BY view_name");
 		if (dependents->HasError() && throw_on_error) {
-			throw CatalogException("OpenIVM could not resolve downstream dependencies for '%s': %s", view_name,
+			throw CatalogException("Cannot resolve downstream consumers for '%s': %s", view_name,
 			                       dependents->GetError());
 		}
 		if (!dependents->HasError()) {
@@ -1755,7 +1826,11 @@ bool RefreshMetadata::IsDuckLakeCatalog(const string &catalog_name) {
 	auto result =
 	    con.Query("SELECT type FROM duckdb_databases() WHERE " +
 	              SqlUtils::IdentifierEqualsSQL("database_name", Value(catalog_name).ToSQLString()) + " LIMIT 1");
-	return !result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
+	if (result->HasError()) {
+		throw CatalogException("OpenIVM could not resolve the type of catalog '%s': %s", catalog_name,
+		                       result->GetError());
+	}
+	return result->RowCount() > 0 && !result->GetValue(0, 0).IsNull() &&
 	       StringUtil::CIEquals(result->GetValue(0, 0).ToString(), "ducklake");
 }
 
@@ -1768,7 +1843,11 @@ int64_t RefreshMetadata::GetCurrentDuckLakeSnapshot(const string &catalog_name) 
 		return -1;
 	}
 	auto result = con.Query("SELECT id FROM " + SqlUtils::QuoteIdentifier(catalog_name) + ".current_snapshot()");
-	if (result->HasError() || result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read current snapshot of catalog '%s': %s", catalog_name,
+		                            result->GetError());
+	}
+	if (result->RowCount() == 0 || result->GetValue(0, 0).IsNull()) {
 		return -1;
 	}
 	return result->GetValue(0, 0).GetValue<int64_t>();
@@ -1787,7 +1866,11 @@ RefreshMetadata::DuckLakeSourceIdentity RefreshMetadata::ResolveDuckLakeSourceId
 	auto result =
 	    con.Query("SELECT source_table_id FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE view_name = '" +
 	              SqlUtils::EscapeValue(view_name) + "' AND " + SourcePredicate(table_name, catalog_name, schema_name));
-	if (!result->HasError() && result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
+	if (result->HasError()) {
+		throw InvalidInputException("Could not read source_table_id for '%s' of materialized view '%s': %s", table_name,
+		                            view_name, result->GetError());
+	}
+	if (result->RowCount() > 0 && !result->GetValue(0, 0).IsNull()) {
 		identity.stored_table_id = result->GetValue(0, 0).GetValue<int64_t>();
 	}
 	if (catalog_name.empty()) {

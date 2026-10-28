@@ -2282,6 +2282,8 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		}
 	}
 
+	const bool ducklake =
+	    !schema_drop && Catalog::GetCatalog(context, drop_info.catalog).GetCatalogType() == "ducklake";
 	Connection con(*context.db);
 	TransactionalMVLockState::Get(*con.context)
 	    .SetMutationOwner(TransactionalMVLockState::Get(context).GetMutationOwner());
@@ -2330,11 +2332,10 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 			}
 			continue;
 		}
-		auto dependent_rows = con.Query(
-		    "SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) + " WHERE " +
-		    RefreshMetadata::SourcePredicate(SqlUtils::DeltaName(drop_info.name), drop_info.catalog, drop_info.schema) +
-		    " OR " + RefreshMetadata::SourcePredicate(drop_info.name, drop_info.catalog, drop_info.schema) +
-		    " ORDER BY view_name");
+		auto owners =
+		    RefreshMetadata::SourceOwnerPredicate(drop_info.name, drop_info.catalog, drop_info.schema, ducklake);
+		auto dependent_rows = con.Query("SELECT DISTINCT view_name FROM " + string(openivm::DELTA_TABLES_TABLE) +
+		                                " WHERE " + owners + " ORDER BY view_name");
 		if (dependent_rows->HasError()) {
 			throw CatalogException("OpenIVM could not resolve materialized views depending on '%s': %s", drop_info.name,
 			                       dependent_rows->GetError());
@@ -2342,10 +2343,24 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 		if (!dependent_rows->RowCount()) {
 			continue;
 		}
+		if (!drop_info.cascade && ducklake) {
+			// DuckLake sources have no OpenIVM delta buffer to retract into. Retained MVs
+			// observe the drop through their recorded DuckLake table id: a same-named
+			// replacement has a new id, which forces a full recompute on refresh.
+			OPENIVM_DEBUG_PRINT("[DROP] Retaining MVs of DuckLake source '%s'\n", drop_info.name.c_str());
+			return BuildDropTableStatement(drop_info) + ";\n";
+		}
 		if (!drop_info.cascade) {
 			// Retained MVs must observe removal before a same-named replacement.
 			auto source = SqlUtils::FullName(drop_info.catalog, drop_info.schema, drop_info.name);
 			return "DELETE FROM " + source + ";\n" + BuildDropTableStatement(drop_info) + ";\n";
+		}
+		if (ducklake && !context.transaction.IsAutoCommit()) {
+			throw CatalogException("Cannot run DROP TABLE %s CASCADE inside an explicit transaction: its materialized "
+			                       "views keep OpenIVM metadata in native catalog '%s', and DuckDB cannot write both "
+			                       "catalogs in one transaction. Run the DROP in autocommit mode.",
+			                       SqlUtils::FullName(drop_info.catalog, drop_info.schema, drop_info.name),
+			                       registry.catalog);
 		}
 		for (idx_t row = 0; row < dependent_rows->RowCount(); row++) {
 			roots.emplace_back(registry, dependent_rows->GetValue(0, row).ToString());
@@ -2363,7 +2378,7 @@ static string BuildSourceDropProgram(ClientContext &context, DropInfo &drop_info
 	for (auto &source : program.sources) {
 		program.staged |= !StringUtil::CIEquals(source.catalog_name, drop_info.catalog);
 	}
-	if (!schema_drop && Catalog::GetCatalog(context, drop_info.catalog).GetCatalogType() == "ducklake") {
+	if (ducklake) {
 		drop_info.cascade = false;
 	}
 	program.sql += drop_statement();
