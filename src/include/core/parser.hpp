@@ -62,6 +62,7 @@ struct MaterializedViewParseData : ParserExtensionParseData {
 	bool is_replace = false;       // CREATE OR REPLACE: drop old MV before creating
 	string alter_sql;              // non-empty for ALTER MATERIALIZED VIEW (executed directly in plan function)
 	string target_name;            // parsed catalog-qualified CREATE/ALTER target
+	string view_query;             // the CREATE's AS body, normalized to DuckDB SQL
 	string original_query;         // lifecycle SQL for native verification/reparsing
 
 	unique_ptr<ParserExtensionParseData> Copy() const override {
@@ -71,6 +72,7 @@ struct MaterializedViewParseData : ParserExtensionParseData {
 		data.is_replace = is_replace;
 		data.alter_sql = alter_sql;
 		data.target_name = target_name;
+		data.view_query = view_query;
 		data.original_query = original_query;
 		return copy;
 	}

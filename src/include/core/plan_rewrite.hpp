@@ -5,11 +5,26 @@
 #include "duckdb.hpp"
 #include "duckdb/planner/logical_operator.hpp"
 
+#include <functional>
+
 namespace duckdb {
 
 struct CreateMVPlanFacts;
 class BoundWindowExpression;
+class LogicalAggregate;
+class LogicalProjection;
 bool IsRunningWindowCandidate(const BoundWindowExpression &window);
+
+/// The single-child path from a plan root down to the first operator that is neither a projection nor accepted by
+/// `pass_through` (a MATERIALIZED_CTE passes through to its consumer, children[1]).
+struct OutputSpine {
+	vector<LogicalProjection *> projections; // root first
+	LogicalOperator *parent = nullptr;       // operator directly above `bottom`, nullptr when `bottom` is the root
+	LogicalOperator *bottom = nullptr;
+};
+OutputSpine FindOutputSpine(LogicalOperator *root, const std::function<bool(const LogicalOperator &)> &pass_through);
+/// The aggregate at the bottom of the spine, directly or below a HAVING filter.
+LogicalAggregate *SpineAggregate(const OutputSpine &spine);
 
 struct PlanRewriteNeeds {
 	bool inline_cte_refs = false;

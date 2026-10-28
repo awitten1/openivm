@@ -677,6 +677,59 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# The pending DuckLake range starts after the snapshot the last refresh consumed.
+# A native view over a DuckLake source consumes the snapshot of the four-row
+# insert; pricing that snapshot again would count eight pending rows instead of four.
+statement ok
+CREATE TABLE dl.cost_range (k INT, v INT);
+
+statement ok
+INSERT INTO dl.cost_range VALUES (1, 10), (2, 20), (3, 30);
+
+statement ok
+CREATE MATERIALIZED VIEW cost_range_mv AS SELECT k, v FROM dl.cost_range WHERE v > 0;
+
+statement ok
+INSERT INTO dl.cost_range VALUES (4, 40), (5, 50), (6, 60), (7, 70);
+
+statement ok
+PRAGMA refresh('cost_range_mv');
+
+statement ok
+INSERT INTO dl.cost_range VALUES (8, 80);
+
+statement ok
+UPDATE dl.cost_range SET v = 25 WHERE k = 2;
+
+statement ok
+DELETE FROM dl.cost_range WHERE k = 2;
+
+query IIIIII
+PRAGMA refresh_cost('cost_range_mv');
+----
+incremental	6.175631	22.000000	6.175631	22.000000	0
+
+statement ok
+PRAGMA refresh('cost_range_mv');
+
+query I
+SELECT count(*) FROM (
+    SELECT k, v FROM cost_range_mv
+    EXCEPT ALL
+    SELECT k, v FROM dl.cost_range WHERE v > 0
+);
+----
+0
+
+query I
+SELECT count(*) FROM (
+    SELECT k, v FROM dl.cost_range WHERE v > 0
+    EXCEPT ALL
+    SELECT k, v FROM cost_range_mv
+);
+----
+0
+
 # The existing conflicting updates above must publish only the retained key scope.
 query I
 SELECT contains(content, 'SELECT v.* FROM (SELECT *, CAST(0 AS BIGINT) AS openivm_ordinal')

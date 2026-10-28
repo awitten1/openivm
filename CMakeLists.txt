@@ -63,7 +63,6 @@ set(EXTENSION_SOURCES
     src/rules/refresh_insert_rule.cpp
     src/rules/transactional_delta_capture.cpp
     src/rules/schema_evolution.cpp
-    src/rules/column_hider.cpp
     src/core/refresh_locks.cpp
     src/core/refresh_daemon.cpp
     src/match/plan_canonical.cpp

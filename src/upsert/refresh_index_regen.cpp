@@ -51,7 +51,7 @@ static void CollectOperatorExpressionBindings(LogicalOperator &op, std::vector<C
 	}
 }
 
-RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder &binder) {
+static RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder &binder) {
 	std::unordered_map<old_idx, new_idx> table_reassign;
 	std::vector<ColumnBinding> current_bindings = plan->GetColumnBindings();
 	CollectOperatorExpressionBindings(*plan, current_bindings);
@@ -218,8 +218,8 @@ static void RebindExpressionsNullSafe(LogicalOperator &op, ColumnBindingReplacer
 	}
 }
 
-ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings,
-                                      const std::unordered_map<old_idx, new_idx> &table_mapping) {
+static ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings,
+                                             const std::unordered_map<old_idx, new_idx> &table_mapping) {
 	ColumnBindingReplacer replacer;
 	std::unordered_set<uint64_t> seen;
 	for (const ColumnBinding &cb : bindings) {

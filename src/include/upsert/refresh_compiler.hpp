@@ -32,21 +32,39 @@ struct WindowPartitionDeltaSpec {
 	string source_column;
 };
 
-string CompileAggregateGroups(
-    const string &view_name, optional_ptr<CatalogEntry> index_delta_view_catalog_entry, vector<string> column_names,
-    const string &view_query_sql = "", bool has_minmax = false, const string &delta_ts_filter = "",
-    const vector<string> &group_column_names = {}, const string &catalog_prefix = "", bool insert_only = false,
-    const vector<string> &aggregate_types = {}, const vector<LogicalType> &column_types = {},
-    bool use_current_diff_affected_keys = false, const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs = nullptr,
-    const string &cascade_lpts_table_prefix = "", bool emit_cascade_delta = false, bool inline_cascade_delta = false,
-    bool *out_handled_cascade_delta = nullptr, const unordered_map<string, string> &derived_output_expressions = {},
-    bool derived_output_expressions_complete = false, const vector<string> &preserved_side_cols = {},
-    bool *out_used_group_recompute = nullptr, bool force_group_recompute = false);
+struct AggregateGroupsOptions {
+	//! The data table's unique group-key index; without it (DuckLake) keys come from group_column_names.
+	optional_ptr<CatalogEntry> unique_index;
+	string view_query_sql;
+	bool has_minmax = false;
+	string delta_ts_filter;
+	vector<string> group_column_names;
+	string catalog_prefix;
+	bool insert_only = false;
+	vector<string> aggregate_types;
+	vector<LogicalType> column_types;
+	bool use_current_diff_affected_keys = false;
+	//! Non-null requests a cascade delta from the group-recompute fallback.
+	const vector<GroupRecomputeDeltaSpec> *cascade_delta_specs = nullptr;
+	//! Replace the compact inline companion with an exact affected-group multiset.
+	bool inline_cascade_delta = false;
+	unordered_map<string, string> derived_output_expressions;
+	bool derived_output_expressions_complete = false;
+	vector<string> preserved_side_cols;
+	bool force_group_recompute = false;
+};
+
+struct AggregateGroupsOutcome {
+	bool handled_cascade_delta = false;
+	bool used_group_recompute = false;
+};
+
+string CompileAggregateGroups(const string &view_name, const vector<string> &column_names,
+                              const AggregateGroupsOptions &options, AggregateGroupsOutcome *outcome = nullptr);
 string CompileSimpleAggregates(const string &view_name, const vector<string> &column_names,
                                const string &view_query_sql = "", bool has_minmax = false,
                                const string &delta_ts_filter = "", const string &catalog_prefix = "",
-                               bool insert_only = false, const vector<LogicalType> &column_types = {},
-                               bool *out_full_recompute = nullptr);
+                               const vector<LogicalType> &column_types = {});
 string CompileProjectionsFilters(const string &view_name, const vector<string> &column_names,
                                  const string &delta_ts_filter = "", const string &catalog_prefix = "",
                                  bool insert_only = false, string *appended_rows = nullptr);
@@ -79,14 +97,9 @@ string CompileFullRecompute(const string &view_name, const string &view_query_sq
 /// the source is a standard DuckDB delta table or a DuckLake snapshot-diff
 /// source. `catalog_prefix` is the SQL prefix used for the MV's data table —
 /// empty for the default catalog, "<cat>.<schema>." otherwise.
-/// `lpts_table_prefix` is the *always-fully-qualified* prefix that LPTS used in
-/// `view_query_sql` to reference base tables ("<cat>.<schema>." even when the
-/// catalog is default), so we can substitute the exact `cat.schema.tbl`
-/// pattern.
 string CompileGroupRecompute(const string &view_name, const string &view_query_sql, const vector<string> &group_columns,
                              const vector<GroupRecomputeDeltaSpec> &delta_table_specs,
-                             const string &catalog_prefix = "", const string &lpts_table_prefix = "",
-                             bool emit_cascade_delta = false,
+                             const string &catalog_prefix = "", bool emit_cascade_delta = false,
                              GroupRecomputeAffectedMode affected_mode = GroupRecomputeAffectedMode::CURRENT_DIFF,
                              const string &additional_affected_groups = "");
 
@@ -130,7 +143,7 @@ string BuildCountDistinctAuxStateCreateSQL(const string &target_table, const str
                                            const string &distinct_col, const string &distinct_expr,
                                            const string &filter_sql, bool replace);
 
-string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, const string &join_type,
+string CompileSemiAntiRecompute(const string &view_name, const string &aux_table, SemiAntiJoinType join_type,
                                 const string &left_table, const string &left_alias, const string &right_table,
                                 const string &right_alias, const string &predicate, const string &post_filter,
                                 const string &right_filter, const vector<string> &left_cols,
@@ -144,7 +157,7 @@ string BuildSemiAntiAuxStateCreateSQL(const string &target_table, const string &
                                       const string &post_filter, const string &right_filter,
                                       const vector<string> &left_cols, const vector<string> &left_exprs, bool replace,
                                       bool null_aware = false, const string &null_aware_right_expr = "");
-string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, const string &join_type,
+string BuildSemiAntiInitialDataSQL(const string &data_table, const string &aux_table, SemiAntiJoinType join_type,
                                    const vector<string> &left_cols, const vector<string> &output_cols,
                                    bool null_aware = false, const string &null_aware_left_col = "");
 
