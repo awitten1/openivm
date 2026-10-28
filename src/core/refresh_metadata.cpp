@@ -2009,19 +2009,19 @@ vector<RefreshMetadata::RefreshHistoryEntry> RefreshMetadata::GetRefreshHistory(
 using MetadataJson::Presence;
 
 template <class IO>
-static void Fields(IO &io, DerivedAggregateOutput &m) {
+static void Fields(IO &io, typename IO::template Field<DerivedAggregateOutput> &m) {
 	io.Str("column", m.output_column);
 	io.Str("expression", m.expression_sql);
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::GroupRecomputeSourceOccurrence &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::GroupRecomputeSourceOccurrence> &m) {
 	io.Str("table", m.table_name);
 	io.Index("count", m.count);
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::DistinctAuxMeta &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::DistinctAuxMeta> &m) {
 	io.Str("aux_table", m.aux_table);
 	io.Arr("cols", m.cols);
 	io.Arr("source_exprs", m.source_exprs, Presence::OPTIONAL);
@@ -2033,7 +2033,7 @@ static void Fields(IO &io, RefreshMetadata::DistinctAuxMeta &m) {
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::CountDistinctAuxMeta &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::CountDistinctAuxMeta> &m) {
 	io.Str("aux_table", m.aux_table);
 	io.Str("source", m.source);
 	io.Arr("group_cols", m.group_cols);
@@ -2045,7 +2045,7 @@ static void Fields(IO &io, RefreshMetadata::CountDistinctAuxMeta &m) {
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::SemiAntiAuxMeta &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::SemiAntiAuxMeta> &m) {
 	io.Str("aux_table", m.aux_table);
 	io.Enum("join_type", m.join_type, SEMI_ANTI_JOIN_TYPE_NAMES);
 	io.Str("left_table", m.left_table);
@@ -2064,7 +2064,7 @@ static void Fields(IO &io, RefreshMetadata::SemiAntiAuxMeta &m) {
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::WindowPartitionLineageOp &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::WindowPartitionLineageOp> &m) {
 	io.Enum("k", m.kind, WINDOW_LINEAGE_KIND_NAMES);
 	io.Str("out", m.output_col);
 	io.Str("source", m.source);
@@ -2080,7 +2080,7 @@ static void Fields(IO &io, RefreshMetadata::WindowPartitionLineageOp &m) {
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::ProjectionKeyLineage &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::ProjectionKeyLineage> &m) {
 	io.Tag("k", "projection_key");
 	io.Str("out", m.output_col);
 	io.Str("key_source", m.key_source);
@@ -2089,14 +2089,14 @@ static void Fields(IO &io, RefreshMetadata::ProjectionKeyLineage &m) {
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::ProjectionKeyLineageArm &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::ProjectionKeyLineageArm> &m) {
 	io.Str("source", m.source);
 	io.Index("occ", m.occurrence);
 	io.Str("source_col", m.source_col);
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::LeftJoinKeySource &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::LeftJoinKeySource> &m) {
 	io.Tag("k", "left_join_key_source");
 	io.Str("table", m.table);
 	io.Index("occ", m.occurrence);
@@ -2105,14 +2105,14 @@ static void Fields(IO &io, RefreshMetadata::LeftJoinKeySource &m) {
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::LeftJoinNullableSources &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::LeftJoinNullableSources> &m) {
 	io.Tag("k", "left_join_nullable");
 	io.Bool("complete", m.complete, Presence::OPTIONAL);
 	io.Arr("tables", m.tables, Presence::OPTIONAL);
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::FilteredGroupCountAuxMeta &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::FilteredGroupCountAuxMeta> &m) {
 	io.Tag("kind", "filtered_group_count");
 	io.Str("aux_table", m.aux_table);
 	io.Str("source", m.source);
@@ -2126,7 +2126,7 @@ static void Fields(IO &io, RefreshMetadata::FilteredGroupCountAuxMeta &m) {
 }
 
 template <class IO>
-static void Fields(IO &io, RefreshMetadata::LeftJoinSecondaryMeta &m) {
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::LeftJoinSecondaryMeta> &m) {
 	io.Tag("kind", "leftjoin_secondary");
 	io.Str("sql", m.sql);
 	io.Arr("preserved_cols", m.preserved_cols);
@@ -2286,7 +2286,7 @@ string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &l
 	vector<string> arms;
 	for (auto &arm : lineage.arms) {
 		MetadataJson::Writer arm_writer;
-		Fields(arm_writer, const_cast<ProjectionKeyLineageArm &>(arm));
+		Fields(arm_writer, arm);
 		vector<string> steps;
 		for (auto &step : arm.steps) {
 			steps.push_back(step.table + "|" + to_string(step.occurrence) + "|" + step.lookup_col + "|" +
@@ -2296,7 +2296,7 @@ string RefreshMetadata::ProjectionKeyLineageToJson(const ProjectionKeyLineage &l
 		arms.push_back(arm_writer.Finish());
 	}
 	MetadataJson::Writer writer;
-	Fields(writer, const_cast<ProjectionKeyLineage &>(lineage));
+	Fields(writer, lineage);
 	writer.Objects("arms", arms);
 	return writer.Finish();
 }

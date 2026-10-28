@@ -66,6 +66,8 @@ constexpr bool ADDED = true;
 // tables receive it through `migration` (default: its definition). LOCAL and REMOTE columns exist
 // only in native or remote metadata catalogs respectively.
 struct MetadataColumn {
+	// Implicit string conversion keeps unchanged column definitions readable in the table-definition list.
+	// NOLINTNEXTLINE(google-explicit-constructor)
 	MetadataColumn(const char *definition, bool added = false, MetadataStore store = MetadataStore::ANY,
 	               const char *migration = nullptr)
 	    : definition(definition), added(added), store(store), migration(migration ? migration : definition) {
@@ -133,7 +135,7 @@ static const vector<std::pair<string, vector<MetadataColumn>>> &MetadataTableDef
 	    {openivm::REFRESH_HOOKS_TABLE,
 	     {"view_name varchar primary key, hook_sql varchar not null, mode varchar not null default 'after'"}},
 	    {openivm::DELTA_TABLES_TABLE,
-	     {"view_name varchar, table_name varchar, last_update timestamp, catalog_type varchar default 'duckdb', "
+	     {"view_name varchar, table_name varchar, last_update timestamp, catalog_type varchar default 'duckdb'",
 	      "last_snapshot_id bigint default null",
 	      {"last_refresh_ts timestamp default null", ADDED},
 	      {"pending_row_estimate bigint default null", ADDED},

@@ -176,8 +176,11 @@ inline vector<string> ExtractJsonObjectsFromArray(const string &json, const stri
 			if (depth++ == 0) {
 				object_start = pos;
 			}
-		} else if (c == '}' && depth > 0 && --depth == 0) {
-			objects.push_back(json.substr(object_start, pos - object_start + 1));
+		} else if (c == '}' && depth > 0) {
+			depth--;
+			if (depth == 0) {
+				objects.push_back(json.substr(object_start, pos - object_start + 1));
+			}
 		} else if (c == ']' && depth == 0) {
 			if (parsed_complete) {
 				*parsed_complete = true;
@@ -188,9 +191,9 @@ inline vector<string> ExtractJsonObjectsFromArray(const string &json, const stri
 	return objects;
 }
 
-// Each metadata struct describes its fields once, as `template <class IO> void Fields(IO &, T &)` in
-// namespace duckdb. Writer serializes them in that order and Reader parses them back. Booleans and
-// indexes are stored as JSON strings, enums by name.
+// Each metadata struct describes its fields once using IO::Field<T>: const for Writer, mutable for Reader.
+// The field list lives in namespace duckdb. Writer serializes them in that order and Reader parses them back. Booleans
+// and indexes are stored as JSON strings, enums by name.
 enum class Presence : uint8_t {
 	REQUIRED,  // always written; reading fails without it
 	OPTIONAL,  // always written; may be absent when read
@@ -199,6 +202,8 @@ enum class Presence : uint8_t {
 
 class Writer {
 public:
+	template <class T>
+	using Field = const T;
 	void Raw(const char *key, const string &json) {
 		out += (out.size() == 1 ? "\"" : ",\"") + string(key) + "\":" + json;
 	}
@@ -236,6 +241,8 @@ private:
 
 class Reader {
 public:
+	template <class T>
+	using Field = T;
 	explicit Reader(const string &json) : json(json) {
 	}
 	void Str(const char *key, string &val, Presence presence = Presence::REQUIRED) {
@@ -285,8 +292,7 @@ private:
 template <class T>
 string Write(const T &val) {
 	Writer writer;
-	// Writer only reads the fields; Fields takes a mutable reference so that it also serves Reader.
-	Fields(writer, const_cast<T &>(val));
+	Fields(writer, val);
 	return writer.Finish();
 }
 
