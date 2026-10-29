@@ -45,6 +45,7 @@ public:
 	static string IdentifierEqualsSQL(const string &left, const string &right);
 	static string QualifiedPrefix(const string &catalog, const string &schema);
 	static string JsonQuote(const string &value);
+	static string TrimSQLFragment(const string &input);
 	static vector<string> ParseColumnList(const string &raw);
 	static string JsonArray(const vector<string> &values);
 	static string DuckLakeTableFunction(const string &function_name, const string &catalog, const string &schema,
@@ -70,6 +71,8 @@ public:
 	static string BuildAllNullPredicate(const vector<string> &columns);
 	static string BuildAnyNullPredicate(const vector<string> &columns, const string &prefix = "");
 	static string BuildNullSafeMatch(const vector<string> &columns, const string &lhs_alias, const string &rhs_alias);
+	// Repeat each input row count times, preserving an empty result for nonpositive counts.
+	static string BuildRowRepetitionSQL(const string &count, const string &alias, SqlDialect dialect);
 	static string BuildNullSafeKeyPredicate(const vector<string> &columns, const string &left_prefix,
 	                                        const string &right_prefix);
 	/// Cast specs retain the legacy single-target-type representation while encoding nested/TRY_CAST expressions.

@@ -2101,7 +2101,15 @@ static void Fields(IO &io, typename IO::template Field<RefreshMetadata::LeftJoin
 	io.Str("table", m.table);
 	io.Index("occ", m.occurrence);
 	io.Str("column", m.column);
+	io.Str("cast_type", m.cast_type, Presence::OPTIONAL);
 	io.Bool("cardinality_transition_check_safe", m.cardinality_transition_check_safe, Presence::OPTIONAL);
+}
+
+template <class IO>
+static void Fields(IO &io, typename IO::template Field<RefreshMetadata::FullOuterScopeInput> &m) {
+	io.Str("table", m.table);
+	io.Index("occ", m.occurrence);
+	io.Index("presence_index", m.presence_index);
 }
 
 template <class IO>
@@ -2308,6 +2316,52 @@ bool RefreshMetadata::GetLeftJoinKeySource(const string &view_name, LeftJoinKeyS
 
 string RefreshMetadata::LeftJoinKeySourceToJson(const LeftJoinKeySource &source) {
 	return MetadataJson::Write(source);
+}
+
+vector<RefreshMetadata::FullOuterScope> RefreshMetadata::GetFullOuterScopes(const string &view_name) {
+	vector<FullOuterScope> scopes;
+	auto json = ReadRefreshLineageEntry(ReadViewString(view_name, "lineage_json"), "full_outer_scopes");
+	if (json.empty()) {
+		return scopes;
+	}
+	for (auto &object : MetadataJson::ExtractJsonObjectsFromArray(json, "scopes")) {
+		FullOuterScope scope;
+		bool complete = true;
+		for (idx_t side = 0; side < 2; side++) {
+			auto &source = side == 0 ? scope.left : scope.right;
+			string prefix = side == 0 ? "left_" : "right_";
+			complete = complete && MetadataJson::ExtractJsonString(object, prefix + "key", source.key_column) &&
+			           MetadataJson::ExtractJsonString(object, prefix + "presence", source.presence_column);
+			for (auto &input_json : MetadataJson::ExtractJsonObjectsFromArray(object, prefix + "inputs")) {
+				FullOuterScopeInput input;
+				complete = MetadataJson::Read(input_json, input) && complete;
+				source.inputs.push_back(std::move(input));
+			}
+			complete = complete && !source.inputs.empty();
+		}
+		if (complete) {
+			scopes.push_back(std::move(scope));
+		}
+	}
+	return scopes;
+}
+
+string RefreshMetadata::FullOuterScopesToJson(const vector<FullOuterScope> &scopes) {
+	vector<string> objects;
+	for (auto &scope : scopes) {
+		vector<string> fields;
+		for (idx_t side = 0; side < 2; side++) {
+			auto &source = side == 0 ? scope.left : scope.right;
+			string prefix = side == 0 ? "left_" : "right_";
+			fields.push_back(SqlUtils::JsonQuote(prefix + "key") + ":" + SqlUtils::JsonQuote(source.key_column));
+			fields.push_back(SqlUtils::JsonQuote(prefix + "presence") + ":" +
+			                 SqlUtils::JsonQuote(source.presence_column));
+			auto inputs = WriteEach(source.inputs);
+			fields.push_back(SqlUtils::JsonQuote(prefix + "inputs") + ":[" + StringUtil::Join(inputs, ",") + "]");
+		}
+		objects.push_back("{" + StringUtil::Join(fields, ",") + "}");
+	}
+	return "{\"k\":\"full_outer_scopes\",\"scopes\":[" + StringUtil::Join(objects, ",") + "]}";
 }
 
 bool RefreshMetadata::GetLeftJoinNullableSources(const string &view_name, LeftJoinNullableSources &out) {
