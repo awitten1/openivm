@@ -652,7 +652,6 @@ static string CollectCreateMVPlanFacts(LogicalOperator *op, const string &curren
 	auto *logical_join = dynamic_cast<LogicalJoin *>(op);
 	if (logical_join && (logical_join->join_type == JoinType::LEFT || logical_join->join_type == JoinType::RIGHT ||
 	                     logical_join->join_type == JoinType::OUTER)) {
-		facts.outer_join_count++;
 		facts.outer_joins.push_back(logical_join);
 	}
 	if (redundant_distinct && op != redundant_distinct && op->type == LogicalOperatorType::LOGICAL_DISTINCT) {
@@ -836,22 +835,25 @@ static bool IsHiddenHavingColumn(const string &name) {
 	return StringUtil::StartsWith(name, "openivm_having_");
 }
 
+// The aggregate function a column reference reads from one of `aggregates`, if any.
+static optional_ptr<BoundAggregateExpression>
+ReferencedAggregate(const BoundColumnRefExpression &column_ref,
+                    const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
+	auto aggregate_it = aggregates.find(column_ref.binding.table_index);
+	if (aggregate_it == aggregates.end() ||
+	    column_ref.binding.column_index >= aggregate_it->second->expressions.size()) {
+		return nullptr;
+	}
+	auto &aggregate_expr = *aggregate_it->second->expressions[column_ref.binding.column_index];
+	return aggregate_expr.expression_class == ExpressionClass::BOUND_AGGREGATE
+	           ? &aggregate_expr.Cast<BoundAggregateExpression>()
+	           : nullptr;
+}
+
 static bool IsMinMaxAggregateColumn(const BoundColumnRefExpression &column_ref,
                                     const unordered_map<idx_t, LogicalAggregate *> &aggregates) {
-	auto aggregate_it = aggregates.find(column_ref.binding.table_index);
-	if (aggregate_it == aggregates.end()) {
-		return false;
-	}
-	auto &aggregate = *aggregate_it->second;
-	if (column_ref.binding.column_index >= aggregate.expressions.size()) {
-		return false;
-	}
-	auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
-	if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
-		return false;
-	}
-	auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
-	return bound_aggregate.function.name == "min" || bound_aggregate.function.name == "max";
+	auto aggregate = ReferencedAggregate(column_ref, aggregates);
+	return aggregate && (aggregate->function.name == "min" || aggregate->function.name == "max");
 }
 
 static bool ExpressionReferencesMinMaxAggregate(Expression &expr,
@@ -878,19 +880,10 @@ static bool ExpressionReferencesUserSumAggregate(Expression &expr, const CreateM
 	}
 	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
 		auto &column_ref = expr.Cast<BoundColumnRefExpression>();
-		auto aggregate_it = aggregates.find(column_ref.binding.table_index);
-		if (aggregate_it != aggregates.end()) {
-			auto &aggregate = *aggregate_it->second;
-			if (column_ref.binding.column_index >= aggregate.expressions.size()) {
-				return false;
-			}
-			auto &aggregate_expr = aggregate.expressions[column_ref.binding.column_index];
-			if (aggregate_expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
-				return false;
-			}
-			auto &bound_aggregate = aggregate_expr->Cast<BoundAggregateExpression>();
-			return bound_aggregate.function.name == "sum" &&
-			       !IncrementalTableNames::IsInternalColumn(bound_aggregate.alias);
+		if (aggregates.count(column_ref.binding.table_index)) {
+			auto aggregate = ReferencedAggregate(column_ref, aggregates);
+			return aggregate && aggregate->function.name == "sum" &&
+			       !IncrementalTableNames::IsInternalColumn(aggregate->alias);
 		}
 		auto projection_it = facts.projections_by_index.find(column_ref.binding.table_index);
 		if (projection_it == facts.projections_by_index.end()) {
@@ -1826,7 +1819,7 @@ bool BuildLeftJoinKeySource(const CreateMVPlanFacts &facts, RefreshMetadata::Lef
 		out.table = source.table;
 		out.occurrence = source.occurrence;
 		out.column = source.column;
-		out.cardinality_transition_check_safe = facts.outer_join_count == 1 && join->conditions.size() == 1 &&
+		out.cardinality_transition_check_safe = facts.outer_joins.size() == 1 && join->conditions.size() == 1 &&
 		                                        join->conditions[0].comparison == ExpressionType::COMPARE_EQUAL;
 		return true;
 	}
@@ -1891,7 +1884,7 @@ bool BuildLeftJoinNullableSources(const CreateMVPlanFacts &facts, RefreshMetadat
 }
 
 struct WindowLineageOp {
-	string kind;
+	WindowLineageKind kind = WindowLineageKind::DIRECT;
 	string output_col;
 	string source_table;
 	idx_t source_occurrence = 0;
@@ -2055,7 +2048,7 @@ static void CollectWindowPartitionRefs(LogicalWindow &window, const CreateMVPlan
 						continue;
 					}
 					WindowLineageOp op;
-					op.kind = "direct";
+					op.kind = WindowLineageKind::DIRECT;
 					op.output_col = output_col;
 					op.source_table = ref.table;
 					op.source_occurrence = ref.occurrence;
@@ -2095,7 +2088,7 @@ static void AddUniqueLineageOp(vector<WindowLineageOp> &ops, WindowLineageOp op)
 static bool HasEquivalentPartitionRef(const vector<WindowLineageOp> &ops, const OccurrenceColumnRef &ref,
                                       const string &output_col) {
 	for (auto &op : ops) {
-		if (op.kind == "direct" && StringUtil::CIEquals(op.output_col, output_col) &&
+		if (op.kind == WindowLineageKind::DIRECT && StringUtil::CIEquals(op.output_col, output_col) &&
 		    StringUtil::CIEquals(op.source_table, ref.table) && op.source_occurrence == ref.occurrence &&
 		    StringUtil::CIEquals(op.source_col, ref.column)) {
 			return true;
@@ -2183,7 +2176,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 					continue;
 				}
 				WindowLineageOp equivalent;
-				equivalent.kind = "direct";
+				equivalent.kind = WindowLineageKind::DIRECT;
 				equivalent.output_col = direct.output_col;
 				equivalent.source_table = other.table;
 				equivalent.source_occurrence = other.occurrence;
@@ -2213,7 +2206,7 @@ bool BuildWindowPartitionLineageOps(const CreateMVPlanFacts &facts, const vector
 				continue;
 			}
 			WindowLineageOp lookup;
-			lookup.kind = "lookup";
+			lookup.kind = WindowLineageKind::LOOKUP;
 			lookup.output_col = direct.output_col;
 			lookup.source_table = edge.changed_join.table;
 			lookup.source_occurrence = edge.changed_join.occurrence;
@@ -2785,37 +2778,47 @@ static bool ColumnIsNotNull(LogicalGet &get, const string &column_name) {
 	return false;
 }
 
-static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateMVPlanFacts &facts,
-                                             const vector<string> &output_names, const string &view_name,
-                                             LogicalComparisonJoin *oj, size_t level,
-                                             const std::set<idx_t> &null_tables, vector<string> &preserved_cols,
-                                             const string &delta_view_catalog_prefix, string &out_inner_table,
-                                             string &out_inner_key, string &out_pres_table, string &out_pres_key) {
-	preserved_cols.clear();
-	if (facts.aggregates.size() != 1) {
+// The qualified identity of the view source `get` scans, which also names its base table; empty otherwise.
+static string ResolveSourceBase(const CreateMVPlanFacts &facts, LogicalGet &get) {
+	auto table = get.GetTable();
+	if (!table.get()) {
 		return "";
 	}
+	auto identity = SqlUtils::FullName(table->ParentCatalog().GetName(), table->schema.name, table->name);
+	return facts.source_table_info.count(identity) ? identity : string();
+}
+
+// Appends this level's SQL and source identities to `meta`; false when the level is unsupported.
+static bool BuildLeftJoinSecondaryForLevel(ClientContext &context, const CreateMVPlanFacts &facts,
+                                           const vector<string> &output_names, const string &view_name,
+                                           LogicalComparisonJoin *oj, size_t level, const std::set<idx_t> &null_tables,
+                                           const string &delta_view_catalog_prefix,
+                                           RefreshMetadata::LeftJoinSecondaryMeta &meta) {
+	vector<string> preserved_cols;
+	if (facts.aggregates.size() != 1) {
+		return false;
+	}
 	if (!oj || oj->join_type != JoinType::LEFT || oj->conditions.size() != 1 || oj->children.size() != 2) {
-		return "";
+		return false;
 	}
 	// Binder can flatten a filtered preserved-side subquery by lifting its
 	// LogicalFilter above the join. Inspect the complete view plan as well as
 	// the local children; secondary transition counts are valid only when no
 	// additional cardinality predicate exists anywhere in this aggregate view.
 	if (facts.has_cardinality_changing_filter) {
-		return "";
+		return false;
 	}
 	// __newc below counts rows directly in the inner base table. A filter or any other
 	// cardinality-changing inner subtree (including a right-only ON predicate pushed below
 	// the join) would make that count differ from the actual join matches.
 	if (!IsUnfilteredGetSubtree(oj->children[1].get())) {
-		return "";
+		return false;
 	}
 	auto &condition = oj->conditions[0];
 	if (condition.comparison != ExpressionType::COMPARE_EQUAL ||
 	    condition.left->expression_class != ExpressionClass::BOUND_COLUMN_REF ||
 	    condition.right->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
-		return "";
+		return false;
 	}
 	// Every LEFT JOIN level needs the secondary, including a SINGLE left join whose preserved side is a
 	// bare table. The old comment here claimed the primary delta already emits the null-padded
@@ -2827,7 +2830,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	auto &agg = *facts.aggregates[0];
 	size_t G = agg.groups.size();
 	if (G == 0 || output_names.size() < G + agg.expressions.size()) {
-		return "";
+		return false;
 	}
 	// Deepest-join keys: condition.left = preserved side, condition.right = inner (null) side.
 	auto &pres_ref = condition.left->Cast<BoundColumnRefExpression>();
@@ -2835,27 +2838,13 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	ColumnBinding key_pres = pres_ref.binding;
 	LogicalGet *inner_get = nullptr;
 	string inner_col;
-	if (!ResolveBindingToGetColumn(inner_ref.binding, facts, inner_get, inner_col) || !inner_get ||
-	    !inner_get->GetTable().get()) {
-		return "";
+	if (!ResolveBindingToGetColumn(inner_ref.binding, facts, inner_get, inner_col) || !inner_get) {
+		return false;
 	}
-	idx_t inner_tidx = inner_get->table_index;
-	string inner_table = inner_get->GetTable().get()->name;
-	auto sti = facts.source_table_info.find(SqlUtils::FullName(inner_get->GetTable()->ParentCatalog().GetName(),
-	                                                           inner_get->GetTable()->schema.name, inner_table));
-	if (sti == facts.source_table_info.end()) {
-		return "";
+	auto inner_identity = ResolveSourceBase(facts, *inner_get);
+	if (inner_identity.empty()) {
+		return false;
 	}
-	string cat = sti->second.catalog_name;
-	string sch = sti->second.schema_name;
-	string qual;
-	if (!cat.empty()) {
-		qual += KeywordHelper::WriteOptionallyQuoted(cat) + ".";
-	}
-	if (!sch.empty()) {
-		qual += KeywordHelper::WriteOptionallyQuoted(sch) + ".";
-	}
-	string inner_base = qual + KeywordHelper::WriteOptionallyQuoted(inner_table);
 	string qcol = KeywordHelper::WriteOptionallyQuoted(inner_col);
 
 	// The correction below assumes a dangling (null-padded) row for this key is ALREADY materialized
@@ -2866,33 +2855,20 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	// own base table/column so we can gate on "did this key exist before this batch's delta."
 	LogicalGet *pres_get = nullptr;
 	string pres_col;
-	if (!ResolveBindingToGetColumn(key_pres, facts, pres_get, pres_col) || !pres_get || !pres_get->GetTable().get()) {
-		return "";
+	if (!ResolveBindingToGetColumn(key_pres, facts, pres_get, pres_col) || !pres_get) {
+		return false;
 	}
-	string pres_table = pres_get->GetTable().get()->name;
-	auto pres_identity = SqlUtils::FullName(pres_get->GetTable()->ParentCatalog().GetName(),
-	                                        pres_get->GetTable()->schema.name, pres_table);
-	auto inner_identity = SqlUtils::FullName(cat, sch, inner_table);
-	if (pres_get->table_index == inner_tidx || StringUtil::CIEquals(pres_identity, inner_identity)) {
+	auto pres_identity = ResolveSourceBase(facts, *pres_get);
+	if (pres_identity.empty()) {
+		return false;
+	}
+	if (pres_get->table_index == inner_get->table_index || StringUtil::CIEquals(pres_identity, inner_identity)) {
 		// Self-referencing deepest join (preserved and inner sides are the same base table): the
 		// old_pres_count/old_count arithmetic below assumes two distinct tables with independent
 		// delta tracking. Bail rather than risk generating ambiguous or incorrect SQL for this rare
 		// shape.
-		return "";
+		return false;
 	}
-	auto pres_sti = facts.source_table_info.find(SqlUtils::FullName(pres_get->GetTable()->ParentCatalog().GetName(),
-	                                                                pres_get->GetTable()->schema.name, pres_table));
-	if (pres_sti == facts.source_table_info.end()) {
-		return "";
-	}
-	string pres_qual;
-	if (!pres_sti->second.catalog_name.empty()) {
-		pres_qual += KeywordHelper::WriteOptionallyQuoted(pres_sti->second.catalog_name) + ".";
-	}
-	if (!pres_sti->second.schema_name.empty()) {
-		pres_qual += KeywordHelper::WriteOptionallyQuoted(pres_sti->second.schema_name) + ".";
-	}
-	string pres_base = pres_qual + KeywordHelper::WriteOptionallyQuoted(pres_table);
 	string pres_qcol = KeywordHelper::WriteOptionallyQuoted(pres_col);
 
 	// Classify each aggregate output column's contribution to a null-padded row of the deepest join.
@@ -2906,7 +2882,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		if (j < agg.expressions.size()) {
 			auto &e = agg.expressions[j];
 			if (e->expression_class != ExpressionClass::BOUND_AGGREGATE) {
-				return "";
+				return false;
 			}
 			auto &ba = e->Cast<BoundAggregateExpression>();
 			string fn = StringUtil::Lower(ba.function.name);
@@ -2916,7 +2892,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 			}
 			auto *cref = GetColumnRefThroughCasts(ba.children[0].get());
 			if (!cref) {
-				return "";
+				return false;
 			}
 			LogicalGet *g = nullptr;
 			string c;
@@ -2924,7 +2900,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 			bool is_inner = resolved && g && null_tables.count(g->table_index) > 0;
 			if (fn == "count") {
 				if (!is_inner && (!resolved || !g || !ColumnIsNotNull(*g, c))) {
-					return "";
+					return false;
 				}
 				contribs.push_back(is_inner ? "0" : "1");
 				if (!is_inner) {
@@ -2935,10 +2911,10 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 				if (is_inner) {
 					contribs.push_back("0");
 				} else {
-					return ""; // preserved-side SUM needs the value; defer to a later generalization
+					return false; // preserved-side SUM needs the value; defer to a later generalization
 				}
 			} else {
-				return "";
+				return false;
 			}
 		} else {
 			// Hidden helper columns are internally generated with fixed openivm_* names (never
@@ -2950,7 +2926,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 			           StringUtil::StartsWith(col, "openivm_nonnull_sum_count")) {
 				contribs.push_back("0");
 			} else {
-				return "";
+				return false;
 			}
 		}
 	}
@@ -2963,7 +2939,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	for (auto &ge : agg.groups) {
 		auto *gr = GetColumnRefThroughCasts(ge.get());
 		if (!gr) {
-			return "";
+			return false;
 		}
 		group_bindings.push_back(gr->binding);
 	}
@@ -2992,11 +2968,11 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		}
 	}
 	if (key_pos < 0) {
-		return "";
+		return false;
 	}
 	for (size_t gi = 0; gi < G; gi++) {
 		if (group_pos[gi] < 0) {
-			return "";
+			return false;
 		}
 	}
 	string x_sql;
@@ -3008,7 +2984,7 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 		x_sql.pop_back();
 	}
 	if (x_sql.empty()) {
-		return "";
+		return false;
 	}
 
 	// delta_mv columns: group cols + aggregate cols + openivm_multiplicity (matches the primary INSERT).
@@ -3025,11 +3001,6 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	col_list += "openivm_multiplicity";
 	sel += "CASE WHEN (__newc - __t.dsum) > 0 AND __newc = 0 THEN 1 ELSE -1 END";
 
-	out_inner_table = inner_identity;
-	out_inner_key = inner_col;
-	out_pres_table = pres_identity;
-	out_pres_key = pres_col;
-
 	// Must carry the same catalog prefix the delta table was created with. Unqualified works only when
 	// the MV's state lives in the default catalog; a DuckLake-backed view's delta table is
 	// dl.main.openivm_delta_<view>, and an unqualified INSERT there fails the whole refresh.
@@ -3045,13 +3016,23 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 	// the delta keys measured ~40% SLOWER at TPC-H SF50 (DuckDB already decorrelates them well).
 	string sql = "INSERT INTO " + dmv + " (" + col_list + ")\nSELECT " + sel +
 	             "\nFROM (SELECT __k, SUM(__m) AS dsum FROM " + inner_delta_src + " GROUP BY __k) __t\nJOIN (" + x_sql +
-	             ") X ON X.\"" + key_alias + "\" = __t.__k,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + inner_base +
+	             ") X ON X.\"" + key_alias + "\" = __t.__k,\nLATERAL (SELECT (SELECT COUNT(*) FROM " + inner_identity +
 	             " ib WHERE ib." + qcol + " = __t.__k) AS __newc) __n,\nLATERAL (SELECT (SELECT COUNT(*) FROM " +
-	             pres_base + " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(__m) FROM " +
+	             pres_identity + " pb WHERE pb." + pres_qcol + " = __t.__k) - COALESCE((SELECT SUM(__m) FROM " +
 	             pres_delta_src +
 	             " __pd WHERE __pd.__k = __t.__k), 0) AS __old_pres_count) __op"
 	             "\nWHERE (__newc > 0) <> ((__newc - __t.dsum) > 0) AND __old_pres_count > 0;";
-	return sql;
+	meta.sql += (meta.sql.empty() ? "" : "\n") + sql;
+	meta.inner_tables.push_back(inner_identity);
+	meta.inner_keys.push_back(inner_col);
+	meta.pres_tables.push_back(pres_identity);
+	meta.pres_keys.push_back(pres_col);
+	for (auto &col : preserved_cols) {
+		if (std::find(meta.preserved_cols.begin(), meta.preserved_cols.end(), col) == meta.preserved_cols.end()) {
+			meta.preserved_cols.push_back(col);
+		}
+	}
+	return true;
 }
 
 // Emit a secondary delta for EVERY LEFT JOIN level whose preserved side is itself a join.
@@ -3064,14 +3045,12 @@ static string BuildLeftJoinSecondaryForLevel(ClientContext &context, const Creat
 // The per-level SQL fragments are concatenated and the two source identities per level are stored as
 // index-aligned arrays, so refresh can resolve each level's placeholders independently (a regular
 // table reads its delta table, a DuckLake table reads snapshot insertions/deletions).
-string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlanFacts &facts,
-                                      const vector<string> &output_names, const string &view_name,
-                                      vector<string> &preserved_cols, const string &delta_view_catalog_prefix,
-                                      vector<string> &out_inner_tables, vector<string> &out_inner_keys,
-                                      vector<string> &out_pres_tables, vector<string> &out_pres_keys) {
-	preserved_cols.clear();
-	string combined_sql;
-	vector<string> inner_tables, inner_keys, pres_tables, pres_keys;
+RefreshMetadata::LeftJoinSecondaryMeta BuildLeftJoinSecondaryDeltaSQL(ClientContext &context,
+                                                                      const CreateMVPlanFacts &facts,
+                                                                      const vector<string> &output_names,
+                                                                      const string &view_name,
+                                                                      const string &delta_view_catalog_prefix) {
+	RefreshMetadata::LeftJoinSecondaryMeta meta;
 	LeftJoinInnerTableMap join_inner_tables;
 	for (auto *join : facts.comparison_joins) {
 		if (!join || join->join_type != JoinType::LEFT || join->children.size() != 2) {
@@ -3079,7 +3058,7 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 		}
 		auto *subtree = GetPlanNodeFacts(facts, join->children[1].get());
 		if (!subtree) {
-			return "";
+			return {};
 		}
 		join_inner_tables.emplace(
 		    join, std::set<idx_t>(subtree->subtree_table_indices.begin(), subtree->subtree_table_indices.end()));
@@ -3093,37 +3072,15 @@ string BuildLeftJoinSecondaryDeltaSQL(ClientContext &context, const CreateMVPlan
 		// bare table -- see the note in BuildLeftJoinSecondaryForLevel for why the primary delta does
 		// NOT cover that case.
 		auto null_tables = ComputeNullTablesForLevel(facts, oj, join_inner_tables);
-		vector<string> level_preserved;
-		string it, ik, pt, pk;
-		string level_sql =
-		    BuildLeftJoinSecondaryForLevel(context, facts, output_names, view_name, oj, level, null_tables,
-		                                   level_preserved, delta_view_catalog_prefix, it, ik, pt, pk);
-		if (level_sql.empty()) {
+		if (!BuildLeftJoinSecondaryForLevel(context, facts, output_names, view_name, oj, level, null_tables,
+		                                    delta_view_catalog_prefix, meta)) {
 			// An unsupported level makes the whole correction incomplete, and a partial correction is
 			// worse than none (it would double-count the levels it does cover). Bail entirely.
-			preserved_cols.clear();
-			return "";
-		}
-		combined_sql += (combined_sql.empty() ? "" : "\n") + level_sql;
-		inner_tables.push_back(it);
-		inner_keys.push_back(ik);
-		pres_tables.push_back(pt);
-		pres_keys.push_back(pk);
-		for (auto &c : level_preserved) {
-			if (std::find(preserved_cols.begin(), preserved_cols.end(), c) == preserved_cols.end()) {
-				preserved_cols.push_back(c);
-			}
+			return {};
 		}
 		level++;
 	}
-	if (combined_sql.empty()) {
-		return "";
-	}
-	out_inner_tables = std::move(inner_tables);
-	out_inner_keys = std::move(inner_keys);
-	out_pres_tables = std::move(pres_tables);
-	out_pres_keys = std::move(pres_keys);
-	return combined_sql;
+	return meta;
 }
 
 } // namespace duckdb

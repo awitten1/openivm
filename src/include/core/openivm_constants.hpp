@@ -128,6 +128,13 @@ enum class RefreshType : uint8_t {
 	COUNT_DISTINCT_INCREMENTAL = 11 // COUNT(DISTINCT x) with per-(group,x) multiplicity aux state
 };
 
+// Persisted by name (index into the *_NAMES arrays) in openivm_views JSON metadata.
+enum class SemiAntiJoinType : uint8_t { SEMI, ANTI };
+constexpr const char *SEMI_ANTI_JOIN_TYPE_NAMES[] = {"semi", "anti"};
+// A window partition key read directly from a source, or through a lookup join.
+enum class WindowLineageKind : uint8_t { DIRECT, LOOKUP };
+constexpr const char *WINDOW_LINEAGE_KIND_NAMES[] = {"direct", "lookup"};
+
 inline bool IsValidRefreshTypeOrdinal(int64_t raw) {
 	return (raw >= 0 && raw <= 9) || raw == 11;
 }

@@ -14,6 +14,7 @@
 #include "core/sql_utils.hpp"
 #include "rules/column_hider.hpp"
 
+#include <algorithm>
 #include <chrono>
 
 namespace duckdb {
@@ -22,23 +23,7 @@ string SqlCsvLiteralOrNull(const vector<string> &values) {
 	if (values.empty()) {
 		return "null";
 	}
-	string result = "'";
-	for (size_t i = 0; i < values.size(); i++) {
-		if (i > 0) {
-			result += ",";
-		}
-		result += SqlUtils::EscapeSingleQuotes(values[i]);
-	}
-	result += "'";
-	return result;
-}
-
-static void AddColumnIfNotExists(vector<string> &ddl, const string &table_name, optional_ptr<TableCatalogEntry> table,
-                                 const string &column_definition) {
-	if (table && table->ColumnExists(column_definition.substr(0, column_definition.find(' ')))) {
-		return;
-	}
-	ddl.push_back("alter table " + table_name + " add column if not exists " + column_definition);
+	return "'" + StringUtil::Join(values, values.size(), ",", SqlUtils::EscapeSingleQuotes) + "'";
 }
 
 // Read the caller's snapshot, including metadata inserted earlier in this
@@ -71,102 +56,137 @@ string BuildUpdateViewJsonSQL(const string &column_name, const string &json, con
 	       SqlUtils::EscapeSingleQuotes(json) + "' WHERE view_name = '" + SqlUtils::EscapeSingleQuotes(view_name) + "'";
 }
 
-static const vector<std::pair<string, string>> &MetadataTableDefinitions() {
-	// Matcher metadata columns (signature_hash..nullified_columns_json) stay
-	// NULL unless openivm_enable_view_matching=true; populated by Stage I wiring.
-	// Refresh hooks: extensions can register custom SQL to run on MV refresh
-	// mode: 'replace' (instead of ivm), 'before' (before ivm), 'after' (after ivm).
-	// Refresh history stores execution stats for learned cost model calibration;
-	// Stage A.5 adds `strategy` (default 'incremental') for per-strategy regression.
-	static const vector<std::pair<string, string>> definitions = {
-	    {openivm::MV_DEPS_TABLE, "(parent_view VARCHAR, child_view VARCHAR, edge_kind VARCHAR DEFAULT 'direct',"
-	                             " PRIMARY KEY (parent_view, child_view))"},
+namespace {
+
+enum class MetadataStore : uint8_t { ANY, LOCAL, REMOTE };
+constexpr bool ADDED = true;
+
+// Column definitions of a control-metadata table, in CREATE TABLE order (an entry may hold several
+// columns or a table constraint). An ADDED column postdates the table's first release: existing
+// tables receive it through `migration` (default: its definition). LOCAL and REMOTE columns exist
+// only in native or remote metadata catalogs respectively.
+struct MetadataColumn {
+	// Implicit string conversion keeps unchanged column definitions readable in the table-definition list.
+	// NOLINTNEXTLINE(google-explicit-constructor)
+	MetadataColumn(const char *definition, bool added = false, MetadataStore store = MetadataStore::ANY,
+	               const char *migration = nullptr)
+	    : definition(definition), added(added), store(store), migration(migration ? migration : definition) {
+	}
+	bool In(bool remote) const {
+		return store == MetadataStore::ANY || (store == MetadataStore::REMOTE) == remote;
+	}
+	const char *definition;
+	bool added;
+	MetadataStore store;
+	const char *migration;
+};
+
+} // namespace
+
+static const vector<std::pair<string, vector<MetadataColumn>>> &MetadataTableDefinitions() {
+	// Matcher metadata columns (signature_hash..nullified_columns_json) stay NULL unless
+	// openivm_enable_view_matching=true. Remote catalogs instead track a per-view refresh_epoch:
+	// an epoch bump marks a view whose lease was overrun, so the next refresh recomputes it.
+	// Refresh hooks run custom SQL on MV refresh; mode: 'replace' (instead of ivm), 'before', 'after'.
+	// Refresh history stores execution stats for learned cost model calibration, per strategy.
+	static const vector<std::pair<string, vector<MetadataColumn>>> definitions = {
+	    {openivm::MV_DEPS_TABLE,
+	     {"parent_view VARCHAR, child_view VARCHAR, edge_kind VARCHAR DEFAULT 'direct'",
+	      "PRIMARY KEY (parent_view, child_view)"}},
 	    {openivm::VIEWS_TABLE,
-	     "(view_name varchar primary key, view_catalog varchar default null,"
-	     " view_schema varchar default null, view_sql_name varchar default null, sql_string varchar, type tinyint,"
-	     " has_minmax boolean default false, has_left_join boolean default false,"
-	     " has_join boolean default false,"
-	     " last_update timestamp, refresh_interval bigint default null,"
-	     " refresh_in_progress boolean default false,"
-	     " group_columns varchar default null,"
-	     " window_order_columns varchar default null,"
-	     " aggregate_types varchar default null,"
-	     " derived_aggregate_outputs_json varchar default null,"
-	     " having_predicate varchar default null,"
-	     " group_recompute_affected_mode varchar default null,"
-	     " group_recompute_source_occurrences_json varchar default null,"
-	     " has_full_outer boolean default false,"
-	     " full_outer_join_cols varchar default null,"
-	     " signature_hash ubigint default null,"
-	     " canonical_plan_blob blob default null,"
-	     " output_columns_json varchar default null,"
-	     " predicate_summary_json varchar default null,"
-	     " fd_summary_json varchar default null,"
-	     " source_tables_json varchar default null,"
-	     " aggregate_decomposition_json varchar default null,"
-	     " nullified_columns_json varchar default null,"
-	     " distinct_aux_meta_json varchar default null,"
-	     " count_distinct_aux_meta_json varchar default null,"
-	     " semi_anti_aux_meta_json varchar default null,"
-	     " lineage_json varchar default null,"
-	     " leftjoin_secondary_meta_json varchar default null,"
-	     " published_query varchar default null,"
-	     " pending_after_hook boolean default null,"
-	     " internal_schema varchar default null)"},
-	    {openivm::REFRESH_HOOKS_TABLE, "(view_name varchar primary key, hook_sql varchar not null,"
-	                                   " mode varchar not null default 'after')"},
-	    {openivm::DELTA_TABLES_TABLE, "(view_name varchar, table_name varchar, last_update timestamp,"
-	                                  " catalog_type varchar default 'duckdb', last_snapshot_id bigint default "
-	                                  "null,"
-	                                  " last_refresh_ts timestamp default null,"
-	                                  " pending_row_estimate bigint default null,"
-	                                  " pending_estimate_ts timestamp default null,"
-	                                  " source_catalog varchar default null,"
-	                                  " source_schema varchar default null,"
-	                                  " source_table_id bigint default null,"
-	                                  " delta_schema varchar default null,"
-	                                  " delta_table_name varchar default null,"
-	                                  " primary key(view_name, table_name))"},
-	    {openivm::HISTORY_TABLE, "(view_name varchar, refresh_timestamp timestamp default "
-	                             "current_timestamp,"
-	                             " method varchar, incremental_compute_est double, "
-	                             "incremental_upsert_est double,"
-	                             " recompute_compute_est double, recompute_replace_est double,"
-	                             " actual_duration_ms bigint,"
-	                             " strategy varchar default 'incremental',"
-	                             " primary key(view_name, refresh_timestamp))"},
-	    {openivm::PROFILE_TABLE, "(refresh_id varchar, view_name varchar,"
-	                             " profile_timestamp timestamp default current_timestamp,"
-	                             " step_order integer, step_name varchar, duration_ms bigint, "
-	                             "detail varchar,"
-	                             " primary key(refresh_id, step_order))"},
-	    {openivm::MATCH_LOG_TABLE, "(query_hash UBIGINT,"
-	                               " log_timestamp TIMESTAMP,"
-	                               " matched_view VARCHAR,"
-	                               " chosen_strategy VARCHAR,"
-	                               " bypass_cost_est DOUBLE,"
-	                               " chosen_cost_est DOUBLE,"
-	                               " actual_duration_ms BIGINT,"
-	                               " PRIMARY KEY (query_hash, log_timestamp))"},
+	     {"view_name varchar primary key",
+	      {"view_catalog varchar default null", ADDED},
+	      {"view_schema varchar default null", ADDED},
+	      {"view_sql_name varchar default null", ADDED},
+	      "sql_string varchar",
+	      {"type tinyint", false, MetadataStore::LOCAL},
+	      {"type smallint", false, MetadataStore::REMOTE},
+	      "has_minmax boolean default false, has_left_join boolean default false",
+	      // NULL for existing rows until the backfill in HasJoinBackfillSQL classifies them.
+	      {"has_join boolean default false", ADDED, MetadataStore::ANY, "has_join boolean default null"},
+	      "last_update timestamp",
+	      {"refresh_interval bigint default null", ADDED},
+	      {"refresh_in_progress boolean default false", ADDED},
+	      "group_columns varchar default null",
+	      {"window_order_columns varchar default null", ADDED},
+	      "aggregate_types varchar default null",
+	      {"derived_aggregate_outputs_json varchar default null", ADDED},
+	      "having_predicate varchar default null",
+	      {"group_recompute_affected_mode varchar default null", ADDED},
+	      {"group_recompute_source_occurrences_json varchar default null", ADDED},
+	      "has_full_outer boolean default false, full_outer_join_cols varchar default null",
+	      {"signature_hash ubigint default null", ADDED, MetadataStore::LOCAL},
+	      {"canonical_plan_blob blob default null", ADDED, MetadataStore::LOCAL},
+	      {"refresh_epoch bigint default 0", ADDED, MetadataStore::REMOTE},
+	      {"output_columns_json varchar default null", ADDED},
+	      {"predicate_summary_json varchar default null", ADDED},
+	      {"fd_summary_json varchar default null", ADDED},
+	      {"source_tables_json varchar default null", ADDED},
+	      {"aggregate_decomposition_json varchar default null", ADDED},
+	      {"nullified_columns_json varchar default null", ADDED},
+	      {"distinct_aux_meta_json varchar default null", ADDED},
+	      {"count_distinct_aux_meta_json varchar default null", ADDED},
+	      {"semi_anti_aux_meta_json varchar default null", ADDED},
+	      {"lineage_json varchar default null", ADDED},
+	      {"leftjoin_secondary_meta_json varchar default null", ADDED},
+	      {"published_query varchar default null", ADDED},
+	      {"pending_after_hook boolean default null", ADDED},
+	      {"internal_schema varchar default null", ADDED}}},
+	    {openivm::REFRESH_HOOKS_TABLE,
+	     {"view_name varchar primary key, hook_sql varchar not null, mode varchar not null default 'after'"}},
+	    {openivm::DELTA_TABLES_TABLE,
+	     {"view_name varchar, table_name varchar, last_update timestamp, catalog_type varchar default 'duckdb'",
+	      "last_snapshot_id bigint default null",
+	      {"last_refresh_ts timestamp default null", ADDED},
+	      {"pending_row_estimate bigint default null", ADDED},
+	      {"pending_estimate_ts timestamp default null", ADDED},
+	      {"source_catalog varchar default null", ADDED},
+	      {"source_schema varchar default null", ADDED},
+	      {"source_table_id bigint default null", ADDED},
+	      {"delta_schema varchar default null", ADDED},
+	      {"delta_table_name varchar default null", ADDED},
+	      "primary key(view_name, table_name)"}},
+	    {openivm::HISTORY_TABLE,
+	     {"view_name varchar, refresh_timestamp timestamp default current_timestamp, method varchar, "
+	      "incremental_compute_est double, incremental_upsert_est double, recompute_compute_est double, "
+	      "recompute_replace_est double, actual_duration_ms bigint",
+	      {"strategy varchar default 'incremental'", ADDED},
+	      "primary key(view_name, refresh_timestamp)"}},
+	    {openivm::PROFILE_TABLE,
+	     {"refresh_id varchar, view_name varchar, profile_timestamp timestamp default current_timestamp, "
+	      "step_order integer, step_name varchar, duration_ms bigint, detail varchar",
+	      "primary key(refresh_id, step_order)"}},
+	    {openivm::MATCH_LOG_TABLE,
+	     {"query_hash UBIGINT, log_timestamp TIMESTAMP, matched_view VARCHAR, chosen_strategy VARCHAR, "
+	      "bypass_cost_est DOUBLE, chosen_cost_est DOUBLE, actual_duration_ms BIGINT",
+	      "PRIMARY KEY (query_hash, log_timestamp)"}},
 	    {openivm::COMPILED_PROGRAMS_TABLE,
-	     "(view_name varchar, view_catalog varchar, view_schema varchar, view_sql_name varchar,"
-	     " operation varchar, version integer, statement_count integer,"
-	     " compilation_id varchar, compiled_at timestamp,"
-	     " last_compilation_id varchar, last_outcome varchar, last_outcome_at timestamp,"
-	     " committed_count bigint default 0, primary key (view_name, operation, version))"},
+	     {"view_name varchar, view_catalog varchar, view_schema varchar, view_sql_name varchar, operation varchar, "
+	      "version integer, statement_count integer, compilation_id varchar, compiled_at timestamp, "
+	      "last_compilation_id varchar, last_outcome varchar, last_outcome_at timestamp, "
+	      "committed_count bigint default 0",
+	      "primary key (view_name, operation, version)"}},
 	    {openivm::COMPILED_STATEMENTS_TABLE,
-	     "(view_name varchar, operation varchar, version integer, stmt_order integer, sql varchar,"
-	     " primary key (view_name, operation, version, stmt_order))"},
+	     {"view_name varchar, operation varchar, version integer, stmt_order integer, sql varchar",
+	      "primary key (view_name, operation, version, stmt_order)"}},
 	    {openivm::REFRESH_LEASE_TABLE,
-	     "(view_name varchar primary key, owner varchar not null, lease_until timestamp not null)"},
+	     {"view_name varchar primary key, owner varchar not null, lease_until timestamp not null"}},
 	    {openivm::CONSTRAINTS_CACHE_TABLE,
-	     "(table_name VARCHAR, constraint_kind VARCHAR,"
-	     " columns_json VARCHAR, referenced_table VARCHAR,"
-	     " referenced_columns_json VARCHAR,"
-	     " is_trusted BOOLEAN DEFAULT true, child_generation VARCHAR, parent_generation VARCHAR,"
-	     " PRIMARY KEY (table_name, constraint_kind, columns_json))"},
+	     {"table_name VARCHAR, constraint_kind VARCHAR, columns_json VARCHAR, referenced_table VARCHAR, "
+	      "referenced_columns_json VARCHAR, is_trusted BOOLEAN DEFAULT true, child_generation VARCHAR, "
+	      "parent_generation VARCHAR",
+	      "PRIMARY KEY (table_name, constraint_kind, columns_json)"}},
 	};
 	return definitions;
+}
+
+static const vector<MetadataColumn> &MetadataColumns(const string &table) {
+	for (auto &definition : MetadataTableDefinitions()) {
+		if (definition.first == table) {
+			return definition.second;
+		}
+	}
+	throw InternalException("Unknown OpenIVM metadata table '%s'", table);
 }
 
 const vector<string> &MetadataTableNames() {
@@ -181,98 +201,70 @@ const vector<string> &MetadataTableNames() {
 }
 
 string CreateMetadataTableSQL(const string &table, const string &target, bool remote) {
-	for (auto &definition : MetadataTableDefinitions()) {
-		if (definition.first == table) {
-			auto columns = definition.second;
-			if (remote && table == openivm::VIEWS_TABLE) {
-				columns = StringUtil::Replace(columns, "type tinyint", "type smallint");
-				columns = StringUtil::Replace(
-				    columns, " signature_hash ubigint default null, canonical_plan_blob blob default null,",
-				    " refresh_epoch bigint default 0,");
-			}
-			return "create table if not exists " + (target.empty() ? table : target) + " " + columns;
+	vector<string> columns;
+	for (auto &column : MetadataColumns(table)) {
+		if (column.In(remote)) {
+			columns.push_back(column.definition);
 		}
 	}
-	throw InternalException("Unknown OpenIVM metadata table '%s'", table);
+	return "create table if not exists " + (target.empty() ? table : target) + " (" + StringUtil::Join(columns, ", ") +
+	       ")";
 }
 
 string CreateMVDependenciesSQL() {
 	return CreateMetadataTableSQL(openivm::MV_DEPS_TABLE);
 }
 
+void AppendMetadataMigrationSQL(vector<string> &ddl, const string &table, optional_ptr<TableCatalogEntry> existing,
+                                bool remote) {
+	for (auto &column : MetadataColumns(table)) {
+		string definition = column.migration;
+		if (column.added && column.In(remote) &&
+		    !(existing && existing->ColumnExists(definition.substr(0, definition.find(' '))))) {
+			ddl.push_back("alter table " + table + " add column if not exists " + definition);
+		}
+	}
+}
+
+vector<string> HasJoinBackfillSQL() {
+	return {"UPDATE " + string(openivm::VIEWS_TABLE) +
+	            " SET has_join = true WHERE has_join IS NULL AND (COALESCE(has_left_join, false) OR "
+	            "COALESCE(has_full_outer, false) OR view_name IN (SELECT view_name FROM " +
+	            string(openivm::DELTA_TABLES_TABLE) +
+	            " GROUP BY view_name HAVING COUNT(*) > 1) OR regexp_matches(COALESCE(sql_string, ''), "
+	            "'(^|[^A-Za-z0-9_])join([^A-Za-z0-9_]|$)', 'i'))",
+	        "UPDATE " + string(openivm::VIEWS_TABLE) + " SET has_join = false WHERE has_join IS NULL"};
+}
+
 static void AppendMetadataSchemaDDL(ClientContext &context, const string &catalog, const string &schema,
                                     vector<string> &ddl, bool remote) {
-	// Inspect this transaction's catalog, not a process-wide initialization flag: older
-	// databases and other attached catalogs must still receive missing columns.
-	auto views = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::VIEWS_TABLE,
-	                                                  OnEntryNotFound::RETURN_NULL);
-	auto deltas = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::DELTA_TABLES_TABLE,
-	                                                   OnEntryNotFound::RETURN_NULL);
-	auto history = Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, openivm::HISTORY_TABLE,
-	                                                    OnEntryNotFound::RETURN_NULL);
 	OPENIVM_DEBUG_PRINT("[CREATE] Checking metadata schema in %s.%s\n", catalog.c_str(), schema.c_str());
-	// Remote tables are created with every column; only migrate tables that already exist.
-	auto add_column = [&](vector<string> &target, const string &table_name, optional_ptr<TableCatalogEntry> table,
-	                      const string &column_definition) {
-		if (remote && !table) {
-			return;
-		}
-		AddColumnIfNotExists(target, table_name, table, column_definition);
-	};
-
-	ddl.push_back(CreateMVDependenciesSQL());
-	ddl.push_back(CreateMetadataTableSQL(openivm::VIEWS_TABLE, "", remote));
-	// Forward-compat ALTER for existing DBs that pre-date `distinct_aux_meta_json`
-	// (the CREATE IF NOT EXISTS above is a no-op when the table exists with the older schema).
-	add_column(ddl, openivm::VIEWS_TABLE, views, "distinct_aux_meta_json varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "count_distinct_aux_meta_json varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "semi_anti_aux_meta_json varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "lineage_json varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "leftjoin_secondary_meta_json varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "has_join boolean default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "group_recompute_affected_mode varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "group_recompute_source_occurrences_json varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "derived_aggregate_outputs_json varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "published_query varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "view_catalog varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "view_sql_name varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "view_schema varchar default null");
-	add_column(ddl, openivm::VIEWS_TABLE, views, "window_order_columns varchar default null");
-
-	add_column(ddl, openivm::VIEWS_TABLE, views, "pending_after_hook boolean default null");
+	vector<string> tables = {openivm::MV_DEPS_TABLE,      openivm::VIEWS_TABLE,   openivm::REFRESH_HOOKS_TABLE,
+	                         openivm::DELTA_TABLES_TABLE, openivm::HISTORY_TABLE, openivm::PROFILE_TABLE};
 	if (remote) {
-		// Clients sharing remote metadata serialize refreshes per view through a lease; an
-		// epoch bump marks a view whose lease was overrun so the next refresh recomputes it.
-		add_column(ddl, openivm::VIEWS_TABLE, views, "refresh_epoch bigint default 0");
-		ddl.push_back(CreateMetadataTableSQL(openivm::REFRESH_LEASE_TABLE));
+		// Clients sharing remote metadata serialize refreshes per view through a lease.
+		tables.push_back(openivm::REFRESH_LEASE_TABLE);
+	} else {
+		tables.push_back(openivm::MATCH_LOG_TABLE);
+		tables.push_back(openivm::CONSTRAINTS_CACHE_TABLE);
 	}
-	add_column(ddl, openivm::VIEWS_TABLE, views, "internal_schema varchar default null");
-
-	ddl.push_back(CreateMetadataTableSQL(openivm::REFRESH_HOOKS_TABLE));
-	ddl.push_back(CreateMetadataTableSQL(openivm::DELTA_TABLES_TABLE));
-	// Backfill for existing databases without the columns (added post-release).
-	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "last_refresh_ts timestamp default null");
-	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "pending_row_estimate bigint default null");
-	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "pending_estimate_ts timestamp default null");
-	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_catalog varchar default null");
-	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_schema varchar default null");
-	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "source_table_id bigint default null");
-	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "delta_schema varchar default null");
-	add_column(ddl, openivm::DELTA_TABLES_TABLE, deltas, "delta_table_name varchar default null");
-	ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) +
-	              " SET has_join = true WHERE has_join IS NULL AND (COALESCE(has_left_join, false) OR "
-	              "COALESCE(has_full_outer, false) OR view_name IN (SELECT view_name FROM " +
-	              string(openivm::DELTA_TABLES_TABLE) +
-	              " GROUP BY view_name HAVING COUNT(*) > 1) OR regexp_matches(COALESCE(sql_string, ''), "
-	              "'(^|[^A-Za-z0-9_])join([^A-Za-z0-9_]|$)', 'i'))");
-	ddl.push_back("UPDATE " + string(openivm::VIEWS_TABLE) + " SET has_join = false WHERE has_join IS NULL");
-
-	ddl.push_back(CreateMetadataTableSQL(openivm::HISTORY_TABLE));
-	add_column(ddl, openivm::HISTORY_TABLE, history, "strategy varchar default 'incremental'");
-	ddl.push_back(CreateMetadataTableSQL(openivm::PROFILE_TABLE));
-	if (!remote) {
-		ddl.push_back(CreateMetadataTableSQL(openivm::MATCH_LOG_TABLE));
-		ddl.push_back(CreateMetadataTableSQL(openivm::CONSTRAINTS_CACHE_TABLE));
+	for (auto &table : tables) {
+		ddl.push_back(CreateMetadataTableSQL(table, "", remote));
+		auto &columns = MetadataColumns(table);
+		if (std::none_of(columns.begin(), columns.end(), [](const MetadataColumn &column) { return column.added; })) {
+			continue;
+		}
+		// Inspect this transaction's catalog, not a process-wide initialization flag: older
+		// databases and other attached catalogs must still receive missing columns. A missing
+		// table is created above with every column.
+		auto existing =
+		    Catalog::GetEntry<TableCatalogEntry>(context, catalog, schema, table, OnEntryNotFound::RETURN_NULL);
+		if (existing) {
+			AppendMetadataMigrationSQL(ddl, table, existing, remote);
+		}
+	}
+	for (auto &statement : HasJoinBackfillSQL()) {
+		ddl.push_back(statement);
 	}
 	for (auto &statement : CompiledSQLArchiveSchemaDDL()) {
 		ddl.push_back(statement);

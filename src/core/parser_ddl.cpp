@@ -254,68 +254,55 @@ unique_ptr<GlobalTableFunctionState> DDLExecutorInitFunction(ClientContext &cont
 	return make_uniq<DDLExecutorGlobalData>();
 }
 
-void ParseCreateMVProfileMarker(const string &payload, string &view_name, string &step_name, string &detail) {
-	auto first = payload.find('\t');
-	auto second = first == string::npos ? string::npos : payload.find('\t', first + 1);
-	if (first == string::npos || second == string::npos) {
-		step_name = "create_mv_unclassified";
-		detail = payload;
-		return;
-	}
-	view_name = payload.substr(0, first);
-	step_name = payload.substr(first + 1, second - first - 1);
-	detail = payload.substr(second + 1);
-}
-
-void ParseCreateMVProfileRecord(const string &payload, string &view_name, string &step_name, int64_t &duration_ms,
-                                string &detail) {
-	auto first = payload.find('\t');
-	auto second = first == string::npos ? string::npos : payload.find('\t', first + 1);
-	auto third = second == string::npos ? string::npos : payload.find('\t', second + 1);
-	if (first == string::npos || second == string::npos || third == string::npos) {
-		step_name = "create_mv_unclassified";
-		duration_ms = 0;
-		detail = payload;
-		return;
-	}
-	view_name = payload.substr(0, first);
-	step_name = payload.substr(first + 1, second - first - 1);
-	try {
-		duration_ms = std::stoll(payload.substr(second + 1, third - second - 1));
-	} catch (...) {
-		duration_ms = 0;
-	}
-	detail = payload.substr(third + 1);
-}
-
-// Archive payload fields are tab-separated; names may contain tabs or backslashes.
-string EncodeArchiveField(const string &field) {
-	string result;
-	for (auto c : field) {
-		if (c == '\\') {
-			result += "\\\\";
-		} else if (c == '\t') {
-			result += "\\t";
-		} else {
-			result.push_back(c);
-		}
-	}
-	return result;
-}
-
-vector<string> DecodeArchiveFields(const string &payload) {
+// The fields of an operation encoded by EncodeDDLOperation, after its prefix.
+vector<string> DecodeDDLFields(const string &statement, const char *prefix) {
 	vector<string> fields(1);
-	for (idx_t i = 0; i < payload.size(); i++) {
-		if (payload[i] == '\t') {
+	for (idx_t i = strlen(prefix); i < statement.size(); i++) {
+		if (statement[i] == '\t') {
 			fields.emplace_back();
-		} else if (payload[i] == '\\' && i + 1 < payload.size()) {
+		} else if (statement[i] == '\\' && i + 1 < statement.size()) {
 			i++;
-			fields.back().push_back(payload[i] == 't' ? '\t' : payload[i]);
+			fields.back().push_back(statement[i] == 't' ? '\t' : statement[i]);
 		} else {
-			fields.back().push_back(payload[i]);
+			fields.back().push_back(statement[i]);
 		}
 	}
 	return fields;
+}
+
+// A CREATE profile marker opens a step measured by the executor; a record carries its own duration.
+struct ProfileOperation {
+	bool measured = false;
+	string view_name;
+	string step_name = "create_mv_unclassified";
+	int64_t duration_ms = 0;
+	string detail;
+};
+
+bool TryParseProfileOperation(const string &statement, ProfileOperation &op) {
+	const char *prefix = OPENIVM_DDL_PROFILE_PREFIX;
+	if (StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
+		op.measured = true;
+		prefix = OPENIVM_DDL_PROFILE_RECORD_PREFIX;
+	} else if (!StringUtil::StartsWith(statement, prefix)) {
+		return false;
+	}
+	auto fields = DecodeDDLFields(statement, prefix);
+	if (fields.size() != (op.measured ? 4 : 3)) {
+		op.detail = statement.substr(strlen(prefix));
+		return true;
+	}
+	op.view_name = fields[0];
+	op.step_name = fields[1];
+	op.detail = fields.back();
+	if (op.measured) {
+		try {
+			op.duration_ms = std::stoll(fields[2]);
+		} catch (...) {
+			op.duration_ms = 0;
+		}
+	}
+	return true;
 }
 
 const char *ArchiveModeName(DDLArchiveMode mode) {
@@ -334,22 +321,23 @@ struct DeltaSchemaDDL {
 	idx_t column_count = 0;
 };
 
-void ParseCreateDeltaFromDataPayload(const string &payload, bool &replace, string &delta_table, string &data_table) {
-	auto first = payload.find('\t');
-	if (first == string::npos) {
-		return;
+struct CreateDeltaOperation {
+	bool replace = false;
+	string delta_table;
+	string data_table;
+};
+
+// False for a malformed payload.
+bool ParseCreateDeltaOperation(const string &statement, CreateDeltaOperation &op) {
+	auto fields = DecodeDDLFields(statement, OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX);
+	if (fields.size() != 3 || (fields[0] != "create" && fields[0] != "replace") || fields[1].empty() ||
+	    fields[2].empty()) {
+		return false;
 	}
-	auto second = payload.find('\t', first + 1);
-	if (second == string::npos) {
-		return;
-	}
-	auto mode = payload.substr(0, first);
-	if (mode != "create" && mode != "replace") {
-		return;
-	}
-	replace = mode == "replace";
-	delta_table = payload.substr(first + 1, second - first - 1);
-	data_table = payload.substr(second + 1);
+	op.replace = fields[0] == "replace";
+	op.delta_table = fields[1];
+	op.data_table = fields[2];
+	return true;
 }
 
 static DeltaSchemaDDL BuildDeltaSchemaDDL(const vector<pair<string, string>> &source_columns, const string &delta_table,
@@ -561,8 +549,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		}
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX)) {
 			flush_pending();
-			auto payload = q.substr(strlen(OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX));
-			auto fields = StringUtil::Split(payload, '\t');
+			auto fields = DecodeDDLFields(q, OPENIVM_DDL_SNAPSHOT_PUBLICATION_PREFIX);
 			if (fields.size() != 4) {
 				fail_ddl("malformed snapshot-publication payload");
 			}
@@ -576,44 +563,31 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 			flush_pending();
 			continue;
 		}
-		if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
+		ProfileOperation profile_op;
+		if (TryParseProfileOperation(q, profile_op)) {
 			flush_pending();
-			string marker_view_name;
-			string measured_step_name;
-			string measured_detail;
-			int64_t measured_duration_ms = 0;
-			ParseCreateMVProfileRecord(q.substr(strlen(OPENIVM_DDL_PROFILE_RECORD_PREFIX)), marker_view_name,
-			                           measured_step_name, measured_duration_ms, measured_detail);
-			if (!marker_view_name.empty()) {
-				profiler.SetViewName(marker_view_name, *conn);
+			if (!profile_op.view_name.empty()) {
+				profiler.SetViewName(profile_op.view_name, *conn);
 			}
-			profiler.AddMeasuredStep(measured_step_name, measured_duration_ms, measured_detail);
-			continue;
-		}
-		if (StringUtil::StartsWith(q, OPENIVM_DDL_PROFILE_PREFIX)) {
-			flush_pending();
-			string marker_view_name;
-			ParseCreateMVProfileMarker(q.substr(strlen(OPENIVM_DDL_PROFILE_PREFIX)), marker_view_name,
-			                           current_profile_step, current_profile_detail);
-			if (!marker_view_name.empty()) {
-				profiler.SetViewName(marker_view_name, *conn);
+			if (profile_op.measured) {
+				profiler.AddMeasuredStep(profile_op.step_name, profile_op.duration_ms, profile_op.detail);
+			} else {
+				current_profile_step = profile_op.step_name;
+				current_profile_detail = profile_op.detail;
 			}
 			continue;
 		}
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
 			flush_pending();
-			bool replace = false;
-			string delta_table;
-			string data_table;
-			ParseCreateDeltaFromDataPayload(q.substr(strlen(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)), replace,
-			                                delta_table, data_table);
-			if (delta_table.empty() || data_table.empty()) {
+			CreateDeltaOperation operation;
+			if (!ParseCreateDeltaOperation(q, operation)) {
 				fail_ddl("malformed delta-schema payload");
 			}
 			auto ddl_start = std::chrono::steady_clock::now();
 			DeltaSchemaDDL derived;
 			try {
-				derived = BuildCreateDeltaFromDataSQL(*conn, delta_table, data_table, replace);
+				derived =
+				    BuildCreateDeltaFromDataSQL(*conn, operation.delta_table, operation.data_table, operation.replace);
 			} catch (std::exception &ex) {
 				profiler.AddStep(current_profile_step, ddl_start,
 				                 current_profile_detail + "; delta_schema_derivation_failed=true");
@@ -645,7 +619,7 @@ void ExecuteDDL(ClientContext &context, const vector<string> &ddl) {
 		if (StringUtil::StartsWith(q, OPENIVM_DDL_ARCHIVE_WRITE_PREFIX)) {
 			flush_pending();
 			auto archive_start = std::chrono::steady_clock::now();
-			auto fields = DecodeArchiveFields(q.substr(strlen(OPENIVM_DDL_ARCHIVE_WRITE_PREFIX)));
+			auto fields = DecodeDDLFields(q, OPENIVM_DDL_ARCHIVE_WRITE_PREFIX);
 			bool after_commit = fields[0] == ArchiveModeName(DDLArchiveMode::AFTER_COMMIT);
 			bool own_transaction = fields[0] != ArchiveModeName(DDLArchiveMode::CURRENT_TRANSACTION);
 			auto write_archive = [&]() -> string {
@@ -979,15 +953,11 @@ void TransactionalMVMetadataState::Apply(Connection &connection) const {
 	}
 	OPENIVM_DEBUG_PRINT("[TRANSACTIONAL METADATA] Seed views=%zu, dependency edges=%zu, closure views=%zu\n",
 	                    registered_views.size(), dependency_edge_count, included_views.size());
-	string view_filter;
 	vector<string> sorted_included_views(included_views.begin(), included_views.end());
 	std::sort(sorted_included_views.begin(), sorted_included_views.end());
-	for (auto &view_name : sorted_included_views) {
-		if (!view_filter.empty()) {
-			view_filter += ", ";
-		}
-		view_filter += "'" + SqlUtils::EscapeValue(view_name) + "'";
-	}
+	string view_filter =
+	    StringUtil::Join(sorted_included_views, sorted_included_views.size(), ", ",
+	                     [](const string &view_name) { return "'" + SqlUtils::EscapeValue(view_name) + "'"; });
 	// Keep the complete replayed ownership relations. Independent committed views
 	// can share a source delta without belonging to this dependency closure. DROP
 	// must see those consumers as well as ownership added or removed by this
@@ -1025,9 +995,25 @@ void TransactionalMVMetadataState::Clear() {
 	dropped_views.clear();
 }
 
+string EncodeDDLOperation(const char *prefix, const vector<string> &fields) {
+	string result = prefix;
+	for (idx_t i = 0; i < fields.size(); i++) {
+		if (i > 0) {
+			result += '\t';
+		}
+		for (auto c : fields[i]) {
+			if (c == '\\' || c == '\t') {
+				result += '\\';
+			}
+			result += c == '\t' ? 't' : c;
+		}
+	}
+	return result;
+}
+
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace) {
-	return string(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX) + (replace ? "replace\t" : "create\t") + delta_table +
-	       "\t" + data_table;
+	return EncodeDDLOperation(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX,
+	                          {replace ? "replace" : "create", delta_table, data_table});
 }
 
 vector<string> BuildArchiveProgramOperation(const CompiledProgram &program, DDLArchiveMode mode,
@@ -1039,14 +1025,10 @@ vector<string> BuildArchiveProgramOperation(const CompiledProgram &program, DDLA
 	for (auto &statement : program.statements) {
 		result.push_back(string(OPENIVM_DDL_ARCHIVE_STATEMENT_PREFIX) + statement);
 	}
-	vector<string> fields = {ArchiveModeName(mode), metadata_catalog,     metadata_schema,
-	                         program.view_name,     program.view_catalog, program.view_schema,
-	                         program.view_sql_name, program.operation,    program.compilation_id};
-	string payload;
-	for (idx_t i = 0; i < fields.size(); i++) {
-		payload += (i > 0 ? "\t" : "") + EncodeArchiveField(fields[i]);
-	}
-	result.push_back(string(OPENIVM_DDL_ARCHIVE_WRITE_PREFIX) + payload);
+	result.push_back(EncodeDDLOperation(OPENIVM_DDL_ARCHIVE_WRITE_PREFIX,
+	                                    {ArchiveModeName(mode), metadata_catalog, metadata_schema, program.view_name,
+	                                     program.view_catalog, program.view_schema, program.view_sql_name,
+	                                     program.operation, program.compilation_id}));
 	return result;
 }
 
@@ -1496,16 +1478,12 @@ vector<string> RenderTransactionalStatement(const string &input, const string &m
 	}
 	auto statement = QualifyMetadataMutation(input, metadata_catalog, metadata_schema);
 	if (StringUtil::StartsWith(statement, OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)) {
-		bool replace = false;
-		string delta_table;
-		string data_table;
-		ParseCreateDeltaFromDataPayload(statement.substr(strlen(OPENIVM_DDL_CREATE_DELTA_FROM_DATA_PREFIX)), replace,
-		                                delta_table, data_table);
-		if (delta_table.empty() || data_table.empty()) {
+		CreateDeltaOperation operation;
+		if (!ParseCreateDeltaOperation(statement, operation)) {
 			throw InternalException("Malformed OpenIVM delta-schema operation");
 		}
-		return {"SELECT true FROM openivm_create_delta_from_data(" + Value(delta_table).ToSQLString() + ", " +
-		        Value(data_table).ToSQLString() + ", " + (replace ? "true" : "false") + ")"};
+		return {"SELECT true FROM openivm_create_delta_from_data(" + Value(operation.delta_table).ToSQLString() + ", " +
+		        Value(operation.data_table).ToSQLString() + ", " + (operation.replace ? "true" : "false") + ")"};
 	}
 	try {
 		Parser parser;
@@ -1591,19 +1569,6 @@ TableFunction DropEntryFunction(CatalogType type) {
 
 string RenderTransactionalDDL(ClientContext &context, const vector<Value> &parameters, const string &metadata_catalog,
                               const string &metadata_schema) {
-	struct ProfileRow {
-		string view_name;
-		string step_name;
-		int64_t duration_ms;
-		string detail;
-	};
-	struct PendingProfileMarker {
-		string view_name;
-		string step_name;
-		string detail;
-		idx_t statement_start;
-	};
-
 	string sql;
 	idx_t logical_statement_count = 0;
 	auto append_statement = [&](const string &statement, bool logical_statement = true) {
@@ -1619,23 +1584,21 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 			logical_statement_count++;
 		}
 	};
-	Value profile_value;
-	bool profile_enabled = context.TryGetCurrentSetting("openivm_profile_refresh", profile_value) &&
-	                       !profile_value.IsNull() && BooleanValue::Get(profile_value);
-	vector<ProfileRow> profile_rows;
-	unique_ptr<PendingProfileMarker> pending_profile;
+	bool profile_enabled = SqlUtils::GetBoolSetting(context, "openivm_profile_refresh", false);
+	vector<ProfileOperation> profile_rows;
+	// The open marker step and the statement count when it opened.
+	unique_ptr<pair<ProfileOperation, idx_t>> pending_profile;
 	auto finish_profile_marker = [&]() {
 		if (!pending_profile) {
 			return;
 		}
-		auto statement_count = logical_statement_count - pending_profile->statement_start;
-		auto detail = pending_profile->detail;
-		if (!detail.empty()) {
-			detail += "; ";
+		auto row = std::move(pending_profile->first);
+		if (!row.detail.empty()) {
+			row.detail += "; ";
 		}
-		detail +=
-		    "statements=" + to_string(statement_count) + "; transactional_program=true; duration_not_measured=true";
-		profile_rows.push_back({pending_profile->view_name, pending_profile->step_name, 0, std::move(detail)});
+		row.detail += "statements=" + to_string(logical_statement_count - pending_profile->second) +
+		              "; transactional_program=true; duration_not_measured=true";
+		profile_rows.push_back(std::move(row));
 		pending_profile.reset();
 	};
 	for (auto &parameter : parameters) {
@@ -1644,28 +1607,14 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 		    StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_TABLE_PREFIX)) {
 			continue;
 		}
-		if (StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_RECORD_PREFIX)) {
-			if (profile_enabled) {
-				string view_name;
-				string step_name;
-				string detail;
-				int64_t duration_ms = 0;
-				ParseCreateMVProfileRecord(statement.substr(strlen(OPENIVM_DDL_PROFILE_RECORD_PREFIX)), view_name,
-				                           step_name, duration_ms, detail);
-				profile_rows.push_back({std::move(view_name), std::move(step_name), duration_ms, std::move(detail)});
-			}
-			continue;
-		}
-		if (StringUtil::StartsWith(statement, OPENIVM_DDL_PROFILE_PREFIX)) {
-			if (profile_enabled) {
+		ProfileOperation profile_op;
+		if (TryParseProfileOperation(statement, profile_op)) {
+			if (profile_enabled && profile_op.measured) {
+				profile_rows.push_back(std::move(profile_op));
+			} else if (profile_enabled) {
 				finish_profile_marker();
-				string view_name;
-				string step_name;
-				string detail;
-				ParseCreateMVProfileMarker(statement.substr(strlen(OPENIVM_DDL_PROFILE_PREFIX)), view_name, step_name,
-				                           detail);
-				pending_profile = make_uniq<PendingProfileMarker>(PendingProfileMarker {
-				    std::move(view_name), std::move(step_name), std::move(detail), logical_statement_count});
+				pending_profile =
+				    make_uniq<pair<ProfileOperation, idx_t>>(std::move(profile_op), logical_statement_count);
 			}
 			continue;
 		}
@@ -1679,8 +1628,11 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 		finish_profile_marker();
 		if (!profile_rows.empty()) {
 			auto view_name = profile_rows.front().view_name;
-			profile_rows.push_back(
-			    {view_name, "create_mv_total", 0, "transactional_program=true; duration_not_measured=true"});
+			ProfileOperation total;
+			total.view_name = view_name;
+			total.step_name = "create_mv_total";
+			total.detail = "transactional_program=true; duration_not_measured=true";
+			profile_rows.push_back(std::move(total));
 			auto now = std::chrono::steady_clock::now().time_since_epoch();
 			auto refresh_id = view_name + "_create_tx_" +
 			                  to_string(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());

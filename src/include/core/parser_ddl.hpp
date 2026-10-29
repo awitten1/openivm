@@ -92,6 +92,8 @@ string RenderTransactionalDDL(ClientContext &context, const vector<Value> &param
 vector<string> RenderTransactionalStatement(const string &statement, const string &metadata_catalog,
                                             const string &metadata_schema);
 void ExecuteStagedDDL(ClientContext &context, const vector<Value> &parameters);
+// Executor operations carry tab-separated fields, escaped so names may contain tabs.
+string EncodeDDLOperation(const char *prefix, const vector<string> &fields);
 string BuildCreateDeltaFromDataOperation(const string &delta_table, const string &data_table, bool replace);
 // Executor operations that archive `program` as committed in the metadata catalog/schema.
 vector<string> BuildArchiveProgramOperation(const CompiledProgram &program, DDLArchiveMode mode,

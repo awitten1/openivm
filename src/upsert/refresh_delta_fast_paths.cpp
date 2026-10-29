@@ -93,19 +93,36 @@ DuckLakeTableActivity ProbeDuckLakeTableChanges(Connection &con, const DuckLakeS
 			return activity;
 		}
 	}
-	// Row-level fallback; change scans include their start snapshot.
-	string insertions = SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
-	                                                    loc.table_name, after_snapshot_id + 1, through_snapshot_id);
-	string deletions = SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
-	                                                   loc.table_name, after_snapshot_id + 1, through_snapshot_id);
-	string count_sql = "SELECT (SELECT COUNT(*) FROM " + insertions + ") + (SELECT COUNT(*) FROM " + deletions + ")";
-	auto counts = con.Query(count_sql);
-	if (counts->HasError() || counts->RowCount() != 1 || counts->GetValue(0, 0).IsNull()) {
-		return activity;
-	}
-	activity.ok = true;
-	activity.has_changes = counts->GetValue(0, 0).GetValue<int64_t>() > 0;
+	RefreshMetadata metadata(con);
+	auto stats = GetDuckLakeDeltaChangeStats(metadata, loc, after_snapshot_id, through_snapshot_id);
+	activity.ok = stats.ok;
+	activity.has_changes = stats.total > 0;
 	return activity;
+}
+
+// Records a source. One whose changes could not be verified (`!ok`) counts as changed with deletes.
+static void AddDeltaSource(DeltaActivityResult &summary, DeltaActivityResult::Source source) {
+	if (!source.ok) {
+		source.has_changes = true;
+		source.has_deletes = true;
+	}
+	if (source.has_changes) {
+		summary.tables_with_changes++;
+		summary.active_delta_table_names.push_back(source.delta_table_name);
+		summary.any_has_deletes = summary.any_has_deletes || source.has_deletes;
+		summary.requires_full_refresh = summary.requires_full_refresh || source.requires_full_refresh;
+	}
+	summary.sources.push_back(std::move(source));
+}
+
+static void ApplyChangeStats(DeltaActivityResult::Source &source, const RefreshMetadata::DeltaChangeStats &stats) {
+	source.ok = stats.ok;
+	if (stats.ok) {
+		source.pending_rows = stats.total;
+		source.pending_deletes = stats.deletes;
+		source.has_changes = stats.total > 0;
+		source.has_deletes = stats.deletes > 0;
+	}
 }
 
 static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, RefreshMetadata &metadata, Connection &con,
@@ -125,18 +142,9 @@ static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, Refresh
 	source.ducklake = true;
 	source.last_snapshot_id = last_snap;
 	source.current_snapshot_id = cur_snap;
-	if (cur_snap < 0 || last_snap < 0) {
-		source.has_changes = true;
-		source.has_deletes = true;
-		summary.any_has_deletes = true; // conservative
-		summary.tables_with_changes++;
-		summary.active_delta_table_names.push_back(delta_table);
-		summary.sources.push_back(std::move(source));
-		return;
-	}
-	if (last_snap == cur_snap) {
-		source.ok = true;
-		summary.sources.push_back(std::move(source));
+	if (cur_snap < 0 || last_snap < 0 || last_snap == cur_snap) {
+		source.ok = last_snap == cur_snap && cur_snap >= 0;
+		AddDeltaSource(summary, std::move(source));
 		return;
 	}
 	auto metadata_activity = ProbeDuckLakeSnapshotActivity(metadata, con, view_name, delta_table, loc.catalog_name,
@@ -146,56 +154,14 @@ static void AccumulateDuckLakeDeltaSummary(DeltaActivityResult &summary, Refresh
 		source.has_changes = metadata_activity.has_changes;
 		source.has_deletes = metadata_activity.has_deletes;
 		source.requires_full_refresh = metadata_activity.requires_full_refresh;
-		if (!metadata_activity.has_changes) {
-			summary.ducklake_snapshot_advances.push_back({delta_table, cur_snap});
-			summary.sources.push_back(std::move(source));
-			return;
-		}
-		if (metadata_activity.requires_full_refresh) {
-			summary.requires_full_refresh = true;
-		}
-		summary.tables_with_changes++;
-		summary.active_delta_table_names.push_back(delta_table);
-		if (metadata_activity.has_deletes) {
-			summary.any_has_deletes = true;
-		}
-		summary.sources.push_back(std::move(source));
-		return;
+	} else {
+		ApplyChangeStats(source, GetDuckLakeDeltaChangeStats(metadata, loc, last_snap, cur_snap));
 	}
-
-	string insertions = SqlUtils::DuckLakeTableFunction("ducklake_table_insertions", loc.catalog_name, loc.schema_name,
-	                                                    loc.table_name, last_snap, cur_snap);
-	string deletions = SqlUtils::DuckLakeTableFunction("ducklake_table_deletions", loc.catalog_name, loc.schema_name,
-	                                                   loc.table_name, last_snap, cur_snap);
-	auto count_result =
-	    con.Query("SELECT (SELECT COUNT(*) FROM " + insertions + "), (SELECT COUNT(*) FROM " + deletions + ")");
-	if (count_result->HasError()) {
-		source.has_changes = true;
-		source.has_deletes = true;
-		summary.any_has_deletes = true;
-		summary.tables_with_changes++;
-		summary.active_delta_table_names.push_back(delta_table);
-		summary.sources.push_back(std::move(source));
-		return;
-	}
-	auto insert_count = count_result->GetValue(0, 0).GetValue<int64_t>();
-	auto delete_count = count_result->GetValue(1, 0).GetValue<int64_t>();
-	source.ok = true;
-	source.pending_rows = insert_count + delete_count;
-	source.pending_deletes = delete_count;
-	source.has_changes = source.pending_rows > 0;
-	source.has_deletes = delete_count > 0;
-	if (insert_count == 0 && delete_count == 0) {
+	if (source.ok && !source.has_changes) {
+		// Nothing in the range touched this table; consume the unrelated snapshots.
 		summary.ducklake_snapshot_advances.push_back({delta_table, cur_snap});
-		summary.sources.push_back(std::move(source));
-		return;
 	}
-	summary.tables_with_changes++;
-	summary.active_delta_table_names.push_back(delta_table);
-	if (delete_count > 0) {
-		summary.any_has_deletes = true;
-	}
-	summary.sources.push_back(std::move(source));
+	AddDeltaSource(summary, std::move(source));
 }
 
 static void AccumulateStandardDeltaSummary(DeltaActivityResult &summary, RefreshMetadata &metadata,
@@ -205,44 +171,12 @@ static void AccumulateStandardDeltaSummary(DeltaActivityResult &summary, Refresh
 	DeltaActivityResult::Source source;
 	source.delta_table_name = delta_table;
 	source.source_table_name = BaseTableNameFromDeltaKey(delta_table);
-	source.ducklake = false;
-	auto ts_string = metadata.GetLastUpdate(view_name, delta_table);
-	if (ts_string.empty()) {
-		source.has_changes = true;
-		source.has_deletes = true;
-		summary.any_has_deletes = true; // conservative
-		summary.tables_with_changes++;
-		summary.active_delta_table_names.push_back(delta_table);
-		summary.sources.push_back(std::move(source));
-		return;
-	}
-	string delta_table_sql =
-	    metadata.ResolveDeltaQualifiedName(view_name, delta_table, view_catalog_name, view_schema_name);
-	auto stats = metadata.GetStandardDeltaChangeStats(delta_table_sql, ts_string);
-	if (!stats.ok) {
-		source.has_changes = true;
-		source.has_deletes = true;
-		summary.any_has_deletes = true; // conservative
-		summary.tables_with_changes++;
-		summary.active_delta_table_names.push_back(delta_table);
-		summary.sources.push_back(std::move(source));
-		return;
-	}
-	source.ok = true;
-	source.pending_rows = stats.total;
-	source.pending_deletes = stats.deletes;
-	source.has_changes = stats.total > 0;
-	source.has_deletes = stats.deletes > 0;
-	if (stats.total == 0) {
-		summary.sources.push_back(std::move(source));
-		return;
-	}
-	summary.tables_with_changes++;
-	summary.active_delta_table_names.push_back(delta_table);
-	if (stats.deletes > 0) {
-		summary.any_has_deletes = true;
-	}
-	summary.sources.push_back(std::move(source));
+	// An empty watermark yields unverified stats.
+	ApplyChangeStats(
+	    source, metadata.GetStandardDeltaChangeStats(
+	                metadata.ResolveDeltaQualifiedName(view_name, delta_table, view_catalog_name, view_schema_name),
+	                metadata.GetLastUpdate(view_name, delta_table)));
+	AddDeltaSource(summary, std::move(source));
 }
 
 static bool IsInsertOnlyDeltaSummary(const DeltaActivityResult &summary, const vector<string> &delta_table_names) {
@@ -264,15 +198,11 @@ static bool IsInsertOnlyDeltaSummary(const DeltaActivityResult &summary, const v
 	return false;
 }
 
-DeltaActivityProvider DeltaActivityProvider::Build(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                                   const string &view_query_sql,
-                                                   const vector<string> &delta_table_names,
-                                                   const string &view_catalog_name, const string &view_schema_name,
-                                                   const string &attached_db_catalog_name,
-                                                   const string &attached_db_schema_name) {
-	DeltaActivityProvider provider;
-	auto &summary = provider.summary;
-	(void)view_query_sql;
+DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connection &con, const string &view_name,
+                                             const vector<string> &delta_table_names, const string &view_catalog_name,
+                                             const string &view_schema_name, const string &attached_db_catalog_name,
+                                             const string &attached_db_schema_name) {
+	DeltaActivityResult summary;
 	summary.has_join = metadata.HasJoin(view_name) || delta_table_names.size() > 1;
 	for (auto &dt : delta_table_names) {
 		if (metadata.IsDuckLakeTable(view_name, dt)) {
@@ -282,28 +212,16 @@ DeltaActivityProvider DeltaActivityProvider::Build(RefreshMetadata &metadata, Co
 			AccumulateStandardDeltaSummary(summary, metadata, view_name, dt, view_catalog_name, view_schema_name);
 		}
 	}
-	return provider;
-}
-
-DeltaActivityResult BuildDeltaActivityResult(RefreshMetadata &metadata, Connection &con, const string &view_name,
-                                             const string &view_query_sql, const vector<string> &delta_table_names,
-                                             const string &view_catalog_name, const string &view_schema_name,
-                                             const string &attached_db_catalog_name,
-                                             const string &attached_db_schema_name) {
-	auto provider =
-	    DeltaActivityProvider::Build(metadata, con, view_name, view_query_sql, delta_table_names, view_catalog_name,
-	                                 view_schema_name, attached_db_catalog_name, attached_db_schema_name);
-	return provider.Summary();
+	return summary;
 }
 
 DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMetadata &metadata, Connection &con,
-                                             const string &view_name, const string &view_query_sql,
-                                             const vector<string> &delta_table_names, const string &view_catalog_name,
-                                             const string &view_schema_name, const string &attached_db_catalog_name,
-                                             const string &attached_db_schema_name, bool cross_system,
+                                             const string &view_name, const vector<string> &delta_table_names,
+                                             const string &view_catalog_name, const string &view_schema_name,
+                                             const string &attached_db_catalog_name,
+                                             const string &attached_db_schema_name,
                                              const DeltaActivityResult *precomputed_delta_activity,
                                              const openivm::CompileFacts *facts) {
-	(void)cross_system;
 	if (facts && facts->compile_only) {
 		DeltaFastPathFlags flags;
 		flags.active_delta_table_names = delta_table_names;
@@ -324,15 +242,10 @@ DeltaFastPathFlags ResolveDeltaFastPathFlags(ClientContext &context, RefreshMeta
 		                    flags.minmax_incremental, flags.active_delta_table_names.size());
 		return flags;
 	}
-	DeltaActivityResult summary;
-	if (precomputed_delta_activity) {
-		summary = *precomputed_delta_activity;
-	} else {
-		auto provider =
-		    DeltaActivityProvider::Build(metadata, con, view_name, view_query_sql, delta_table_names, view_catalog_name,
-		                                 view_schema_name, attached_db_catalog_name, attached_db_schema_name);
-		summary = provider.Summary();
-	}
+	auto summary = precomputed_delta_activity
+	                   ? *precomputed_delta_activity
+	                   : BuildDeltaActivityResult(metadata, con, view_name, delta_table_names, view_catalog_name,
+	                                              view_schema_name, attached_db_catalog_name, attached_db_schema_name);
 	DeltaFastPathFlags flags;
 	flags.insert_only = IsInsertOnlyDeltaSummary(summary, delta_table_names);
 	flags.skip_agg_delete = flags.insert_only;

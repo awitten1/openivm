@@ -156,22 +156,14 @@ string BuildPublishViewSQL(const string &view_name, const string &prefix, const 
 		OPENIVM_DEBUG_PRINT("[PUBLISH] Appending visible projection delta for %s\n", view_name.c_str());
 		return sql;
 	}
-	string equality;
-	for (auto &column : columns) {
-		if (!equality.empty()) {
-			equality += " AND ";
-		}
-		auto quoted = quote(column);
-		equality += "v." + quoted + " IS NOT DISTINCT FROM d." + quoted;
-	}
-	string scope;
-	for (auto &column : scope_columns) {
-		if (!scope.empty()) {
-			scope += " AND ";
-		}
-		auto quoted = quote(column);
-		scope += "v." + quoted + " IS NOT DISTINCT FROM d." + quoted;
-	}
+	auto null_safe_match = [&](const vector<string> &match_columns) {
+		return StringUtil::Join(match_columns, match_columns.size(), " AND ", [&](const string &column) {
+			auto quoted = quote(column);
+			return "v." + quoted + " IS NOT DISTINCT FROM d." + quoted;
+		});
+	};
+	string equality = null_safe_match(columns);
+	string scope = null_safe_match(scope_columns);
 	string scoped_query = query;
 	string old_query = "SELECT * FROM " + visible;
 	if (!scope.empty()) {

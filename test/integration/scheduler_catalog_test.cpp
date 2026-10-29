@@ -1,6 +1,7 @@
 #include "duckdb.hpp"
 #include "core/refresh_metadata.hpp"
 #include "core/sql_utils.hpp"
+#include <algorithm>
 #include <iostream>
 
 using namespace duckdb;
@@ -64,7 +65,12 @@ int main(int argc, char **argv) {
 		std::cout << "READY" << std::endl;
 		string line;
 		std::getline(std::cin, line);
-		auto catalogs = RefreshMetadata::MetadataCatalogs(con);
+		vector<string> catalogs;
+		for (auto &location : RefreshMetadata::MetadataLocations(con)) {
+			catalogs.push_back(location.catalog);
+		}
+		std::sort(catalogs.begin(), catalogs.end());
+		catalogs.erase(std::unique(catalogs.begin(), catalogs.end()), catalogs.end());
 		if (catalogs != vector<string> {"configured", "memory", "other"}) {
 			throw InvalidInputException("Source metadata discovery did not find every native catalog");
 		}

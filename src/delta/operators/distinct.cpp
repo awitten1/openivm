@@ -1,7 +1,7 @@
 #include "delta/delta_operator.hpp"
 #include "core/openivm_constants.hpp"
 #include "core/openivm_debug.hpp"
-#include "duckdb/function/aggregate/distributive_functions.hpp"
+#include "core/plan_rewrite_internal.hpp"
 #include "duckdb/optimizer/column_binding_replacer.hpp"
 #include "duckdb/planner/expression/bound_aggregate_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
@@ -40,21 +40,9 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 	// Group-by keys = all child columns EXCEPT multiplicity
 	// Aggregate = COUNT(*) as openivm_distinct_count
 	// Multiplicity is added as a group-by key (same pattern as aggregate delta)
-	idx_t group_index = binder.GenerateTableIndex();
-	idx_t aggregate_index = binder.GenerateTableIndex();
-
-	auto count_star_func = CountStarFun::GetFunction();
-	vector<unique_ptr<Expression>> count_args;
-	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star_func), std::move(count_args), nullptr,
-	                                                      nullptr, AggregateType::NON_DISTINCT);
-	count_expr->alias = openivm::DISTINCT_COUNT_COL;
-
 	vector<unique_ptr<Expression>> aggregates;
-	aggregates.push_back(std::move(count_expr));
-
-	auto agg_node = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
-
-	GroupingSet grouping_set;
+	aggregates.push_back(MakeCountStar(openivm::DISTINCT_COUNT_COL));
+	vector<unique_ptr<Expression>> groups;
 	const idx_t child_output_count = child_bindings.size();
 	// The validated binding/type vectors define this exact traversal; changing the bound is invalid planner state.
 	for (idx_t i = 0; i < child_output_count; // mull-ignore: cxx_lt_to_ge,cxx_lt_to_le
@@ -62,25 +50,12 @@ DeltaPlanFragment CompileDistinctDelta(DeltaOperatorInput input) {
 		if (child_bindings[i] == input_mul_binding) {
 			continue; // skip multiplicity — added separately below
 		}
-		auto group_expr = make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]);
-		grouping_set.insert(agg_node->groups.size());
-		agg_node->groups.push_back(std::move(group_expr));
-		agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(child_types[i])));
+		groups.push_back(make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]));
 	}
-
-	ColumnBinding mod_mul_binding;
-	mod_mul_binding.column_index = agg_node->groups.size();
-	mod_mul_binding.table_index = group_index;
-
-	auto mul_expr = make_uniq<BoundColumnRefExpression>(openivm::MULTIPLICITY_COL, input.mul_type, input_mul_binding);
-	grouping_set.insert(agg_node->groups.size());
-	agg_node->groups.push_back(std::move(mul_expr));
-	agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(input.mul_type)));
-
-	agg_node->grouping_sets.push_back(std::move(grouping_set));
-
-	agg_node->children.push_back(std::move(rewritten_child));
-	agg_node->ResolveOperatorTypes();
+	groups.push_back(make_uniq<BoundColumnRefExpression>(openivm::MULTIPLICITY_COL, input.mul_type, input_mul_binding));
+	auto agg_node = MakeGroupedAggregate(binder, std::move(groups), std::move(aggregates), std::move(rewritten_child));
+	const idx_t group_index = agg_node->group_index;
+	ColumnBinding mod_mul_binding(group_index, agg_node->groups.size() - 1);
 
 	// Remap parent references: each original DISTINCT output binding (child's i-th binding)
 	// is replaced with the new aggregate's group output binding (group_index, group_position).

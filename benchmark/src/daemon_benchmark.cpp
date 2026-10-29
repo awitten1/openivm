@@ -16,6 +16,7 @@
 #include "duckdb.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/common/printer.hpp"
+#include "daemon_metadata.hpp"
 #include "tpcc_helpers.hpp"
 
 #include <atomic>
@@ -871,17 +872,10 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 				con.Query("DROP TABLE IF EXISTS " + full);
 			}
 		}
-		// view_name holds an encoded internal key; match the SQL-facing name (view_sql_name) too,
-		// and delete dependent metadata before the openivm_views rows that identify it.
-		const string stale_keys = "SELECT view_name FROM openivm_views WHERE COALESCE(view_sql_name, view_name) LIKE "
-		                          "'mv\\_%' ESCAPE '\\'";
-		for (const char *dependent :
-		     {"openivm_delta_tables", "openivm_refresh_history", "openivm_refresh_hooks"}) {
-			con.Query(string("DELETE FROM ") + dependent + " WHERE view_name LIKE 'mv_%' OR view_name IN (" +
-			          stale_keys + ")");
+		// Metadata rows are keyed by the internal view key; select them via the SQL name.
+		for (auto &stmt : openivm_bench::StaleBenchmarkMetadataCleanupSQL()) {
+			con.Query(stmt);
 		}
-		con.Query("DELETE FROM openivm_views WHERE view_name LIKE 'mv_%' OR COALESCE(view_sql_name, view_name) LIKE "
-		          "'mv\\_%' ESCAPE '\\'");
 
 		// DuckLake attach for S9/S10/S11
 		if (subtest == "S9" || subtest == "S10" || subtest == "S11") {
@@ -1088,10 +1082,7 @@ static int RunSubtest(const string &subtest, int duration_s, const string &db_pa
 					// last_update. Helps diagnose whether rows are "stuck" in delta (not applied)
 					// vs the refresh applied something wrong.
 					string diag;
-					auto dt_r = fin_con.Query(
-					    "SELECT table_name, last_update FROM openivm_delta_tables WHERE view_name IN "
-					    "(SELECT view_name FROM openivm_views WHERE lower(COALESCE(view_sql_name, view_name)) = "
-					    "lower(" + duckdb::Value(v.name).ToSQLString() + "))");
+					auto dt_r = fin_con.Query(openivm_bench::DeltaMetadataDiagnosticSQL(v.name, v.catalog_schema));
 					if (dt_r && !dt_r->HasError()) {
 						for (idx_t di = 0; di < dt_r->RowCount(); di++) {
 							string tn = dt_r->GetValue(0, di).ToString();

@@ -2355,6 +2355,187 @@ SELECT COUNT(*) FROM (
 ----
 0
 
+# Ungrouped aggregates whose input becomes empty, either because the source table is
+# emptied or because the WHERE filter no longer matches any row: COUNT must be 0
+# (not NULL), and SUM/AVG/STDDEV/VARIANCE must be NULL (not 0 or NaN).
+statement ok
+CREATE TABLE sa_empty (id INT, v INT, d DOUBLE);
+
+statement ok
+INSERT INTO sa_empty VALUES (1, 1, 1.5), (2, 2, 2.5), (3, NULL, 3.0);
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sa_empty AS
+    SELECT SUM(v) AS s, COUNT(*) AS c, COUNT(v) AS cv, AVG(d) AS a, STDDEV_SAMP(d) AS sd, VAR_POP(d) AS vp FROM sa_empty;
+
+statement ok
+CREATE MATERIALIZED VIEW mv_sa_filtered AS
+    SELECT SUM(v) AS s, COUNT(*) AS c, STDDEV_SAMP(d) AS sd FROM sa_empty WHERE d > 2;
+
+query I
+SELECT COUNT(*) FROM openivm_views WHERE view_name IN ('__openivm_mv_6d656d6f7279_6d61696e_6d765f73615f656d707479_', '__openivm_mv_6d656d6f7279_6d61696e_6d765f73615f66696c7465726564_') AND type = 1;
+----
+2
+
+# Filtered input becomes empty while the table keeps one row.
+statement ok
+INSERT INTO sa_empty VALUES (4, 4, 4.5);
+
+statement ok
+UPDATE sa_empty SET v = v + 10 WHERE id = 1;
+
+statement ok
+DELETE FROM sa_empty WHERE id IN (2, 3, 4);
+
+statement ok
+UPDATE sa_empty SET d = 1.0 WHERE id = 1;
+
+statement ok
+PRAGMA refresh('mv_sa_empty');
+
+statement ok
+PRAGMA refresh('mv_sa_filtered');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM mv_sa_empty
+    EXCEPT ALL
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, COUNT(v) AS cv, AVG(d) AS a, STDDEV_SAMP(d) AS sd, VAR_POP(d) AS vp FROM sa_empty)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, COUNT(v) AS cv, AVG(d) AS a, STDDEV_SAMP(d) AS sd, VAR_POP(d) AS vp FROM sa_empty)
+    EXCEPT ALL
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM mv_sa_empty
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, round(sd, 6) FROM mv_sa_filtered
+    EXCEPT ALL
+    SELECT s, c, round(sd, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, STDDEV_SAMP(d) AS sd FROM sa_empty WHERE d > 2)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, round(sd, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, STDDEV_SAMP(d) AS sd FROM sa_empty WHERE d > 2)
+    EXCEPT ALL
+    SELECT s, c, round(sd, 6) FROM mv_sa_filtered
+);
+----
+0
+
+# The source table becomes empty.
+statement ok
+INSERT INTO sa_empty VALUES (5, 5, 5.0);
+
+statement ok
+UPDATE sa_empty SET v = 50 WHERE id = 5;
+
+statement ok
+DELETE FROM sa_empty;
+
+statement ok
+PRAGMA refresh('mv_sa_empty');
+
+statement ok
+PRAGMA refresh('mv_sa_filtered');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM mv_sa_empty
+    EXCEPT ALL
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, COUNT(v) AS cv, AVG(d) AS a, STDDEV_SAMP(d) AS sd, VAR_POP(d) AS vp FROM sa_empty)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, COUNT(v) AS cv, AVG(d) AS a, STDDEV_SAMP(d) AS sd, VAR_POP(d) AS vp FROM sa_empty)
+    EXCEPT ALL
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM mv_sa_empty
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, round(sd, 6) FROM mv_sa_filtered
+    EXCEPT ALL
+    SELECT s, c, round(sd, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, STDDEV_SAMP(d) AS sd FROM sa_empty WHERE d > 2)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, round(sd, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, STDDEV_SAMP(d) AS sd FROM sa_empty WHERE d > 2)
+    EXCEPT ALL
+    SELECT s, c, round(sd, 6) FROM mv_sa_filtered
+);
+----
+0
+
+# Repopulate after the empty state.
+statement ok
+INSERT INTO sa_empty VALUES (6, 6, 6.0), (7, NULL, 7.5), (8, 8, 0.5), (9, 9, 9.0);
+
+statement ok
+UPDATE sa_empty SET v = 60 WHERE id = 6;
+
+statement ok
+DELETE FROM sa_empty WHERE id = 8;
+
+statement ok
+PRAGMA refresh('mv_sa_empty');
+
+statement ok
+PRAGMA refresh('mv_sa_filtered');
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM mv_sa_empty
+    EXCEPT ALL
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, COUNT(v) AS cv, AVG(d) AS a, STDDEV_SAMP(d) AS sd, VAR_POP(d) AS vp FROM sa_empty)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, COUNT(v) AS cv, AVG(d) AS a, STDDEV_SAMP(d) AS sd, VAR_POP(d) AS vp FROM sa_empty)
+    EXCEPT ALL
+    SELECT s, c, cv, round(a, 6), round(sd, 6), round(vp, 6) FROM mv_sa_empty
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, round(sd, 6) FROM mv_sa_filtered
+    EXCEPT ALL
+    SELECT s, c, round(sd, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, STDDEV_SAMP(d) AS sd FROM sa_empty WHERE d > 2)
+);
+----
+0
+
+query I
+SELECT COUNT(*) FROM (
+    SELECT s, c, round(sd, 6) FROM (SELECT SUM(v) AS s, COUNT(*) AS c, STDDEV_SAMP(d) AS sd FROM sa_empty WHERE d > 2)
+    EXCEPT ALL
+    SELECT s, c, round(sd, 6) FROM mv_sa_filtered
+);
+----
+0
+
 # LIST with large batch of mixed inserts/deletes
 statement ok
 CREATE TABLE list_heavy (bucket INT, token VARCHAR);

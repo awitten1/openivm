@@ -19,6 +19,9 @@ class RefreshMetadata {
 	Connection &con;
 	Value ReadViewValue(const string &view_name, const string &column);
 	string ReadViewString(const string &view_name, const string &column);
+	bool ReadViewBool(const string &view_name, const string &column);
+	// One column of a view's openivm_delta_tables row for `table_name`; NULL when missing.
+	Value ReadDeltaValue(const string &view_name, const string &table_name, const string &column);
 	vector<string> ReadViewList(const string &view_name, const string &column);
 
 public:
@@ -92,10 +95,12 @@ public:
 
 	// Every metadata location that may consume delta tables (see MetadataLocator::All).
 	static vector<MetadataLocation> MetadataLocations(Connection &con);
-	static vector<string> MetadataCatalogs(Connection &con);
 	// Accept both legacy short keys and qualified keys for sources with colliding names.
 	static string SourceTableName(const string &key, const string &catalog, const string &schema);
 	static string SourcePredicate(const string &table, const string &catalog, const string &schema);
+	// Rows owned by a physical source table. DuckLake rows store the source name itself;
+	// native rows store the source's delta-table name.
+	static string SourceOwnerPredicate(const string &table, const string &catalog, const string &schema, bool ducklake);
 
 	// A source's delta table lives beside the source unless openivm_internal_schema placed it in
 	// an internal schema of the same catalog; there its name encodes the source schema.
@@ -356,7 +361,7 @@ public:
 
 	struct SemiAntiAuxMeta {
 		string aux_table;
-		string join_type;
+		SemiAntiJoinType join_type = SemiAntiJoinType::SEMI;
 		string left_table;
 		string left_alias;
 		string right_table;
@@ -376,7 +381,7 @@ public:
 	static string SemiAntiAuxMetaToJson(const SemiAntiAuxMeta &meta);
 
 	struct WindowPartitionLineageOp {
-		string kind;
+		WindowLineageKind kind = WindowLineageKind::DIRECT;
 		string output_col;
 		string source;
 		string source_col;
